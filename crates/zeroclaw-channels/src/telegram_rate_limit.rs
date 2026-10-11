@@ -4,7 +4,14 @@
 //! (`parameters.retry_after` in the JSON envelope, or `retry after <N>` in
 //! the human-readable description). Firing again inside that window escalates
 //! the token's penalty, so this module keeps one shared "blocked until"
-//! instant per channel instance and routes every Bot API POST through it.
+//! instant per channel instance.
+//!
+//! Gated surface: the channel's text traffic — `sendMessage` (final answers,
+//! draft creation, approval prompts), `editMessageText` (draft updates and
+//! finalize), and `sendChatAction` (typing) — goes through
+//! [`post_bot_api_json`]. Media uploads, `deleteMessage`, `answerCallbackQuery`,
+//! and the model picker's markup edits still post directly; they are not
+//! covered by this gate.
 //!
 //! State-source justification (AGENTS.md): `blocked_until` is newly created
 //! runtime state — the only local mirror of Telegram's own server-side
@@ -19,11 +26,6 @@ use parking_lot::Mutex;
 /// Telegram's Bot API contract always sends one, so this only covers
 /// proxy-generated or truncated answers.
 const FALLBACK_RETRY_AFTER_SECS: u64 = 5;
-
-/// Ceiling for one recorded flood-control window. Keeps the `Instant`
-/// arithmetic infallible and bounds how long a bogus `retry_after` (from a
-/// misbehaving self-hosted Bot API server) can silence the token.
-const MAX_BLOCK_WINDOW_SECS: u64 = 3600;
 
 /// Delivery class of a Bot API call: whether the caller must get the request
 /// through (waiting out a flood-control window, bounded by
@@ -47,17 +49,25 @@ pub(crate) enum RateLimitGate {
     Blocked(Duration),
 }
 
-/// Why a gated Bot API call produced no usable response. Both variants mean
-/// "nothing was delivered and the shared window already accounts for it";
-/// Droppable-class callers log at DEBUG and move on.
+/// Why a gated Bot API call produced no usable response. Every variant means
+/// "nothing was delivered and the shared window already accounts for it", so
+/// callers must stop their formatting/resume/resend fallbacks — a 429 is not
+/// a formatting failure. Droppable-class callers log at DEBUG and move on.
 #[derive(Debug)]
 pub(crate) enum TelegramGateError {
     /// Pre-send gate: the token is inside a flood-control window, so a
     /// Droppable call was skipped without any network call.
     Skipped { remaining: Duration },
     /// The call reached Telegram and was answered 429; the window was noted
-    /// and the body consumed to harvest `retry_after`.
+    /// and the body consumed to harvest `retry_after`. For a Deliver call this
+    /// marks the single permitted retry also answering 429 (its own, possibly
+    /// longer, delay is the one recorded).
     FloodLimited { retry_after_secs: u64 },
+    /// A Deliver call spent its whole caller-side wait budget and the shared
+    /// window was still active when it re-checked — the server penalty
+    /// outlasts the budget, or a concurrent 429 extended the window while
+    /// this caller slept. No (re)send happened.
+    BudgetExhausted { remaining: Duration },
 }
 
 impl std::fmt::Display for TelegramGateError {
@@ -71,6 +81,12 @@ impl std::fmt::Display for TelegramGateError {
             Self::FloodLimited { retry_after_secs } => write!(
                 f,
                 "Telegram Bot API answered 429 Too Many Requests; blocked for {retry_after_secs}s"
+            ),
+            Self::BudgetExhausted { remaining } => write!(
+                f,
+                "Telegram Bot API wait budget expired with the token still blocked for {}s more; \
+                 nothing was sent",
+                remaining.as_secs()
             ),
         }
     }
@@ -91,19 +107,41 @@ impl TelegramRateLimiter {
         Self::default()
     }
 
-    /// Block the token for `retry_after_secs` plus up to 2s of jitter, so
+    /// Block the token until `retry_after_secs` (plus up to 2s of jitter, so
     /// several chats blocked by the same 429 do not all resume on the same
-    /// tick. Jitter derives from the wall clock's sub-second nanos; no `rand`
-    /// dependency is warranted for a 3-way pick.
+    /// tick) from now. Jitter derives from the wall clock's sub-second nanos;
+    /// no `rand` dependency is warranted for a 3-way pick.
+    ///
+    /// Concurrent 429 responses can arrive in either order, so the new
+    /// deadline only replaces the active one when it is *later*: a 1s answer
+    /// landing after a 30s one must not shorten the block. A delay so large
+    /// it cannot be represented as an `Instant` is bogus (Telegram penalties
+    /// are seconds to minutes); it is rejected outright — the active deadline
+    /// stands — rather than clamped into permission to send sooner.
     pub(crate) fn note_rate_limited(&self, retry_after_secs: u64) {
         let jitter_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| u64::from(d.subsec_nanos()) % 3)
             .unwrap_or(0);
-        let window_secs = retry_after_secs
-            .min(MAX_BLOCK_WINDOW_SECS)
-            .saturating_add(jitter_secs);
-        *self.blocked_until.lock() = Some(Instant::now() + Duration::from_secs(window_secs));
+        let new_deadline = retry_after_secs
+            .checked_add(jitter_secs)
+            .map(Duration::from_secs)
+            .and_then(|window| Instant::now().checked_add(window));
+        let Some(new_deadline) = new_deadline else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"retry_after_secs": retry_after_secs})),
+                "Telegram 429 retry_after is not representable as a deadline; keeping the active window"
+            );
+            return;
+        };
+        let mut guard = self.blocked_until.lock();
+        if guard.is_some_and(|active| active > new_deadline) {
+            return;
+        }
+        *guard = Some(new_deadline);
     }
 
     /// Inspect the window, clearing it when it has expired.
@@ -153,17 +191,41 @@ pub(crate) fn parse_retry_after(body: &str) -> Option<u64> {
     }
 }
 
+/// Wait out an active flood-control window for a Deliver-class call, bounded
+/// by the caller's `max_wait` budget, then re-check the shared gate before
+/// returning. The budget bounds how long *this caller* waits, never the
+/// server deadline: a window that outlives the budget — or that a concurrent
+/// 429 extended while this caller slept — ends the wait with
+/// [`TelegramGateError::BudgetExhausted`] instead of an early send.
+async fn wait_out_window(
+    limiter: &TelegramRateLimiter,
+    max_wait: Duration,
+) -> Result<(), TelegramGateError> {
+    if let RateLimitGate::Blocked(remaining) = limiter.check() {
+        tokio::time::sleep(remaining.min(max_wait)).await;
+        if let RateLimitGate::Blocked(still_blocked) = limiter.check() {
+            return Err(TelegramGateError::BudgetExhausted {
+                remaining: still_blocked,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// POST `body` to a Bot API `url` through the shared flood-control gate.
 ///
 /// - Pre-send, a Droppable call inside the window fails with
 ///   [`TelegramGateError::Skipped`] without any network call; a Deliver call
-///   waits out the window (bounded by `max_wait`) first.
-/// - On a 429 answer the window is noted from `retry_after`. Droppable calls
-///   then fail with [`TelegramGateError::FloodLimited`] (the body was consumed
-///   for parsing, so no response survives to return); Deliver calls wait
-///   `min(retry_after, max_wait)` and retry once. A retry that also 429s
-///   renews the note and is returned as-is for the caller's existing
-///   non-success handling.
+///   waits out the window (bounded by `max_wait`) and re-checks the gate —
+///   still blocked means [`TelegramGateError::BudgetExhausted`], no request.
+/// - On a 429 answer the window is noted from that response's own
+///   `retry_after`. Droppable calls then fail with
+///   [`TelegramGateError::FloodLimited`] (the body was consumed for parsing,
+///   so no response survives to return); Deliver calls wait the window out
+///   (same bounded re-checking wait) and retry once. A retry that also 429s
+///   contributes its own — possibly longer — `retry_after` to the window and
+///   fails with [`TelegramGateError::FloodLimited`]: the caller's
+///   formatting/resume fallbacks must stop, a 429 is not a formatting failure.
 ///
 /// Any other status — success or failure — is returned untouched, and
 /// transport errors propagate.
@@ -175,16 +237,13 @@ pub(crate) async fn post_bot_api_json(
     limiter: &TelegramRateLimiter,
     max_wait: Duration,
 ) -> anyhow::Result<reqwest::Response> {
-    match limiter.check() {
-        RateLimitGate::Clear => {}
-        RateLimitGate::Blocked(remaining) => match class {
-            BotApiClass::Droppable => {
+    match class {
+        BotApiClass::Droppable => {
+            if let RateLimitGate::Blocked(remaining) = limiter.check() {
                 return Err(TelegramGateError::Skipped { remaining }.into());
             }
-            BotApiClass::Deliver => {
-                tokio::time::sleep(remaining.min(max_wait)).await;
-            }
-        },
+        }
+        BotApiClass::Deliver => wait_out_window(limiter, max_wait).await?,
     }
 
     let resp = client.post(url).json(body).send().await?;
@@ -199,12 +258,19 @@ pub(crate) async fn post_bot_api_json(
     match class {
         BotApiClass::Droppable => Err(TelegramGateError::FloodLimited { retry_after_secs }.into()),
         BotApiClass::Deliver => {
-            tokio::time::sleep(Duration::from_secs(retry_after_secs).min(max_wait)).await;
+            wait_out_window(limiter, max_wait).await?;
             let retry = client.post(url).json(body).send().await?;
-            if retry.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                limiter.note_rate_limited(retry_after_secs);
+            if retry.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Ok(retry);
             }
-            Ok(retry)
+            // The single permitted retry was flood-limited again: harvest the
+            // new delay into the shared window and stop — returning the 429
+            // response would let the caller's formatting fallback fire into
+            // the still-active window.
+            let retry_after_secs = parse_retry_after(&retry.text().await.unwrap_or_default())
+                .unwrap_or(FALLBACK_RETRY_AFTER_SECS);
+            limiter.note_rate_limited(retry_after_secs);
+            Err(TelegramGateError::FloodLimited { retry_after_secs }.into())
         }
     }
 }
@@ -212,6 +278,11 @@ pub(crate) async fn post_bot_api_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gate_error(err: &anyhow::Error) -> &TelegramGateError {
+        err.downcast_ref::<TelegramGateError>()
+            .expect("expected a TelegramGateError")
+    }
 
     #[test]
     fn parse_retry_after_reads_json_envelope() {
@@ -293,14 +364,417 @@ mod tests {
     }
 
     #[test]
-    fn note_rate_limited_caps_absurd_windows() {
+    fn note_rate_limited_keeps_the_longer_active_deadline() {
+        // In-flight requests can be answered out of order: a 30s penalty
+        // followed by a 1s one must not shorten the block to ~1s.
         let limiter = TelegramRateLimiter::new();
+        limiter.note_rate_limited(30);
+        limiter.note_rate_limited(1);
+        match limiter.check() {
+            RateLimitGate::Blocked(remaining) => {
+                assert!(
+                    remaining > Duration::from_secs(29),
+                    "the 1s response must not shorten the active 30s window: {remaining:?}"
+                );
+            }
+            RateLimitGate::Clear => panic!("expected the 30s window to survive a 1s note"),
+        }
+    }
+
+    #[test]
+    fn note_rate_limited_extends_a_shorter_active_deadline() {
+        // Escalation: a later, longer penalty replaces the short one.
+        let limiter = TelegramRateLimiter::new();
+        limiter.note_rate_limited(5);
+        limiter.note_rate_limited(30);
+        match limiter.check() {
+            RateLimitGate::Blocked(remaining) => {
+                assert!(remaining > Duration::from_secs(29));
+            }
+            RateLimitGate::Clear => panic!("expected blocked after escalation note"),
+        }
+    }
+
+    #[test]
+    fn note_rate_limited_rejects_an_unrepresentable_delay() {
+        // A bogus `retry_after` that cannot become an `Instant` must not be
+        // clamped into permission to send sooner: the active window stands.
+        let limiter = TelegramRateLimiter::new();
+        limiter.note_rate_limited(30);
         limiter.note_rate_limited(u64::MAX);
         match limiter.check() {
             RateLimitGate::Blocked(remaining) => {
-                assert!(remaining <= Duration::from_secs(MAX_BLOCK_WINDOW_SECS + 2));
+                assert!(
+                    remaining > Duration::from_secs(29),
+                    "the unrepresentable delay must be rejected, not clamped: {remaining:?}"
+                );
             }
-            RateLimitGate::Clear => panic!("expected blocked after note_rate_limited"),
+            RateLimitGate::Clear => panic!("expected the prior window to survive a bogus note"),
         }
+    }
+
+    #[tokio::test]
+    async fn deliver_waits_out_window_and_sends_when_within_budget() {
+        let mock_server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true, "result": {"message_id": 1}})),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let limiter = TelegramRateLimiter::new();
+        *limiter.blocked_until.lock() = Some(Instant::now() + Duration::from_millis(700));
+
+        let started = Instant::now();
+        let resp = post_bot_api_json(
+            &reqwest::Client::new(),
+            &format!("{}/bottoken/sendMessage", mock_server.uri()),
+            &serde_json::json!({"chat_id": "1", "text": "hi"}),
+            BotApiClass::Deliver,
+            &limiter,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("a window within the budget is waited out, then sent");
+
+        assert!(resp.status().is_success());
+        assert!(
+            started.elapsed() >= Duration::from_millis(700),
+            "the send must not fire before the window expires: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_budget_expiry_makes_no_request() {
+        // Penalty 30s, budget 1s: after the capped wait the gate is still
+        // blocked, so nothing may be sent.
+        let mock_server = wiremock::MockServer::start().await;
+
+        let limiter = TelegramRateLimiter::new();
+        *limiter.blocked_until.lock() = Some(Instant::now() + Duration::from_secs(30));
+
+        let started = Instant::now();
+        let result = post_bot_api_json(
+            &reqwest::Client::new(),
+            &format!("{}/bottoken/sendMessage", mock_server.uri()),
+            &serde_json::json!({"chat_id": "1", "text": "hi"}),
+            BotApiClass::Deliver,
+            &limiter,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        let err = match result {
+            Ok(_) => panic!("a 1s budget must not authorize a send into a 30s window"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(gate_error(&err), TelegramGateError::BudgetExhausted { .. }),
+            "expected BudgetExhausted, got: {err}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "the caller waits its budget before giving up: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            mock_server
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty(),
+            "no request may fire while the window is active"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_rechecks_window_extended_while_asleep() {
+        // The window is short when this caller starts waiting, but a
+        // concurrent 429 extends it mid-wait; the re-check must catch that.
+        let mock_server = wiremock::MockServer::start().await;
+
+        let limiter = TelegramRateLimiter::new();
+        *limiter.blocked_until.lock() = Some(Instant::now() + Duration::from_millis(600));
+
+        let extender = limiter.clone();
+        let extend = zeroclaw_spawn::spawn!(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            extender.note_rate_limited(30);
+        });
+
+        let result = post_bot_api_json(
+            &reqwest::Client::new(),
+            &format!("{}/bottoken/sendMessage", mock_server.uri()),
+            &serde_json::json!({"chat_id": "1", "text": "hi"}),
+            BotApiClass::Deliver,
+            &limiter,
+            Duration::from_secs(60),
+        )
+        .await;
+        extend.await.expect("extender task");
+
+        let err = match result {
+            Ok(_) => panic!("a window extended while asleep must block the send"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(gate_error(&err), TelegramGateError::BudgetExhausted { .. }),
+            "expected BudgetExhausted, got: {err}"
+        );
+        assert!(
+            mock_server
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty(),
+            "no request may fire into the extended window"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_deliver_wait_fires_no_request_and_keeps_window() {
+        // Dropping the caller mid-wait (turn cancelled) must not disturb the
+        // shared window and must not fire a request.
+        let mock_server = wiremock::MockServer::start().await;
+
+        let limiter = TelegramRateLimiter::new();
+        *limiter.blocked_until.lock() = Some(Instant::now() + Duration::from_secs(30));
+
+        let waiter = limiter.clone();
+        let uri = mock_server.uri();
+        let task = zeroclaw_spawn::spawn!(async move {
+            post_bot_api_json(
+                &reqwest::Client::new(),
+                &format!("{uri}/bottoken/sendMessage"),
+                &serde_json::json!({"chat_id": "1", "text": "hi"}),
+                BotApiClass::Deliver,
+                &waiter,
+                Duration::from_secs(60),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        task.abort();
+        let _ = task.await;
+
+        assert!(
+            mock_server
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty(),
+            "a cancelled waiter must not leave a request in flight"
+        );
+        assert!(
+            matches!(limiter.check(), RateLimitGate::Blocked(_)),
+            "the window survives a cancelled waiter for the token's other callers"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_retry_after_429_waits_and_sends_once() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+
+        let mock_server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 429,
+                "description": "Too Many Requests: retry after 1",
+                "parameters": { "retry_after": 1 }
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true, "result": {"message_id": 1}})),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let limiter = TelegramRateLimiter::new();
+        let started = Instant::now();
+        let resp = post_bot_api_json(
+            &reqwest::Client::new(),
+            &format!("{}/bottoken/sendMessage", mock_server.uri()),
+            &serde_json::json!({"chat_id": "1", "text": "hi"}),
+            BotApiClass::Deliver,
+            &limiter,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("the gated retry delivers");
+
+        assert!(resp.status().is_success());
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "the retry must wait out the noted window: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            mock_server
+                .received_requests()
+                .await
+                .expect("requests")
+                .len(),
+            2,
+            "exactly the flood-limited attempt and one gated retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_429_contributes_its_own_longer_deadline() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+
+        // 1s then 30s: the second 429 must record *its* delay, not re-note
+        // the first response's.
+        let mock_server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 429,
+                "description": "Too Many Requests: retry after 1",
+                "parameters": { "retry_after": 1 }
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 429,
+                "description": "Too Many Requests: retry after 30",
+                "parameters": { "retry_after": 30 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let limiter = TelegramRateLimiter::new();
+        let result = post_bot_api_json(
+            &reqwest::Client::new(),
+            &format!("{}/bottoken/sendMessage", mock_server.uri()),
+            &serde_json::json!({"chat_id": "1", "text": "hi"}),
+            BotApiClass::Deliver,
+            &limiter,
+            Duration::from_secs(30),
+        )
+        .await;
+
+        let err = match result {
+            Ok(_) => panic!("a retry answered 429 must not be returned as a usable response"),
+            Err(err) => err,
+        };
+        match gate_error(&err) {
+            TelegramGateError::FloodLimited { retry_after_secs } => {
+                assert_eq!(*retry_after_secs, 30, "the second 429's own delay");
+            }
+            other => panic!("expected FloodLimited from the retried 429, got: {other}"),
+        }
+        match limiter.check() {
+            RateLimitGate::Blocked(remaining) => {
+                assert!(
+                    remaining > Duration::from_secs(28),
+                    "the shared window must carry the second 429's 30s: {remaining:?}"
+                );
+            }
+            RateLimitGate::Clear => panic!("expected the 30s window to be noted"),
+        }
+        assert_eq!(
+            mock_server
+                .received_requests()
+                .await
+                .expect("requests")
+                .len(),
+            2,
+            "one attempt, one retry, no fallback fire"
+        );
+    }
+
+    #[tokio::test]
+    async fn droppable_call_makes_no_network_request_inside_window() {
+        let mock_server = wiremock::MockServer::start().await;
+
+        let limiter = TelegramRateLimiter::new();
+        limiter.note_rate_limited(30);
+
+        let result = post_bot_api_json(
+            &reqwest::Client::new(),
+            &format!("{}/bottoken/sendChatAction", mock_server.uri()),
+            &serde_json::json!({"chat_id": "1", "action": "typing"}),
+            BotApiClass::Droppable,
+            &limiter,
+            Duration::from_secs(30),
+        )
+        .await;
+
+        let err = match result {
+            Ok(_) => panic!("a blocked droppable call must be skipped"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(gate_error(&err), TelegramGateError::Skipped { .. }),
+            "expected Skipped, got: {err}"
+        );
+        assert!(
+            mock_server
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty(),
+            "a skipped call must not reach the network"
+        );
+    }
+
+    #[tokio::test]
+    async fn droppable_429_is_reported_as_flood_limited() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+
+        let mock_server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 429,
+                "description": "Too Many Requests: retry after 7",
+                "parameters": { "retry_after": 7 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let limiter = TelegramRateLimiter::new();
+        let result = post_bot_api_json(
+            &reqwest::Client::new(),
+            &format!("{}/bottoken/sendChatAction", mock_server.uri()),
+            &serde_json::json!({"chat_id": "1", "action": "typing"}),
+            BotApiClass::Droppable,
+            &limiter,
+            Duration::from_secs(30),
+        )
+        .await;
+
+        let err = match result {
+            Ok(_) => panic!("a 429-answered droppable call must fail"),
+            Err(err) => err,
+        };
+        match gate_error(&err) {
+            TelegramGateError::FloodLimited { retry_after_secs } => {
+                assert_eq!(*retry_after_secs, 7);
+            }
+            other => panic!("expected FloodLimited, got: {other}"),
+        }
+        assert!(matches!(limiter.check(), RateLimitGate::Blocked(_)));
     }
 }

@@ -10699,21 +10699,49 @@ async fn process_channel_message_body(
                                 true
                             }
                             Err(e) => {
-                                ::zeroclaw_log::record!(
-                                    WARN,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Note
+                                // Telegram flood-control exhaustion is not a
+                                // formatting failure: the token is inside an
+                                // active 429 window that already outlasted the
+                                // wait budget, so the fresh-send fallback would
+                                // only hit the same gate. Stop instead.
+                                #[cfg(feature = "channel-telegram")]
+                                let flood_limited = e
+                                    .downcast_ref::<crate::telegram_rate_limit::TelegramGateError>(
                                     )
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                                    "Failed to finalize draft; sending as new message"
-                                );
-                                let mut fallback = SendMessage::reply_to(&msg, &delivered_response);
-                                if suppress {
-                                    fallback = fallback.suppress_voice();
+                                    .is_some();
+                                #[cfg(not(feature = "channel-telegram"))]
+                                let flood_limited = false;
+                                if flood_limited {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                        "Final answer held: Telegram flood-control window outlasted \
+                                         the wait budget; not falling back to a fresh send"
+                                    );
+                                    false
+                                } else {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                        "Failed to finalize draft; sending as new message"
+                                    );
+                                    let mut fallback =
+                                        SendMessage::reply_to(&msg, &delivered_response);
+                                    if suppress {
+                                        fallback = fallback.suppress_voice();
+                                    }
+                                    channel.send_final(&fallback).await.is_ok()
                                 }
-                                channel.send_final(&fallback).await.is_ok()
                             }
                         }
                     }
@@ -12696,10 +12724,6 @@ fn build_channel_by_id(
                 .with_api_base(tg.api_base_url.clone())
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
-                .with_rate_limit_tuning(
-                    tg.rate_limit_max_wait_secs,
-                    tg.typing_refresh_interval_secs,
-                )
                 .with_passive_group_context(tg.passive_group_context)
                 .with_transcription_manager(
                     config.transcription.clone(),
@@ -14279,10 +14303,6 @@ fn collect_configured_channels_with_authority(
                     .with_api_base(tg.api_base_url.clone())
                     .with_ack_reactions(ack)
                     .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
-                    .with_rate_limit_tuning(
-                        tg.rate_limit_max_wait_secs,
-                        tg.typing_refresh_interval_secs,
-                    )
                     .with_passive_group_context(tg.passive_group_context)
                     .with_transcription_manager(
                         config.transcription.clone(),
