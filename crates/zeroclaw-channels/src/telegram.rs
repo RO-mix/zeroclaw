@@ -993,13 +993,6 @@ pub struct TelegramChannel {
     /// Shared per-token flood-control window (HTTP 429 / `retry_after`).
     /// Runtime-only mirror of Telegram's server-side limiter; not config.
     rate_limiter: TelegramRateLimiter,
-    /// Ceiling on how long a deliver-class Bot API call waits out a
-    /// flood-control window. Canonical source:
-    /// `[channels.telegram.<alias>].rate_limit_max_wait_secs`.
-    rate_limit_max_wait_secs: u64,
-    /// Typing-indicator refresh cadence for `start_typing`'s loop. Canonical
-    /// source: `[channels.telegram.<alias>].typing_refresh_interval_secs`.
-    typing_refresh_interval_secs: u64,
     last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
     /// Per-draft MultiMessage streaming state keyed by `(recipient, draft_id)`.
     multi_message_drafts: Mutex<std::collections::HashMap<MultiDraftKey, MultiDraftState>>,
@@ -2625,8 +2618,6 @@ impl TelegramChannel {
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: TELEGRAM_DRAFT_UPDATE_INTERVAL_MS,
             rate_limiter: TelegramRateLimiter::new(),
-            rate_limit_max_wait_secs: TELEGRAM_RATE_LIMIT_MAX_WAIT_SECS,
-            typing_refresh_interval_secs: TELEGRAM_TYPING_REFRESH_INTERVAL_SECS,
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
             multi_message_drafts: Mutex::new(std::collections::HashMap::new()),
             typing_handle: Mutex::new(None),
@@ -2805,25 +2796,39 @@ impl TelegramChannel {
         self
     }
 
-    /// Configure flood-control handling: the ceiling on deliver-class waits
-    /// and the typing-indicator refresh cadence. Zeros fall back to the
-    /// channel defaults, matching `with_streaming`.
-    pub fn with_rate_limit_tuning(
-        mut self,
-        rate_limit_max_wait_secs: u64,
-        typing_refresh_interval_secs: u64,
-    ) -> Self {
-        self.rate_limit_max_wait_secs = if rate_limit_max_wait_secs == 0 {
-            TELEGRAM_RATE_LIMIT_MAX_WAIT_SECS
-        } else {
-            rate_limit_max_wait_secs
-        };
-        self.typing_refresh_interval_secs = if typing_refresh_interval_secs == 0 {
-            TELEGRAM_TYPING_REFRESH_INTERVAL_SECS
-        } else {
-            typing_refresh_interval_secs
-        };
-        self
+    /// Canonical source: `[channels.telegram.<alias>].rate_limit_max_wait_secs`
+    /// and `.typing_refresh_interval_secs`, read from the live config handle
+    /// in one guard acquisition. Shared by the channel methods and the
+    /// detached typing loop, which has no `&self`. A zero value restores the
+    /// channel default (it is not a disable switch), and a channel without a
+    /// persistence authority runs on the defaults.
+    fn resolve_rate_limit_tuning(
+        persist: &Option<zeroclaw_runtime::LiveConfigAuthority>,
+        alias: &str,
+    ) -> (u64, u64) {
+        let configured = persist.as_ref().and_then(|config| {
+            config
+                .live_handle()
+                .read()
+                .channels
+                .telegram
+                .get(alias)
+                .map(|tg| (tg.rate_limit_max_wait_secs, tg.typing_refresh_interval_secs))
+        });
+        let max_wait = configured
+            .map(|(max_wait, _)| max_wait)
+            .filter(|max_wait| *max_wait > 0)
+            .unwrap_or(TELEGRAM_RATE_LIMIT_MAX_WAIT_SECS);
+        let refresh = configured
+            .map(|(_, refresh)| refresh)
+            .filter(|refresh| *refresh > 0)
+            .unwrap_or(TELEGRAM_TYPING_REFRESH_INTERVAL_SECS);
+        (max_wait, refresh)
+    }
+
+    /// Canonical source: `[channels.telegram.<alias>].rate_limit_max_wait_secs`.
+    fn resolve_rate_limit_max_wait_secs(&self) -> u64 {
+        Self::resolve_rate_limit_tuning(&self.persist, &self.alias).0
     }
 
     /// Canonical source: `[channels.telegram.<alias>].multi_message_delay_ms`.
@@ -3790,7 +3795,7 @@ impl TelegramChannel {
 
     /// POST to a Bot API method through the shared per-token flood-control
     /// gate (see [`crate::telegram_rate_limit::post_bot_api_json`]). Deliver-
-    /// class calls wait out an active 429 window (bounded by
+    /// class calls wait out an active 429 window (bounded by the live
     /// `rate_limit_max_wait_secs`) and retry once on a fresh 429; Droppable
     /// calls fail with a skip error instead of touching the network.
     async fn bot_api_post(
@@ -3805,7 +3810,7 @@ impl TelegramChannel {
             body,
             class,
             &self.rate_limiter,
-            Duration::from_secs(self.rate_limit_max_wait_secs),
+            Duration::from_secs(self.resolve_rate_limit_max_wait_secs()),
         )
         .await
     }
@@ -6289,7 +6294,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// time and reports how many chunks it accepted before a failure. On such a
     /// partial failure this first *resumes* from the accepted prefix, so a
     /// transient error still completes the answer without re-posting earlier
-    /// chunks. If the resume also fails after some chunks were accepted, it
+    /// chunks — unless the failure is flood-control exhaustion
+    /// ([`crate::telegram_rate_limit::TelegramGateError`]), which is not a
+    /// formatting failure: the window is still active, so no resume is
+    /// attempted. If the resume also fails after some chunks were accepted, it
     /// returns [`FinalizePartialDelivery`] so the orchestrator's generic
     /// finalize fallback does not resend the whole answer and duplicate what
     /// Telegram already delivered. A failure before any chunk is accepted
@@ -6328,7 +6336,20 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 source,
                 ..
             }) => Err(source),
-            Err(SendChunksError { delivered, .. }) => {
+            Err(SendChunksError {
+                delivered, source, ..
+            }) => {
+                // Flood-control exhaustion is not a formatting failure: the
+                // token is inside an active window that already outlasted the
+                // wait budget, so resuming would just burn the budget again.
+                // Report the accepted prefix so the orchestrator does not
+                // resend it, and stop.
+                if source
+                    .downcast_ref::<crate::telegram_rate_limit::TelegramGateError>()
+                    .is_some()
+                {
+                    return Err(zeroclaw_api::channel::FinalizePartialDelivery { delivered }.into());
+                }
                 // Some chunks are already posted. Resume from the first unsent
                 // chunk rather than restarting, then report the accepted prefix
                 // if it still cannot finish.
@@ -7795,11 +7816,13 @@ impl Channel for TelegramChannel {
                     body["message_thread_id"] = serde_json::Value::String(tid.to_string());
                 }
 
+                // The draft placeholder is user-visible (it becomes the final
+                // answer), so it is Deliver-class: it waits out an active
+                // flood-control window within budget, its own 429 feeds the
+                // shared limiter, and an exhausted budget fails the draft —
+                // the orchestrator then falls back to the (gated) plain send.
                 let resp = self
-                    .http_client()
-                    .post(self.api_url("sendMessage"))
-                    .json(&body)
-                    .send()
+                    .bot_api_post("sendMessage", &body, BotApiClass::Deliver)
                     .await?;
 
                 if !resp.status().is_success() {
@@ -8655,11 +8678,16 @@ Ensure only one `zeroclaw` process is using this bot token."
         let url = self.api_url("sendChatAction");
         let chat_id = recipient.to_string();
         let rate_limiter = self.rate_limiter.clone();
-        let max_wait = Duration::from_secs(self.rate_limit_max_wait_secs);
-        let refresh = Duration::from_secs(self.typing_refresh_interval_secs);
+        // The detached loop re-resolves both flood-control tunables from the
+        // live config on every tick (AGENTS.md single source of truth); a
+        // channel without persistence authority gets the defaults.
+        let persist = self.persist.clone();
+        let alias = self.alias.clone();
 
         let handle = zeroclaw_spawn::spawn!(async move {
             loop {
+                let (max_wait_secs, refresh_secs) =
+                    TelegramChannel::resolve_rate_limit_tuning(&persist, &alias);
                 let body = serde_json::json!({
                     "chat_id": &chat_id,
                     "action": "typing"
@@ -8672,11 +8700,11 @@ Ensure only one `zeroclaw` process is using this bot token."
                     &body,
                     BotApiClass::Droppable,
                     &rate_limiter,
-                    max_wait,
+                    Duration::from_secs(max_wait_secs),
                 )
                 .await;
                 // Telegram typing indicator expires after ~5s; refresh sooner.
-                tokio::time::sleep(refresh).await;
+                tokio::time::sleep(Duration::from_secs(refresh_secs)).await;
             }
         });
 
@@ -8976,6 +9004,24 @@ mod tests {
             TelegramConfig {
                 bot_token: "fake-token".into(),
                 multi_message_delay_ms,
+                ..TelegramConfig::default()
+            },
+        );
+        LiveConfigAuthority::new(config)
+    }
+
+    fn telegram_rate_limit_authority(
+        alias: &str,
+        rate_limit_max_wait_secs: u64,
+        typing_refresh_interval_secs: u64,
+    ) -> LiveConfigAuthority {
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            alias.to_string(),
+            TelegramConfig {
+                bot_token: "fake-token".into(),
+                rate_limit_max_wait_secs,
+                typing_refresh_interval_secs,
                 ..TelegramConfig::default()
             },
         );
@@ -24999,6 +25045,139 @@ mod tests {
             mock_server.received_requests().await.unwrap().len(),
             1,
             "only chat 100's flood-limited sendMessage attempt reached the mock"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_channel_fires_no_premature_request_when_starting_a_draft() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .expect(0)
+            .named("no draft creation may fire while the token is blocked")
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 0)
+        .with_persistence_authority(telegram_rate_limit_authority("telegram_test_alias", 1, 4))
+        .with_mock_api_base(mock_server.uri());
+        ch.rate_limiter.note_rate_limited(30);
+
+        // Draft creation is Deliver-class: it waits its 1s budget, re-checks
+        // the still-active window, and fails without a network request.
+        let started = std::time::Instant::now();
+        let err = match ch.send_draft(&SendMessage::new("hello", "123")).await {
+            Ok(_) => panic!("a blocked channel must not create a draft over the wire"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(
+                err.downcast_ref::<crate::telegram_rate_limit::TelegramGateError>(),
+                Some(crate::telegram_rate_limit::TelegramGateError::BudgetExhausted { .. })
+            ),
+            "expected BudgetExhausted, got: {err}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "draft creation waits its budget before giving up: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            mock_server.received_requests().await.unwrap().is_empty(),
+            "no premature network request while the token is blocked"
+        );
+    }
+
+    #[test]
+    fn rate_limit_tuning_resolves_from_live_config_without_rebuilding_the_channel() {
+        let authority = telegram_rate_limit_authority("telegram_test_alias", 60, 4);
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_persistence_authority(authority.clone());
+
+        assert_eq!(ch.resolve_rate_limit_max_wait_secs(), 60);
+        assert_eq!(
+            TelegramChannel::resolve_rate_limit_tuning(&ch.persist, &ch.alias),
+            (60, 4)
+        );
+
+        // A published change reaches the next use of the already-running
+        // channel — no rebuild, no restart-only snapshot.
+        let mut updated = Config::default();
+        updated.channels.telegram.insert(
+            "telegram_test_alias".to_string(),
+            TelegramConfig {
+                bot_token: "fake-token".into(),
+                rate_limit_max_wait_secs: 7,
+                typing_refresh_interval_secs: 9,
+                ..TelegramConfig::default()
+            },
+        );
+        authority.publish_for_test(updated);
+
+        assert_eq!(ch.resolve_rate_limit_max_wait_secs(), 7);
+        assert_eq!(
+            TelegramChannel::resolve_rate_limit_tuning(&ch.persist, &ch.alias),
+            (7, 9)
+        );
+
+        // Zero restores the channel default; it is not a disable switch.
+        let mut zeroed = Config::default();
+        zeroed.channels.telegram.insert(
+            "telegram_test_alias".to_string(),
+            TelegramConfig {
+                bot_token: "fake-token".into(),
+                rate_limit_max_wait_secs: 0,
+                typing_refresh_interval_secs: 0,
+                ..TelegramConfig::default()
+            },
+        );
+        authority.publish_for_test(zeroed);
+        assert_eq!(
+            TelegramChannel::resolve_rate_limit_tuning(&ch.persist, &ch.alias),
+            (
+                TELEGRAM_RATE_LIMIT_MAX_WAIT_SECS,
+                TELEGRAM_TYPING_REFRESH_INTERVAL_SECS
+            )
+        );
+    }
+
+    #[test]
+    fn rate_limit_tuning_falls_back_to_defaults_without_persistence_authority() {
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        assert_eq!(
+            ch.resolve_rate_limit_max_wait_secs(),
+            TELEGRAM_RATE_LIMIT_MAX_WAIT_SECS
+        );
+        assert_eq!(
+            TelegramChannel::resolve_rate_limit_tuning(&ch.persist, &ch.alias),
+            (
+                TELEGRAM_RATE_LIMIT_MAX_WAIT_SECS,
+                TELEGRAM_TYPING_REFRESH_INTERVAL_SECS
+            )
         );
     }
 }
