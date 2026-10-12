@@ -191,41 +191,53 @@ pub(crate) fn parse_retry_after(body: &str) -> Option<u64> {
     }
 }
 
-/// Wait out an active flood-control window for a Deliver-class call, bounded
-/// by the caller's `max_wait` budget, then re-check the shared gate before
-/// returning. The budget bounds how long *this caller* waits, never the
-/// server deadline: a window that outlives the budget — or that a concurrent
-/// 429 extended while this caller slept — ends the wait with
+/// Wait out an active flood-control window for a Deliver-class call, drawing
+/// down the caller's `budget` — the remaining slice of the operation's single
+/// `max_wait` allowance, shared by the pre-send wait and the wait before the
+/// retry. The loop keeps waiting and re-checking until the gate clears or the
+/// budget runs out: a window extended by a concurrent 429 while this caller
+/// sleeps is honored (never sent into) as long as budget remains. The budget
+/// bounds how long *this caller* waits, never the server deadline: when it is
+/// spent and the window is still active, the wait ends with
 /// [`TelegramGateError::BudgetExhausted`] instead of an early send.
 async fn wait_out_window(
     limiter: &TelegramRateLimiter,
-    max_wait: Duration,
+    budget: &mut Duration,
 ) -> Result<(), TelegramGateError> {
-    if let RateLimitGate::Blocked(remaining) = limiter.check() {
-        tokio::time::sleep(remaining.min(max_wait)).await;
-        if let RateLimitGate::Blocked(still_blocked) = limiter.check() {
-            return Err(TelegramGateError::BudgetExhausted {
-                remaining: still_blocked,
-            });
+    loop {
+        match limiter.check() {
+            RateLimitGate::Clear => return Ok(()),
+            RateLimitGate::Blocked(remaining) => {
+                if budget.is_zero() {
+                    return Err(TelegramGateError::BudgetExhausted { remaining });
+                }
+                let wait = remaining.min(*budget);
+                let slept = Instant::now();
+                tokio::time::sleep(wait).await;
+                *budget = budget.saturating_sub(slept.elapsed());
+            }
         }
     }
-    Ok(())
 }
 
 /// POST `body` to a Bot API `url` through the shared flood-control gate.
 ///
 /// - Pre-send, a Droppable call inside the window fails with
 ///   [`TelegramGateError::Skipped`] without any network call; a Deliver call
-///   waits out the window (bounded by `max_wait`) and re-checks the gate —
-///   still blocked means [`TelegramGateError::BudgetExhausted`], no request.
+///   waits out the window (bounded by `max_wait`, re-checking after each
+///   sleep so a mid-wait extension is honored while budget remains) — a spent
+///   budget with the gate still blocked means
+///   [`TelegramGateError::BudgetExhausted`], no request.
 /// - On a 429 answer the window is noted from that response's own
 ///   `retry_after`. Droppable calls then fail with
 ///   [`TelegramGateError::FloodLimited`] (the body was consumed for parsing,
 ///   so no response survives to return); Deliver calls wait the window out
-///   (same bounded re-checking wait) and retry once. A retry that also 429s
-///   contributes its own — possibly longer — `retry_after` to the window and
-///   fails with [`TelegramGateError::FloodLimited`]: the caller's
-///   formatting/resume fallbacks must stop, a 429 is not a formatting failure.
+///   from the *remaining* budget — the pre-send wait and this wait share one
+///   per-operation allowance, so a call never waits longer than `max_wait`
+///   in total — and retry once. A retry that also 429s contributes its own —
+///   possibly longer — `retry_after` to the window and fails with
+///   [`TelegramGateError::FloodLimited`]: the caller's formatting/resume
+///   fallbacks must stop, a 429 is not a formatting failure.
 ///
 /// Any other status — success or failure — is returned untouched, and
 /// transport errors propagate.
@@ -237,13 +249,16 @@ pub(crate) async fn post_bot_api_json(
     limiter: &TelegramRateLimiter,
     max_wait: Duration,
 ) -> anyhow::Result<reqwest::Response> {
+    // One caller-side allowance covers the whole operation; Droppable calls
+    // never draw on it.
+    let mut budget = max_wait;
     match class {
         BotApiClass::Droppable => {
             if let RateLimitGate::Blocked(remaining) = limiter.check() {
                 return Err(TelegramGateError::Skipped { remaining }.into());
             }
         }
-        BotApiClass::Deliver => wait_out_window(limiter, max_wait).await?,
+        BotApiClass::Deliver => wait_out_window(limiter, &mut budget).await?,
     }
 
     let resp = client.post(url).json(body).send().await?;
@@ -258,7 +273,7 @@ pub(crate) async fn post_bot_api_json(
     match class {
         BotApiClass::Droppable => Err(TelegramGateError::FloodLimited { retry_after_secs }.into()),
         BotApiClass::Deliver => {
-            wait_out_window(limiter, max_wait).await?;
+            wait_out_window(limiter, &mut budget).await?;
             let retry = client.post(url).json(body).send().await?;
             if retry.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
                 return Ok(retry);
@@ -492,9 +507,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliver_rechecks_window_extended_while_asleep() {
+    async fn deliver_keeps_waiting_when_window_extended_within_budget() {
         // The window is short when this caller starts waiting, but a
-        // concurrent 429 extends it mid-wait; the re-check must catch that.
+        // concurrent 429 extends it mid-wait. With most of the budget still
+        // remaining, the caller must keep waiting and re-checking — not give
+        // up after one sleep — and the send lands once the extended window
+        // clears, well within budget.
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+
+        let mock_server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true, "result": {"message_id": 1}})),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let limiter = TelegramRateLimiter::new();
+        *limiter.blocked_until.lock() = Some(Instant::now() + Duration::from_millis(600));
+
+        let extender = limiter.clone();
+        let extend = zeroclaw_spawn::spawn!(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            extender.note_rate_limited(2);
+        });
+
+        let started = Instant::now();
+        let resp = post_bot_api_json(
+            &reqwest::Client::new(),
+            &format!("{}/bottoken/sendMessage", mock_server.uri()),
+            &serde_json::json!({"chat_id": "1", "text": "hi"}),
+            BotApiClass::Deliver,
+            &limiter,
+            Duration::from_secs(30),
+        )
+        .await;
+        extend.await.expect("extender task");
+
+        assert!(
+            resp.expect("an extension within budget is waited out")
+                .status()
+                .is_success()
+        );
+        assert!(
+            started.elapsed() >= Duration::from_secs(2),
+            "the extended window must be honored, not slept through once: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_stops_when_window_extension_outlives_budget() {
+        // Same mid-wait extension, but the extended window outlives the
+        // remaining budget: no request may fire.
         let mock_server = wiremock::MockServer::start().await;
 
         let limiter = TelegramRateLimiter::new();
@@ -506,24 +574,30 @@ mod tests {
             extender.note_rate_limited(30);
         });
 
+        let started = Instant::now();
         let result = post_bot_api_json(
             &reqwest::Client::new(),
             &format!("{}/bottoken/sendMessage", mock_server.uri()),
             &serde_json::json!({"chat_id": "1", "text": "hi"}),
             BotApiClass::Deliver,
             &limiter,
-            Duration::from_secs(60),
+            Duration::from_secs(1),
         )
         .await;
         extend.await.expect("extender task");
 
         let err = match result {
-            Ok(_) => panic!("a window extended while asleep must block the send"),
+            Ok(_) => panic!("a window extended past the budget must block the send"),
             Err(err) => err,
         };
         assert!(
             matches!(gate_error(&err), TelegramGateError::BudgetExhausted { .. }),
             "expected BudgetExhausted, got: {err}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "the caller waits its whole budget before giving up: {:?}",
+            started.elapsed()
         );
         assert!(
             mock_server
@@ -532,6 +606,65 @@ mod tests {
                 .expect("requests")
                 .is_empty(),
             "no request may fire into the extended window"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_send_and_retry_waits_share_one_budget() {
+        // One 4s operation budget: the pre-send wait consumes ~3s of it, so
+        // the post-429 wait sees only ~1s remaining — not a fresh 4s — and
+        // the 2s retry window outlives it. The retry must NOT fire.
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+
+        let mock_server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 429,
+                "description": "Too Many Requests: retry after 2",
+                "parameters": { "retry_after": 2 }
+            })))
+            .expect(1)
+            .named("the initial attempt is the only request")
+            .mount(&mock_server)
+            .await;
+
+        let limiter = TelegramRateLimiter::new();
+        *limiter.blocked_until.lock() = Some(Instant::now() + Duration::from_secs(3));
+
+        let started = Instant::now();
+        let result = post_bot_api_json(
+            &reqwest::Client::new(),
+            &format!("{}/bottoken/sendMessage", mock_server.uri()),
+            &serde_json::json!({"chat_id": "1", "text": "hi"}),
+            BotApiClass::Deliver,
+            &limiter,
+            Duration::from_secs(4),
+        )
+        .await;
+
+        let err = match result {
+            Ok(_) => panic!("the retry must not get a fresh budget after the pre-send wait"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(gate_error(&err), TelegramGateError::BudgetExhausted { .. }),
+            "expected BudgetExhausted, got: {err}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_secs(4),
+            "the operation spends its whole 4s budget across both waits: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            mock_server
+                .received_requests()
+                .await
+                .expect("requests")
+                .len(),
+            1,
+            "the retry never fires once the shared budget is spent"
         );
     }
 

@@ -17411,9 +17411,17 @@ pub async fn deliver_announcement(
             let peers = config.channel_external_peers("telegram", alias);
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
+            // This one-off channel has no daemon persistence authority, so
+            // its live-config resolvers would fall back to built-in defaults.
+            // Attach an in-memory authority over the supplied config (the
+            // same move the one-shot factory makes) so operator settings like
+            // `rate_limit_max_wait_secs` apply to announcement sends too.
             let ch =
                 TelegramChannel::new(tg.bot_token.clone(), alias, peer_resolver, tg.mention_only)
-                    .with_api_base(tg.api_base_url.clone());
+                    .with_api_base(tg.api_base_url.clone())
+                    .with_persistence_authority(zeroclaw_runtime::LiveConfigAuthority::new(
+                        config.clone(),
+                    ));
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(not(feature = "channel-telegram"))]
@@ -55133,6 +55141,72 @@ Done."#;
                 "{channel} must report the real config table [channels.lark.default]; got: {msg}"
             );
         }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-telegram")]
+    async fn deliver_announcement_telegram_honors_configured_rate_limit_budget() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // The one-off announcement channel has no daemon persistence
+        // authority; without the in-memory authority over the supplied
+        // config, its resolver would wait the 60s default instead of the
+        // configured 1s — and the retry would fire into the 30s penalty.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 429,
+                "description": "Too Many Requests: retry after 30",
+                "parameters": { "retry_after": 30 }
+            })))
+            .expect(1)
+            .named("the flood-limited attempt is the only request")
+            .mount(&mock_server)
+            .await;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.telegram.insert(
+            "ann".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                bot_token: "fake-token".into(),
+                api_base_url: mock_server.uri(),
+                rate_limit_max_wait_secs: 1,
+                ..Default::default()
+            },
+        );
+
+        let started = std::time::Instant::now();
+        let err = deliver_announcement(&config, "telegram.ann", "123", None, "hello")
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("a 1s configured budget cannot wait out a 30s penalty"));
+
+        assert!(
+            format!("{err:#}").contains("wait budget"),
+            "expected the wait-budget outcome, got: {err:#}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "the configured 1s budget is waited before giving up: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the configured 1s budget must apply instead of the 60s default: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            mock_server
+                .received_requests()
+                .await
+                .expect("requests")
+                .len(),
+            1,
+            "no retry may fire once the configured budget is spent"
+        );
     }
 
     #[tokio::test]
