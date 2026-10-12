@@ -17926,9 +17926,17 @@ pub async fn deliver_announcement(
             let peers = config.channel_external_peers("telegram", alias);
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
+            // This one-off channel has no daemon persistence authority, so
+            // its live-config resolvers would fall back to built-in defaults.
+            // Attach an in-memory authority over the supplied config (the
+            // same move the one-shot factory makes) so operator settings like
+            // `rate_limit_max_wait_secs` apply to announcement sends too.
             let ch =
                 TelegramChannel::new(tg.bot_token.clone(), alias, peer_resolver, tg.mention_only)
-                    .with_api_base(tg.api_base_url.clone());
+                    .with_api_base(tg.api_base_url.clone())
+                    .with_persistence_authority(zeroclaw_runtime::LiveConfigAuthority::new(
+                        config.clone(),
+                    ));
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(not(feature = "channel-telegram"))]
@@ -57256,6 +57264,68 @@ Done."#;
                 "{channel} must report the real config table [channels.lark.default]; got: {msg}"
             );
         }
+    }
+
+    /// A one-off announcement channel shares the sendMessage flood policy: a
+    /// penalty past the 60s inline wait ceiling fails the announcement after
+    /// exactly one request — the ceiling is not waited out and no resend
+    /// fires into the window.
+    #[tokio::test]
+    #[cfg(feature = "channel-telegram")]
+    async fn deliver_announcement_telegram_stops_after_one_request_on_long_flood_penalty() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 429,
+                "description": "Too Many Requests: retry after 536",
+                "parameters": { "retry_after": 536 }
+            })))
+            .expect(1)
+            .named("the flood-limited attempt is the only request")
+            .mount(&mock_server)
+            .await;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.telegram.insert(
+            "ann".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                bot_token: "fake-token".into(),
+                api_base_url: mock_server.uri(),
+                ..Default::default()
+            },
+        );
+
+        let started = std::time::Instant::now();
+        let err = deliver_announcement(&config, "telegram.ann", "123", None, "hello")
+            .await
+            .err()
+            .unwrap_or_else(|| {
+                panic!("a penalty past the inline ceiling must fail the announcement")
+            });
+
+        assert!(
+            format!("{err:#}").contains("rate limited"),
+            "expected the rate-limited outcome, got: {err:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "a penalty past the inline ceiling must not be waited out: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            mock_server
+                .received_requests()
+                .await
+                .expect("requests")
+                .len(),
+            1,
+            "no retry may fire into the penalty window"
+        );
     }
 
     #[tokio::test]
