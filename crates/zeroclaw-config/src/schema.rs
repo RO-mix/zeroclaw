@@ -16826,7 +16826,7 @@ pub struct TelegramConfig {
     pub draft_update_interval_ms: u64,
     /// Maximum seconds a deliver-class Bot API call (final answers, approval
     /// prompts) waits out a Telegram flood-control window (`retry_after`)
-    /// before giving up without sending — a window that outlives this budget
+    /// before giving up without sending - a window that outlives this budget
     /// is never sent into. Droppable calls (draft edits, typing indicators)
     /// are skipped instead of waiting. `0` restores the default (this is not
     /// a disable switch). Default: 60.

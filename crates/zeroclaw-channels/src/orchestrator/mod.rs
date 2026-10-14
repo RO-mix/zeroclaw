@@ -57268,7 +57268,7 @@ Done."#;
 
     /// A one-off announcement channel shares the sendMessage flood policy: a
     /// penalty past the 60s inline wait ceiling fails the announcement after
-    /// exactly one request — the ceiling is not waited out and no resend
+    /// exactly one request - the ceiling is not waited out and no resend
     /// fires into the window.
     #[tokio::test]
     #[cfg(feature = "channel-telegram")]

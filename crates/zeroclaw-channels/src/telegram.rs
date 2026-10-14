@@ -6294,7 +6294,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// time and reports how many chunks it accepted before a failure. On such a
     /// partial failure this first *resumes* from the accepted prefix, so a
     /// transient error still completes the answer without re-posting earlier
-    /// chunks — unless the failure is flood-control exhaustion
+    /// chunks - unless the failure is flood-control exhaustion
     /// ([`crate::telegram_rate_limit::TelegramGateError`]), which is not a
     /// formatting failure: the window is still active, so no resume is
     /// attempted. If the resume also fails after some chunks were accepted, it
@@ -7819,7 +7819,7 @@ impl Channel for TelegramChannel {
                 // The draft placeholder is user-visible (it becomes the final
                 // answer), so it is Deliver-class: it waits out an active
                 // flood-control window within budget, its own 429 feeds the
-                // shared limiter, and an exhausted budget fails the draft —
+                // shared limiter, and an exhausted budget fails the draft -
                 // the orchestrator then falls back to the (gated) plain send.
                 let resp = self
                     .bot_api_post("sendMessage", &body, BotApiClass::Deliver)
@@ -25120,7 +25120,7 @@ mod tests {
         );
 
         // A published change reaches the next use of the already-running
-        // channel — no rebuild, no restart-only snapshot.
+        // channel - no rebuild, no restart-only snapshot.
         let mut updated = Config::default();
         updated.channels.telegram.insert(
             "telegram_test_alias".to_string(),
