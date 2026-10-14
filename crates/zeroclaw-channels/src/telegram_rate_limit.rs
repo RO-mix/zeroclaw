@@ -6,15 +6,15 @@
 //! the token's penalty, so this module keeps one shared "blocked until"
 //! instant per channel instance.
 //!
-//! Gated surface: the channel's text traffic — `sendMessage` (final answers,
+//! Gated surface: the channel's text traffic - `sendMessage` (final answers,
 //! draft creation, approval prompts), `editMessageText` (draft updates and
-//! finalize), and `sendChatAction` (typing) — goes through
+//! finalize), and `sendChatAction` (typing) - goes through
 //! [`post_bot_api_json`]. Media uploads, `deleteMessage`, `answerCallbackQuery`,
 //! and the model picker's markup edits still post directly; they are not
 //! covered by this gate.
 //!
 //! State-source justification (AGENTS.md): `blocked_until` is newly created
-//! runtime state — the only local mirror of Telegram's own server-side
+//! runtime state - the only local mirror of Telegram's own server-side
 //! limiter. It duplicates no config key and no other runtime field.
 
 use std::sync::Arc;
@@ -51,7 +51,7 @@ pub(crate) enum RateLimitGate {
 
 /// Why a gated Bot API call produced no usable response. Every variant means
 /// "nothing was delivered and the shared window already accounts for it", so
-/// callers must stop their formatting/resume/resend fallbacks — a 429 is not
+/// callers must stop their formatting/resume/resend fallbacks - a 429 is not
 /// a formatting failure. Droppable-class callers log at DEBUG and move on.
 #[derive(Debug)]
 pub(crate) enum TelegramGateError {
@@ -64,7 +64,7 @@ pub(crate) enum TelegramGateError {
     /// longer, delay is the one recorded).
     FloodLimited { retry_after_secs: u64 },
     /// A Deliver call spent its whole caller-side wait budget and the shared
-    /// window was still active when it re-checked — the server penalty
+    /// window was still active when it re-checked - the server penalty
     /// outlasts the budget, or a concurrent 429 extended the window while
     /// this caller slept. No (re)send happened.
     BudgetExhausted { remaining: Duration },
@@ -116,8 +116,8 @@ impl TelegramRateLimiter {
     /// deadline only replaces the active one when it is *later*: a 1s answer
     /// landing after a 30s one must not shorten the block. A delay so large
     /// it cannot be represented as an `Instant` is bogus (Telegram penalties
-    /// are seconds to minutes); it is rejected outright — the active deadline
-    /// stands — rather than clamped into permission to send sooner.
+    /// are seconds to minutes); it is rejected outright - the active deadline
+    /// stands - rather than clamped into permission to send sooner.
     pub(crate) fn note_rate_limited(&self, retry_after_secs: u64) {
         let jitter_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -192,7 +192,7 @@ pub(crate) fn parse_retry_after(body: &str) -> Option<u64> {
 }
 
 /// Wait out an active flood-control window for a Deliver-class call, drawing
-/// down the caller's `budget` — the remaining slice of the operation's single
+/// down the caller's `budget` - the remaining slice of the operation's single
 /// `max_wait` allowance, shared by the pre-send wait and the wait before the
 /// retry. The loop keeps waiting and re-checking until the gate clears or the
 /// budget runs out: a window extended by a concurrent 429 while this caller
@@ -225,21 +225,21 @@ async fn wait_out_window(
 /// - Pre-send, a Droppable call inside the window fails with
 ///   [`TelegramGateError::Skipped`] without any network call; a Deliver call
 ///   waits out the window (bounded by `max_wait`, re-checking after each
-///   sleep so a mid-wait extension is honored while budget remains) — a spent
+///   sleep so a mid-wait extension is honored while budget remains) - a spent
 ///   budget with the gate still blocked means
 ///   [`TelegramGateError::BudgetExhausted`], no request.
 /// - On a 429 answer the window is noted from that response's own
 ///   `retry_after`. Droppable calls then fail with
 ///   [`TelegramGateError::FloodLimited`] (the body was consumed for parsing,
 ///   so no response survives to return); Deliver calls wait the window out
-///   from the *remaining* budget — the pre-send wait and this wait share one
+///   from the *remaining* budget - the pre-send wait and this wait share one
 ///   per-operation allowance, so a call never waits longer than `max_wait`
-///   in total — and retry once. A retry that also 429s contributes its own —
-///   possibly longer — `retry_after` to the window and fails with
+///   in total - and retry once. A retry that also 429s contributes its own -
+///   possibly longer - `retry_after` to the window and fails with
 ///   [`TelegramGateError::FloodLimited`]: the caller's formatting/resume
 ///   fallbacks must stop, a 429 is not a formatting failure.
 ///
-/// Any other status — success or failure — is returned untouched, and
+/// Any other status - success or failure - is returned untouched, and
 /// transport errors propagate.
 pub(crate) async fn post_bot_api_json(
     client: &reqwest::Client,
@@ -279,7 +279,7 @@ pub(crate) async fn post_bot_api_json(
                 return Ok(retry);
             }
             // The single permitted retry was flood-limited again: harvest the
-            // new delay into the shared window and stop — returning the 429
+            // new delay into the shared window and stop - returning the 429
             // response would let the caller's formatting fallback fire into
             // the still-active window.
             let retry_after_secs = parse_retry_after(&retry.text().await.unwrap_or_default())
@@ -510,8 +510,8 @@ mod tests {
     async fn deliver_keeps_waiting_when_window_extended_within_budget() {
         // The window is short when this caller starts waiting, but a
         // concurrent 429 extends it mid-wait. With most of the budget still
-        // remaining, the caller must keep waiting and re-checking — not give
-        // up after one sleep — and the send lands once the extended window
+        // remaining, the caller must keep waiting and re-checking - not give
+        // up after one sleep - and the send lands once the extended window
         // clears, well within budget.
         use wiremock::matchers::method;
         use wiremock::{Mock, ResponseTemplate};
@@ -612,7 +612,7 @@ mod tests {
     #[tokio::test]
     async fn pre_send_and_retry_waits_share_one_budget() {
         // One 4s operation budget: the pre-send wait consumes ~3s of it, so
-        // the post-429 wait sees only ~1s remaining — not a fresh 4s — and
+        // the post-429 wait sees only ~1s remaining - not a fresh 4s - and
         // the 2s retry window outlives it. The retry must NOT fire.
         use wiremock::matchers::method;
         use wiremock::{Mock, ResponseTemplate};

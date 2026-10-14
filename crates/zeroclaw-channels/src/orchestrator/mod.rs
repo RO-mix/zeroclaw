@@ -55152,7 +55152,7 @@ Done."#;
         // The one-off announcement channel has no daemon persistence
         // authority; without the in-memory authority over the supplied
         // config, its resolver would wait the 60s default instead of the
-        // configured 1s — and the retry would fire into the 30s penalty.
+        // configured 1s - and the retry would fire into the 30s penalty.
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"/bot[^/]+/sendMessage$"))
