@@ -3106,6 +3106,39 @@ impl TelegramChannel {
                                 skip = e.delivered;
                                 last_sent_at = Some(std::time::Instant::now());
                             }
+                            // A flood-control gate error is terminal for this
+                            // finalization, not an ordinary transient failure:
+                            // the shared window already outlasted one wait
+                            // budget, and each retry or the final-answer send
+                            // below would draw a FRESH budget, restarting waits
+                            // against a gate that still blocks every call. Stop
+                            // here and propagate the gate error itself: the
+                            // orchestrator's flood branch suppresses its resend
+                            // fallback and reports the reply as NOT delivered,
+                            // rather than falsely treating the unsent final
+                            // answer as delivered. The accepted-prefix
+                            // accounting above (`skip`) is preserved and logged.
+                            if e.source
+                                .downcast_ref::<crate::telegram_rate_limit::TelegramGateError>()
+                                .is_some()
+                            {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "error": format!("{}", e.source),
+                                            "chunks_delivered": skip,
+                                        })
+                                    ),
+                                    "Telegram flood-control window outlasted the wait budget during pending-narration delivery; holding the final answer"
+                                );
+                                return Err(e.source);
+                            }
                             attempt += 1;
                             if attempt >= MULTI_MESSAGE_FINALIZE_RETRIES {
                                 ::zeroclaw_log::record!(
@@ -11838,6 +11871,213 @@ mod tests {
         assert!(
             bodies.iter().any(|b| b.contains("Final answer")),
             "the final answer must be delivered after the narration succeeds"
+        );
+    }
+
+    /// Regression: a flood-control gate error while delivering pending
+    /// intermediate narration is terminal for this finalization, not an
+    /// ordinary transient failure. With a ZERO accepted prefix, finalize must
+    /// spend one bounded wait - not one wait per narration retry plus another
+    /// for the final-answer send - fire no request into the active window, and
+    /// propagate the gate error so the orchestrator suppresses its resend
+    /// fallback without reporting the undelivered final answer as delivered.
+    /// The elapsed bound is the real assertion: a request-count-only check
+    /// would pass against the old behavior, which made no further requests but
+    /// still burned three narration waits plus a final-answer wait.
+    #[tokio::test]
+    async fn finalize_stops_on_flood_gate_with_zero_accepted_narration_prefix() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .expect(0)
+            .named("no sendMessage may fire into the active flood window")
+            .mount(&mock_server)
+            .await;
+
+        // Multi-message channel whose deliver wait budget (1s) is far shorter
+        // than the active 30s flood window.
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_persistence_authority(telegram_rate_limit_authority("telegram_test_alias", 1, 4))
+        .with_streaming(StreamMode::MultiMessage, 750)
+        .with_mock_api_base(mock_server.uri());
+        let recipient = "123";
+        let draft_id = TelegramChannel::new_multi_message_draft_id();
+        let key = TelegramChannel::multi_draft_key(recipient, &draft_id);
+
+        // Pending intermediate narration with no accepted prefix.
+        {
+            let mut drafts = ch.multi_message_drafts.lock();
+            let mut st = MultiDraftState::new(None);
+            st.latest_visible = "Searching the docs...".to_string();
+            st.sent_text = String::new();
+            drafts.insert(key.clone(), st);
+        }
+        ch.rate_limiter.note_rate_limited(30);
+
+        let started = std::time::Instant::now();
+        let err = match ch
+            .finalize_draft(recipient, &draft_id, "Final answer", false)
+            .await
+        {
+            Ok(()) => panic!("a gated finalization must not report success"),
+            Err(err) => err,
+        };
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(
+                err.downcast_ref::<crate::telegram_rate_limit::TelegramGateError>(),
+                Some(crate::telegram_rate_limit::TelegramGateError::BudgetExhausted { .. })
+            ),
+            "the terminal gate error must propagate, got: {err}"
+        );
+        assert!(
+            err.downcast_ref::<zeroclaw_api::channel::FinalizePartialDelivery>()
+                .is_none(),
+            "nothing of the final answer reached the wire, so no degraded-delivery report"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(1),
+            "the single bounded wait still elapses: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "no restarted waits: the old behavior spent 3 narration waits plus a final-answer wait (~4s): {elapsed:?}"
+        );
+        assert!(
+            mock_server.received_requests().await.unwrap().is_empty(),
+            "no request may fire into the active window"
+        );
+        assert!(
+            !ch.multi_message_drafts.lock().contains_key(&key),
+            "finalize remains the terminal lifecycle event: no orphaned draft state"
+        );
+    }
+
+    /// Regression: the same terminal gate stop with a NONZERO accepted
+    /// narration prefix. The first pending-chunk attempt is answered 429 with
+    /// a 30s penalty that outlasts the 1s wait budget. Finalize must spend one
+    /// bounded wait, never re-send the accepted prefix, never restart waits
+    /// for the remaining retries or the final answer, and propagate the gate
+    /// error - not `FinalizePartialDelivery`, because the final answer itself
+    /// never reached the wire.
+    #[tokio::test]
+    async fn finalize_stops_on_flood_gate_with_nonzero_accepted_narration_prefix() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 429,
+                "description": "Too Many Requests: retry after 30",
+                "parameters": { "retry_after": 30 }
+            })))
+            .expect(1)
+            .named("the pending-chunk attempt is the only request")
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_persistence_authority(telegram_rate_limit_authority("telegram_test_alias", 1, 4))
+        .with_streaming(StreamMode::MultiMessage, 750)
+        .with_mock_api_base(mock_server.uri());
+        let recipient = "123";
+        let draft_id = TelegramChannel::new_multi_message_draft_id();
+        let key = TelegramChannel::multi_draft_key(recipient, &draft_id);
+
+        // chunk 0 ('A') was accepted by a prior partial flush; the 'B' suffix
+        // is still unsent - the resume point that must never be re-sent.
+        let narration = format!(
+            "{}{}",
+            "A".repeat(TELEGRAM_MAX_MESSAGE_LENGTH),
+            "B".repeat(500)
+        );
+        let chunks = split_message_for_telegram(&narration);
+        assert!(chunks.len() >= 2, "narration must span multiple chunks");
+        {
+            let mut drafts = ch.multi_message_drafts.lock();
+            let mut st = MultiDraftState::new(None);
+            st.latest_visible = narration.clone();
+            st.sent_text = String::new();
+            st.delivered_chunks = 1;
+            st.delivered_prefix = chunks[..1].concat();
+            drafts.insert(key.clone(), st);
+        }
+
+        let started = std::time::Instant::now();
+        let err = match ch
+            .finalize_draft(recipient, &draft_id, "Final answer", false)
+            .await
+        {
+            Ok(()) => panic!("a gated finalization must not report success"),
+            Err(err) => err,
+        };
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(
+                err.downcast_ref::<crate::telegram_rate_limit::TelegramGateError>(),
+                Some(crate::telegram_rate_limit::TelegramGateError::BudgetExhausted { .. })
+            ),
+            "the terminal gate error must propagate, got: {err}"
+        );
+        assert!(
+            err.downcast_ref::<zeroclaw_api::channel::FinalizePartialDelivery>()
+                .is_none(),
+            "the final answer never reached the wire, so no degraded-delivery report"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(1),
+            "the single bounded wait still elapses: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "no restarted waits after the budget-exhausted narration attempt: {elapsed:?}"
+        );
+        let bodies: Vec<String> = mock_server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert_eq!(
+            bodies.len(),
+            1,
+            "the flood-limited attempt is the only request: no retry, no plain fallback, no final answer"
+        );
+        assert!(
+            bodies.iter().any(|b| b.contains(&"B".repeat(200))),
+            "the single request is the pending narration chunk"
+        );
+        assert!(
+            !bodies.iter().any(|b| b.contains(&"A".repeat(200))),
+            "the already-accepted chunk 0 must never be re-sent"
+        );
+        assert!(
+            !ch.multi_message_drafts.lock().contains_key(&key),
+            "finalize remains the terminal lifecycle event: no orphaned draft state"
         );
     }
 
