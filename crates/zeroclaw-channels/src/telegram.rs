@@ -12040,7 +12040,90 @@ mod tests {
         );
     }
 
-    /// Regression:
+    /// Regression: a flood window already noted on the shared per-token gate
+    /// (by an earlier call or a concurrent task on the same token) is
+    /// terminal for a multi-message finalization, not an ordinary transient
+    /// failure: the pending-narration send refuses to fire inside the window,
+    /// no narration retry or final-answer send restarts against the gate, and
+    /// finalize reports `FinalizeUndelivered` so the orchestrator neither
+    /// resends nor counts the unsent final answer as delivered.
+    #[tokio::test]
+    async fn finalize_stops_on_noted_flood_window_with_zero_accepted_narration_prefix() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+                ),
+            )
+            .expect(0)
+            .named("no sendMessage may fire into the active flood window")
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::MultiMessage, 750)
+        .with_mock_api_base(mock_server.uri());
+        let recipient = "123";
+        let draft_id = TelegramChannel::new_multi_message_draft_id();
+        let key = TelegramChannel::multi_draft_key(recipient, &draft_id);
+
+        // Pending intermediate narration with no accepted prefix.
+        {
+            let mut drafts = ch.multi_message_drafts.lock();
+            let mut st = MultiDraftState::new(None);
+            st.latest_visible = "Searching the docs...".to_string();
+            st.sent_text = String::new();
+            drafts.insert(key.clone(), st);
+        }
+        // A window past the inline wait ceiling, as noted by any call on this
+        // token: the narration send must stop without firing a request.
+        ch.rate_limiter.note_rate_limited(120);
+
+        let started = std::time::Instant::now();
+        let err = match ch
+            .finalize_draft(recipient, &draft_id, "Final answer", false)
+            .await
+        {
+            Ok(()) => panic!("a gated finalization must not report success"),
+            Err(err) => err,
+        };
+        let elapsed = started.elapsed();
+
+        assert!(
+            err.downcast_ref::<zeroclaw_api::channel::FinalizeUndelivered>()
+                .is_some(),
+            "the terminal flood stop must report FinalizeUndelivered, got: {err:#}"
+        );
+        assert!(
+            err.downcast_ref::<zeroclaw_api::channel::FinalizePartialDelivery>()
+                .is_none(),
+            "nothing of the final answer reached the wire, so no degraded-delivery report"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a window past the inline ceiling must stop the finalize without waiting it out: {elapsed:?}"
+        );
+        assert!(
+            mock_server.received_requests().await.unwrap().is_empty(),
+            "no request may fire into the active window"
+        );
+        assert!(
+            !ch.multi_message_drafts.lock().contains_key(&key),
+            "finalize remains the terminal lifecycle event: no orphaned draft state"
+        );
+    }
+
+
     /// when the outbound hook cancels a narration turn, `discard_draft_turn`
     /// consumes exactly that turn (nothing is sent, and it is never resurrected),
     /// while a later turn's narration still flushes normally.
