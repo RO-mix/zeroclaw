@@ -2,6 +2,7 @@
 
 pub(crate) mod approval_gate;
 pub(crate) mod call_prep;
+pub(crate) mod compaction;
 pub(crate) mod context;
 pub(crate) mod context_recovery;
 pub(crate) mod delivery_defaults;
@@ -1056,6 +1057,16 @@ struct PreDispatchTrimResult {
     outcome: PreDispatchOutcome,
     dropped_messages: usize,
     kept_turns: usize,
+    /// Set when narrative compaction replaced the dropped span with a
+    /// summary (Story: context compaction). `dropped_messages` still counts
+    /// the removed span rows only, not the inserted replacement rows.
+    compaction: Option<crate::agent::turn::compaction::CompactionOutcome>,
+    /// Synthetic rows compaction inserted at the start of the durable body
+    /// (the summary marker, then the verbatim-kept user messages), in splice
+    /// order. The caller mirrors them into the rebuilt post-hook request so
+    /// the dispatched population matches the persisted history. Empty on the
+    /// breadcrumb path.
+    inserted_rows: Vec<zeroclaw_providers::ChatMessage>,
 }
 
 fn record_dispatch_trim(
@@ -1109,27 +1120,67 @@ fn record_dispatch_trim(
 /// Drop at most one whole turn, then let the caller rebuild and recount the
 /// actual prepared request. Raw-history estimates cannot decide how many
 /// prepared turns fit, especially after hooks or multimodal expansion.
-fn surface_oversized_dispatch_if_needed(
+///
+/// With context compaction enabled, the same span is first offered to the
+/// compaction engine: on success the durable body keeps the span's genuine
+/// user messages verbatim and carries one narrative summary marker instead
+/// of the removed agent work (no breadcrumb is inserted — the summary is the
+/// visible marker). On any compaction failure the existing breadcrumb trim
+/// below runs unchanged, so the turn never fails because of compaction.
+async fn surface_oversized_dispatch_if_needed(
     injected_memory_preamble: &mut Option<MemoryPreamble>,
     history: &mut Vec<ChatMessage>,
     crumb_present: &mut bool,
     measured_population: u64,
     context_token_budget: usize,
+    compaction: &compaction::CompactionPlanner,
+    turn_provider: &dyn ModelProvider,
+    turn_provider_name: &str,
+    turn_model: &str,
 ) -> PreDispatchTrimResult {
     let before = retention_layout(history, *crumb_present);
     let outcome;
     let mut dropped_messages = 0;
+    let mut compaction_outcome: Option<compaction::CompactionOutcome> = None;
+    let mut inserted_rows: Vec<ChatMessage> = Vec::new();
     if context_token_budget == 0 || measured_population <= context_token_budget as u64 {
         outcome = PreDispatchOutcome::Fit;
     } else {
-        dropped_messages =
-            crate::agent::history_trim::drop_oldest_whole_turn(history, *crumb_present);
-        if dropped_messages == 0 {
-            outcome = PreDispatchOutcome::Floor;
-        } else {
-            *crumb_present =
-                crate::agent::history_trim::insert_breadcrumb_deduped(history, *crumb_present);
+        let span_len =
+            crate::agent::history_trim::oldest_whole_turn_drop_len(history, *crumb_present);
+        if span_len > 0 {
+            compaction_outcome = compaction
+                .maybe_compact(
+                    "pre_dispatch",
+                    history,
+                    *crumb_present,
+                    span_len,
+                    turn_provider,
+                    turn_provider_name,
+                    turn_model,
+                )
+                .await;
+        }
+        if let Some(done) = compaction_outcome.as_ref() {
+            // The span rows were removed and replaced in place; account the
+            // same `dropped_messages` the breadcrumb trim would have, and
+            // collect the inserted rows for the caller's post-hook rebuild.
+            dropped_messages = span_len;
+            if let Some(summary) = done.summary.clone() {
+                inserted_rows.push(summary);
+            }
+            inserted_rows.extend(done.kept_users.iter().cloned());
             outcome = PreDispatchOutcome::Trimmed;
+        } else {
+            dropped_messages =
+                crate::agent::history_trim::drop_oldest_whole_turn(history, *crumb_present);
+            if dropped_messages == 0 {
+                outcome = PreDispatchOutcome::Floor;
+            } else {
+                *crumb_present =
+                    crate::agent::history_trim::insert_breadcrumb_deduped(history, *crumb_present);
+                outcome = PreDispatchOutcome::Trimmed;
+            }
         }
     }
     remap_memory_after_trim(injected_memory_preamble, before, history, *crumb_present);
@@ -1138,6 +1189,8 @@ fn surface_oversized_dispatch_if_needed(
         dropped_messages,
         kept_turns: crate::agent::history_trim::count_turns(history)
             .saturating_sub(usize::from(*crumb_present)),
+        compaction: compaction_outcome,
+        inserted_rows,
     }
 }
 
@@ -1187,6 +1240,13 @@ async fn enforce_reported_budget(
     // varies between iterations are re-measured at the next dispatch seam, which
     // re-enforces against its own measured population.
     hook_reserve_tokens: usize,
+    // Context-compaction plan for this turn plus the provider route that would
+    // serve the summary. Before the raw trim runs, the same span is offered
+    // to the compaction engine; on failure the trim below runs unchanged.
+    compaction: &compaction::CompactionPlanner,
+    turn_provider: &dyn ModelProvider,
+    turn_provider_name: &str,
+    turn_model: &str,
     // The history owner's authoritative record that the population carries the
     // synthetic trim breadcrumb after its leading system messages. Provenance is
     // never inferred from message text: a genuine first user turn that happens
@@ -1202,7 +1262,7 @@ async fn enforce_reported_budget(
     let pre_trim_estimated = reported_population_estimated;
     let retention_before = retention_layout(history, *crumb_present);
     let taken_had_crumb = *crumb_present;
-    let taken = std::mem::take(history);
+    let mut taken = std::mem::take(history);
     let taken_len = taken.len();
     let taken_turns = crate::agent::history_trim::count_turns(&taken)
         .saturating_sub(usize::from(taken_had_crumb));
@@ -1238,14 +1298,65 @@ async fn enforce_reported_budget(
         ratio,
     )
     .await;
-    let mut result = crate::agent::history_trim::trim_to_reported_budget_with_crumb(
-        taken,
-        context_token_budget,
-        reported_input_tokens,
-        reported_population_estimated,
-        tool_schema_tokens,
-        taken_had_crumb,
-    );
+    let mut result = if compaction.is_enabled() {
+        // Size the compaction span with the caller's own trim (run on a
+        // clone): the summary must replace exactly what the breadcrumb would
+        // have removed. The clone mirrors the `taken_for_before` projection
+        // above — enforcement runs only on the rare over-budget path.
+        let probe = crate::agent::history_trim::trim_to_reported_budget_with_crumb(
+            taken.clone(),
+            context_token_budget,
+            reported_input_tokens,
+            reported_population_estimated,
+            tool_schema_tokens,
+            taken_had_crumb,
+        );
+        let compaction_outcome = compaction
+            .maybe_compact(
+                "reported_budget",
+                &mut taken,
+                taken_had_crumb,
+                probe.dropped_messages,
+                turn_provider,
+                turn_provider_name,
+                turn_model,
+            )
+            .await;
+        match compaction_outcome {
+            Some(_) => {
+                // Compaction spliced the span in place; the projection loops
+                // below still re-check the provider-facing population and may
+                // drop further whole turns exactly as after a raw trim.
+                let tokens_after = crate::agent::history::estimate_history_tokens(&taken);
+                crate::agent::history_trim::TrimResult {
+                    tokens_before: probe.tokens_before,
+                    tokens_after,
+                    history: taken,
+                    dropped_messages: probe.dropped_messages,
+                    dropped_turns: probe.dropped_turns,
+                    kept_turns: probe.kept_turns,
+                    trimmed: true,
+                }
+            }
+            None => crate::agent::history_trim::trim_to_reported_budget_with_crumb(
+                taken,
+                context_token_budget,
+                reported_input_tokens,
+                reported_population_estimated,
+                tool_schema_tokens,
+                taken_had_crumb,
+            ),
+        }
+    } else {
+        crate::agent::history_trim::trim_to_reported_budget_with_crumb(
+            taken,
+            context_token_budget,
+            reported_input_tokens,
+            reported_population_estimated,
+            tool_schema_tokens,
+            taken_had_crumb,
+        )
+    };
     let mut trimmed = result.history;
     let mut trimmed_any = result.trimmed;
     // Align the projected population with the request the NEXT iteration will
@@ -1688,6 +1799,12 @@ async fn run_tool_call_loop_impl<'a>(
     let mut turn_state = TurnState::new(raw_history, raw_canonical, *history_has_trim_breadcrumb);
 
     turn_state.sync_pending();
+
+    // Resolve the context-compaction plan once per loop from the live config,
+    // alongside the other per-turn runtime knobs. Inert unless the agent's
+    // runtime profile enables it; every trim trigger below consults it before
+    // falling back to the breadcrumb trim.
+    let compaction_planner = compaction::CompactionPlanner::resolve(config, agent_alias);
 
     let ingress_policy_cfg = IngressPolicy::default();
 
@@ -2364,10 +2481,20 @@ async fn run_tool_call_loop_impl<'a>(
             &mut turn_state.crumb_present,
             tokens_before_dispatch,
             trim_budget,
-        );
+            &compaction_planner,
+            active_model_provider,
+            active_model_provider_name,
+            provider_request_model,
+        )
+        .await;
         *history_has_trim_breadcrumb = turn_state.crumb_present;
+        // A compaction round changes neither the message count (span rows are
+        // swapped for the summary + kept users) nor the crumb flag when the
+        // inserted rows happen to balance the removed ones — the compaction
+        // outcome itself is the authoritative "history changed" signal.
         let history_was_trimmed = turn_state.history.len() != history_len_before
-            || turn_state.crumb_present != crumb_before;
+            || turn_state.crumb_present != crumb_before
+            || trim_result.compaction.is_some();
         if history_was_trimmed && hook_structural_mutation {
             // The rebuild below reconstructs the post-hook request by
             // trimming `post_hook_snapshot` as if everything past
@@ -2391,14 +2518,29 @@ async fn run_tool_call_loop_impl<'a>(
             // Recount the prepared population after every removal. A raw
             // estimate cannot predict the contribution of an image or hook
             // suffix, so it must not choose several drops ahead of this check.
+            // `compaction_inserted` tracks the rows compaction spliced at the
+            // durable body start and still present there: a later breadcrumb
+            // round drops the oldest durable body rows, which are exactly the
+            // earliest mirrored rows, so they leave the mirror too.
             let mut total_dropped_messages = trim_result.dropped_messages;
             let mut dropped_turns = usize::from(trim_result.dropped_messages > 0);
             let mut tokens_after_dispatch = tokens_before_dispatch;
+            let mut compaction_inserted: Vec<ChatMessage> = Vec::new();
+            match &trim_result.compaction {
+                Some(_) => compaction_inserted.extend(trim_result.inserted_rows.iter().cloned()),
+                None => {
+                    let drain = trim_result.dropped_messages.min(compaction_inserted.len());
+                    compaction_inserted.drain(..drain);
+                }
+            }
             let max_iterations = crate::agent::history_trim::count_turns(turn_state.history) + 1;
             for _ in 0..max_iterations {
                 // Wire roles cannot identify turns: prompt-mode results are
                 // plain user messages. Remove precisely the durable source
-                // span, preserving prepared media and the hook suffix.
+                // span, preserving prepared media and the hook suffix. The
+                // removed region stays contiguous in the SNAPSHOT's row space
+                // — compaction inserts live only in the durable history — so
+                // the accumulated span length still addresses it correctly.
                 let removed_rows =
                     original_body_start..original_body_start + total_dropped_messages;
                 let mut trimmed_post_hook: Vec<_> = post_hook_snapshot
@@ -2410,11 +2552,25 @@ async fn run_tool_call_loop_impl<'a>(
                 // If the durable trim inserted a fresh breadcrumb, mirror it
                 // in the post-hook request so the dispatched population
                 // matches the persisted history.
-                if !post_hook_had_crumb && turn_state.crumb_present {
+                let crumb_now = post_hook_had_crumb
+                    || (!post_hook_had_crumb && turn_state.crumb_present);
+                if crumb_now && !post_hook_had_crumb {
                     crate::agent::history_trim::insert_breadcrumb_deduped(
                         &mut trimmed_post_hook,
                         false,
                     );
+                }
+                // Mirror the rows compaction spliced into the durable body
+                // (summary marker first, then the verbatim-kept user
+                // messages) right after the system prefix and crumb, the same
+                // position they occupy in the persisted history.
+                if !compaction_inserted.is_empty() {
+                    let anchor = trimmed_post_hook
+                        .iter()
+                        .take_while(|m| m.role == "system")
+                        .count()
+                        + usize::from(crumb_now);
+                    trimmed_post_hook.splice(anchor..anchor, compaction_inserted.iter().cloned());
                 }
                 // Re-append the hook's transient suffix and re-apply prompt
                 // framing so the system anchor stays consistent.
@@ -2468,12 +2624,27 @@ async fn run_tool_call_loop_impl<'a>(
                     &mut turn_state.crumb_present,
                     tokens_after_dispatch,
                     trim_budget,
-                );
+                    &compaction_planner,
+                    active_model_provider,
+                    active_model_provider_name,
+                    provider_request_model,
+                )
+                .await;
                 *history_has_trim_breadcrumb = turn_state.crumb_present;
                 total_dropped_messages += trim_result.dropped_messages;
                 dropped_turns += usize::from(trim_result.dropped_messages > 0);
+                match &trim_result.compaction {
+                    Some(_) => {
+                        compaction_inserted.extend(trim_result.inserted_rows.iter().cloned());
+                    }
+                    None => {
+                        let drain = trim_result.dropped_messages.min(compaction_inserted.len());
+                        compaction_inserted.drain(..drain);
+                    }
+                }
                 let dropped_more = turn_state.history.len() != before_len
-                    || turn_state.crumb_present != before_crumb;
+                    || turn_state.crumb_present != before_crumb
+                    || trim_result.compaction.is_some();
                 if !dropped_more {
                     break;
                 }
@@ -2878,6 +3049,10 @@ async fn run_tool_call_loop_impl<'a>(
                     ctx.context_limits,
                     agent_alias,
                     turn_id,
+                    &compaction_planner,
+                    active_model_provider,
+                    active_model_provider_name,
+                    provider_request_model,
                     &mut turn_state.crumb_present,
                 )
                 .await;
@@ -3177,6 +3352,10 @@ async fn run_tool_call_loop_impl<'a>(
                     image_cache.as_mut().map(|state| &mut *state.cache),
                     use_native_tools,
                     0,
+                    &compaction_planner,
+                    active_model_provider,
+                    active_model_provider_name,
+                    provider_request_model,
                     &mut turn_state.crumb_present,
                 ))
                 .await;
@@ -5038,6 +5217,39 @@ mod surface3_tests {
     }
 }
 
+/// Inert provider for disabled-compaction test paths: the planner
+/// short-circuits before touching it, so it only satisfies the signature.
+#[cfg(test)]
+struct DisabledRouteProvider;
+
+#[cfg(test)]
+impl zeroclaw_api::attribution::Attributable for DisabledRouteProvider {
+    fn role(&self) -> zeroclaw_api::attribution::Role {
+        zeroclaw_api::attribution::Role::Provider(
+            zeroclaw_api::attribution::ProviderKind::Model(
+                zeroclaw_api::attribution::ModelProviderKind::Custom,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        "disabled-route"
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl ModelProvider for DisabledRouteProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: Option<f64>,
+    ) -> anyhow::Result<String> {
+        Ok(String::new())
+    }
+}
+
 #[cfg(test)]
 mod reported_budget_tests {
     use super::*;
@@ -5078,6 +5290,10 @@ mod reported_budget_tests {
             image_cache,
             next_use_native_tools,
             hook_reserve_tokens,
+            &compaction::CompactionPlanner::disabled(),
+            &DisabledRouteProvider,
+            "test-provider",
+            "test-model",
             crumb_present,
         )
         .await;
@@ -5138,6 +5354,10 @@ mod reported_budget_tests {
             None,
             false,
             0,
+            &compaction::CompactionPlanner::disabled(),
+            &DisabledRouteProvider,
+            "test-provider",
+            "test-model",
             &mut false,
         )
         .await;
@@ -6140,8 +6360,8 @@ mod trim_budget_tests {
         ]
     }
 
-    #[test]
-    fn dispatch_trim_includes_breadcrumb_in_floor_recount() {
+    #[tokio::test]
+    async fn dispatch_trim_includes_breadcrumb_in_floor_recount() {
         // System (5) + newest turn (10) fit the 20-token budget, but adding
         // the model-visible breadcrumb (~17) pushes the final history over it.
         let mut history = boundary_history();
@@ -6154,7 +6374,12 @@ mod trim_budget_tests {
             &mut crumb_present,
             tokens_before as u64,
             budget,
-        );
+            &compaction::CompactionPlanner::disabled(),
+            &DisabledRouteProvider,
+            "test-provider",
+            "test-model",
+        )
+        .await;
         assert_eq!(result.outcome, PreDispatchOutcome::Trimmed);
         let final_tokens = crate::agent::history::estimate_history_tokens(&history);
         assert!(
@@ -6167,7 +6392,12 @@ mod trim_budget_tests {
             &mut crumb_present,
             final_tokens as u64,
             budget,
-        );
+            &compaction::CompactionPlanner::disabled(),
+            &DisabledRouteProvider,
+            "test-provider",
+            "test-model",
+        )
+        .await;
         assert_eq!(floor.outcome, PreDispatchOutcome::Floor);
         let crumb = crate::agent::history_trim::breadcrumb();
         assert!(
@@ -6294,7 +6524,12 @@ mod active_route_context_tests {
             &mut false,
             tokens_before as u64,
             vision_limits.context_token_budget,
-        );
+            &compaction::CompactionPlanner::disabled(),
+            &DisabledRouteProvider,
+            "test-provider",
+            "test-model",
+        )
+        .await;
         assert!(
             trim.outcome == PreDispatchOutcome::Trimmed,
             "the selected vision route must trim history that the text route would retain"

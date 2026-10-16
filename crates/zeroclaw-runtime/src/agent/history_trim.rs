@@ -352,6 +352,27 @@ pub(crate) fn count_turns(history: &[ChatMessage]) -> usize {
     history.iter().filter(|m| is_turn_boundary(m)).count()
 }
 
+/// Number of body rows [`drop_oldest_whole_turn`] would drop, without
+/// mutating. Lets compaction size its span as exactly what the breadcrumb
+/// trim would remove. `crumb_present` is the same owner record the drop
+/// honors: selection starts after the leading system messages and the
+/// owner-recorded synthetic breadcrumb.
+pub(crate) fn oldest_whole_turn_drop_len(history: &[ChatMessage], crumb_present: bool) -> usize {
+    let leading_system = history.iter().take_while(|m| is_system(m)).count();
+    let body_start = leading_system + usize::from(crumb_present);
+    let body = &history[body_start.min(history.len())..];
+    let boundaries: Vec<usize> = body
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| is_turn_boundary(m))
+        .map(|(i, _)| body_start + i)
+        .collect();
+    if boundaries.len() <= 1 {
+        return 0;
+    }
+    next_boundary_after(&boundaries, boundaries[0]) - body_start
+}
+
 /// Drop the oldest whole turn (after leading system messages and an optional
 /// breadcrumb), preserving the most recent whole turn and the system prefix.
 /// `crumb_present` is the OWNER's authoritative record that the population
@@ -362,22 +383,14 @@ pub(crate) fn count_turns(history: &[ChatMessage]) -> usize {
 /// caller treats as the unsatisfiable floor rather than silently claiming the
 /// history fits.
 pub(crate) fn drop_oldest_whole_turn(history: &mut Vec<ChatMessage>, crumb_present: bool) -> usize {
-    let leading_system = history.iter().take_while(|m| is_system(m)).count();
-    let body_start = leading_system + usize::from(crumb_present);
-    let body = &history[body_start..];
-    let boundaries: Vec<usize> = body
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| is_turn_boundary(m))
-        .map(|(i, _)| body_start + i)
-        .collect();
-    if boundaries.len() <= 1 {
+    let drop_len = oldest_whole_turn_drop_len(history, crumb_present);
+    if drop_len == 0 {
         return 0;
     }
-    let drop_end = next_boundary_after(&boundaries, boundaries[0]);
-    let dropped = drop_end - body_start;
-    history.drain(body_start..drop_end);
-    dropped
+    let leading_system = history.iter().take_while(|m| is_system(m)).count();
+    let body_start = leading_system + usize::from(crumb_present);
+    history.drain(body_start..body_start + drop_len);
+    drop_len
 }
 
 /// Front breadcrumb injected after the system messages so the model SEES that

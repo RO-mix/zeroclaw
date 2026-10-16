@@ -254,7 +254,16 @@ pub(crate) async fn finish_after_max_iterations(
                     crumb_present,
                     tokens,
                     trim_budget,
-                );
+                    // Out of the three compaction triggers by design: the
+                    // max-iteration trim is an exhaustion path, not a budget
+                    // seam, and this step carries no agent identity to
+                    // resolve the profile from. Behavior stays breadcrumb-only.
+                    &super::compaction::CompactionPlanner::disabled(),
+                    model_provider,
+                    provider_name,
+                    model,
+                )
+                .await;
                 dropped_messages += trim.dropped_messages;
                 if trim.outcome == super::PreDispatchOutcome::Trimmed {
                     // Rebuild only an unchanged prefix plus a transient suffix.

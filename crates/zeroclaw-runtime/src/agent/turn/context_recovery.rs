@@ -85,6 +85,13 @@ pub(crate) async fn try_recover_context_overflow(
     context_limits: zeroclaw_config::schema::ResolvedContextLimits,
     agent_alias: Option<&str>,
     turn_id: &str,
+    // Context-compaction plan for this turn plus the route that would serve
+    // the summary. Attempted before the raw trim; on failure the trim below
+    // runs unchanged.
+    compaction: &super::compaction::CompactionPlanner,
+    turn_provider: &dyn zeroclaw_providers::ModelProvider,
+    turn_provider_name: &str,
+    turn_model: &str,
     // Owner-tracked breadcrumb provenance for `history` (see
     // `history_trim::insert_breadcrumb_deduped`); set when this recovery
     // inserts a fresh crumb so classification never depends on text.
@@ -118,7 +125,44 @@ pub(crate) async fn try_recover_context_overflow(
         // Preserve the established reactive policy after a context overflow.
         let budget = tokens_now.saturating_mul(2) / 3;
         let owned = std::mem::take(history);
-        let result = trim_to_recent_turns_with_crumb(owned, budget, *crumb_present);
+        // With compaction enabled, offer the same span to the summary engine
+        // first (span sized by the recovery's own trim on a clone). On
+        // failure the raw trim below runs on the untouched history.
+        let result = if compaction.is_enabled() {
+            let mut owned = owned;
+            let probe = trim_to_recent_turns_with_crumb(
+                owned.clone(),
+                budget,
+                *crumb_present,
+            );
+            let compacted = compaction
+                .maybe_compact(
+                    "overflow_recovery",
+                    &mut owned,
+                    *crumb_present,
+                    probe.dropped_messages,
+                    turn_provider,
+                    turn_provider_name,
+                    turn_model,
+                )
+                .await
+                .is_some();
+            if compacted {
+                crate::agent::history_trim::TrimResult {
+                    tokens_before: probe.tokens_before,
+                    tokens_after: crate::agent::history::estimate_history_tokens(&owned),
+                    history: owned,
+                    dropped_messages: probe.dropped_messages,
+                    dropped_turns: probe.dropped_turns,
+                    kept_turns: probe.kept_turns,
+                    trimmed: true,
+                }
+            } else {
+                trim_to_recent_turns_with_crumb(owned, budget, *crumb_present)
+            }
+        } else {
+            trim_to_recent_turns_with_crumb(owned, budget, *crumb_present)
+        };
         let trimmed = result.trimmed;
         let dropped_turns = result.dropped_turns;
         let dropped_messages = result.dropped_messages;
@@ -288,6 +332,10 @@ mod tests {
                 limits(32_000),
                 None,
                 "test",
+                &super::super::compaction::CompactionPlanner::disabled(),
+                &DisabledRouteProvider,
+                "test-provider",
+                "test-model",
                 &mut crumb,
             )
             .await,
@@ -343,6 +391,10 @@ mod tests {
                 limits(32_000),
                 None,
                 "test",
+                &super::super::compaction::CompactionPlanner::disabled(),
+                &DisabledRouteProvider,
+                "test-provider",
+                "test-model",
                 &mut crumb,
             )
             .await,
@@ -386,9 +438,43 @@ mod tests {
             context_limits,
             None,
             "test",
+            &super::super::compaction::CompactionPlanner::disabled(),
+            &DisabledRouteProvider,
+            "test-provider",
+            "test-model",
             crumb_present,
         )
         .await
+    }
+
+    /// Inert provider for the disabled-compaction test path: the planner
+    /// short-circuits before touching it, so it only satisfies the signature.
+    struct DisabledRouteProvider;
+
+    impl zeroclaw_api::attribution::Attributable for DisabledRouteProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "disabled-route"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl zeroclaw_providers::ModelProvider for DisabledRouteProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
     }
 
     #[derive(Default)]
@@ -437,6 +523,10 @@ mod tests {
             limits(32_000),
             Some("effective-agent"),
             "turn-1",
+            &super::super::compaction::CompactionPlanner::disabled(),
+            &DisabledRouteProvider,
+            "test-provider",
+            "test-model",
             &mut false,
         )
         .await;
