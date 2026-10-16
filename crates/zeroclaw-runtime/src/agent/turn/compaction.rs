@@ -142,15 +142,20 @@ pub(crate) fn select_compaction_span(
 }
 
 /// One LLM round-trip that compresses `span_input` into a first-person
-/// narrative. Returns the summary text and the provider-reported output token
-/// count when available. Errors propagate so the caller can fall back (I4);
-/// an empty/whitespace summary is an error for the same reason.
+/// narrative. Returns the summary text, the provider-reported usage (when
+/// available), and the locally estimated input tokens of the request.
+/// Errors propagate so the caller can fall back (I4); an empty/whitespace
+/// summary is an error for the same reason.
 pub(crate) async fn summarize_span(
     summarizer: &dyn ModelProvider,
     model: &str,
     span_input: &[ChatMessage],
     max_output_tokens: u32,
-) -> anyhow::Result<(String, Option<u64>)> {
+) -> anyhow::Result<(
+    String,
+    Option<zeroclaw_api::model_provider::TokenUsage>,
+    usize,
+)> {
     let budget_note = format!(
         "Token budget for the summary: at most {max_output_tokens} tokens.\n\n\
          Earlier agent work to summarize:\n{}",
@@ -164,6 +169,7 @@ pub(crate) async fn summarize_span(
         ChatMessage::system(SUMMARY_SYSTEM_PROMPT),
         ChatMessage::user(budget_note),
     ];
+    let input_estimate = estimate_history_tokens(&messages);
     let response = summarizer
         .chat(
             ChatRequest {
@@ -179,11 +185,7 @@ pub(crate) async fn summarize_span(
     if text.is_empty() {
         anyhow::bail!("compaction summarizer returned an empty summary");
     }
-    let reported_output_tokens = response
-        .usage
-        .as_ref()
-        .and_then(|usage| usage.output_tokens);
-    Ok((text, reported_output_tokens))
+    Ok((text, response.usage, input_estimate))
 }
 
 /// Outcome of one successful compaction; also used (via [`CompactionMode::Breadcrumb`])
@@ -230,6 +232,25 @@ impl CompactionOutcome {
             provider,
             fell_back: true,
         }
+    }
+}
+
+/// Map an engine outcome to the public event payload attached to
+/// `TurnEvent::HistoryTrimmed` (FR9).
+pub(crate) fn event_info(
+    outcome: &CompactionOutcome,
+) -> zeroclaw_api::agent::ContextCompactionInfo {
+    zeroclaw_api::agent::ContextCompactionInfo {
+        mode: match outcome.mode {
+            CompactionMode::Summary => "summary",
+            CompactionMode::Breadcrumb => "breadcrumb",
+        },
+        span_messages: outcome.span_messages,
+        span_tokens: outcome.span_tokens,
+        summary_tokens: outcome.summary_tokens,
+        kept_user_messages: outcome.kept_user_messages,
+        provider: outcome.provider.clone(),
+        fell_back: outcome.fell_back,
     }
 }
 
@@ -285,7 +306,7 @@ pub(crate) async fn compact_history(
     }
     let span = select_compaction_span(history, crumb_present, span_len, cfg.trigger_tokens)?;
     let provider = format!("{summarizer_provider}/{summarizer_model}");
-    let (text, reported_output_tokens) = match summarize_span(
+    let (text, usage, input_estimate) = match summarize_span(
         summarizer,
         summarizer_model,
         &span.summary_input,
@@ -311,6 +332,7 @@ pub(crate) async fn compact_history(
             return None;
         }
     };
+    let reported_output_tokens = usage.as_ref().and_then(|u| u.output_tokens);
     if let Some(output_tokens) = reported_output_tokens
         && output_tokens > cfg.summary_max_output_tokens as u64
     {
@@ -329,6 +351,25 @@ pub(crate) async fn compact_history(
         );
         return None;
     }
+    // FR8: attribute the summary round-trip to the session's CostTracker
+    // under the distinct `context_compaction` scope. Providers that report
+    // usage are priced on the report; the rest are estimated locally
+    // (input estimate from the request, output at ~4 chars/token).
+    let input_tokens = usage
+        .as_ref()
+        .and_then(|u| u.input_tokens)
+        .unwrap_or(input_estimate as u64);
+    let output_tokens = reported_output_tokens.unwrap_or((text.len() / 4).max(1) as u64);
+    crate::agent::cost::record_context_compaction_cost_usage(
+        summarizer_provider,
+        summarizer_model,
+        &zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(input_tokens),
+            output_tokens: Some(output_tokens),
+            cached_input_tokens: None,
+            cache_creation_input_tokens: None,
+        },
+    );
     let summary_tokens = reported_output_tokens
         .map(|tokens| usize::try_from(tokens).unwrap_or(usize::MAX))
         .unwrap_or_else(|| text.len() / 4);
@@ -416,10 +457,7 @@ impl CompactionPlanner {
             .filter(|provider_ref| !provider_ref.trim().is_empty())
             .map(|provider_ref| {
                 let name = provider_ref.trim().to_string();
-                match zeroclaw_providers::create_model_provider_from_ref_with_model(
-                    config,
-                    &name,
-                ) {
+                match zeroclaw_providers::create_model_provider_from_ref_with_model(config, &name) {
                     Ok(resolved) => CompactionRoute::Override {
                         provider: resolved.provider,
                         name,
@@ -428,13 +466,16 @@ impl CompactionPlanner {
                     Err(error) => {
                         ::zeroclaw_log::record!(
                             WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                .with_category(::zeroclaw_log::EventCategory::Agent)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                .with_attrs(::serde_json::json!({
-                                    "provider": name,
-                                    "error": format!("{error:#}"),
-                                })),
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "provider": name,
+                                "error": format!("{error:#}"),
+                            })),
                             "Context compaction: summary_provider override could not be built; \
                              falling back to the turn's provider"
                         );
@@ -450,6 +491,20 @@ impl CompactionPlanner {
 
     pub(crate) fn is_enabled(&self) -> bool {
         self.plan.is_some()
+    }
+
+    /// `provider/model` label of the route a summary takes (or would take on
+    /// fallback) — used to attribute events and traces.
+    pub(crate) fn provider_label(&self, turn_provider: &str, turn_model: &str) -> String {
+        match &self.plan {
+            Some(plan) => match &plan.route {
+                CompactionRoute::TurnModel => format!("{turn_provider}/{turn_model}"),
+                CompactionRoute::Override { name, model, .. } => {
+                    format!("{name}/{}", model.as_deref().unwrap_or(turn_model))
+                }
+            },
+            None => format!("{turn_provider}/{turn_model}"),
+        }
     }
 
     /// Attempt to replace the caller-selected span (`span_len` body rows,
@@ -488,7 +543,11 @@ impl CompactionPlanner {
         }
         let (provider, provider_name, model) = match &plan.route {
             CompactionRoute::TurnModel => (turn_provider, turn_provider_name, turn_model),
-            CompactionRoute::Override { provider, name, model } => (
+            CompactionRoute::Override {
+                provider,
+                name,
+                model,
+            } => (
                 provider.as_ref(),
                 name.as_str(),
                 model.as_deref().unwrap_or(turn_model),
@@ -512,10 +571,11 @@ impl CompactionPlanner {
 }
 
 #[cfg(test)]
-mod tests {    use super::*;
+mod tests {
+    use super::*;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
-    use zeroclaw_providers::ChatResponse;
     use zeroclaw_config::scattered_types::ContextCompressionConfig;
+    use zeroclaw_providers::ChatResponse;
 
     fn sys(c: &str) -> ChatMessage {
         ChatMessage::system(c)
@@ -531,7 +591,10 @@ mod tests {    use super::*;
     }
 
     fn tool_results_carrier(c: &str) -> ChatMessage {
-        user(&format!("{}\n{c}", zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX))
+        user(&format!(
+            "{}\n{c}",
+            zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX
+        ))
     }
 
     /// ChatMessage has no PartialEq; the history tests compare through the
@@ -789,9 +852,7 @@ mod tests {    use super::*;
             "genuine user rows must stay out of the summarizer input: {seen:?}"
         );
         assert!(
-            seen[1..]
-                .iter()
-                .all(|m| m.role != "system"),
+            seen[1..].iter().all(|m| m.role != "system"),
             "only the fixed summarization prompt may be a system row: {seen:?}"
         );
     }
@@ -812,7 +873,11 @@ mod tests {    use super::*;
         )
         .await;
         assert!(outcome.is_none(), "summarizer failure must fall back (I4)");
-        assert_eq!(history_json(&history), history_json(&original), "fallback leaves history untouched");
+        assert_eq!(
+            history_json(&history),
+            history_json(&original),
+            "fallback leaves history untouched"
+        );
     }
 
     #[tokio::test]
@@ -910,10 +975,7 @@ mod tests {    use super::*;
         )
         .await
         .expect("first compaction succeeds");
-        let summaries = history
-            .iter()
-            .filter(|m| is_compaction_summary(m))
-            .count();
+        let summaries = history.iter().filter(|m| is_compaction_summary(m)).count();
         assert_eq!(summaries, 1);
 
         // Second trim drops everything up to the newest turn, including the
@@ -931,10 +993,7 @@ mod tests {    use super::*;
         )
         .await
         .expect("second compaction succeeds");
-        let summaries = history
-            .iter()
-            .filter(|m| is_compaction_summary(m))
-            .count();
+        let summaries = history.iter().filter(|m| is_compaction_summary(m)).count();
         assert_eq!(
             summaries, 1,
             "the old summary row must fold into the new one, not stack"

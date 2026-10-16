@@ -510,6 +510,31 @@ fn record_tool_loop_cost_usage_inner(
         usage,
         updates_context_window_fill,
         None,
+        None,
+    )
+}
+
+/// Record token usage from a context-compaction summary call via the
+/// task-local cost tracker, persisted under the distinct `context_compaction`
+/// feature scope (FR8) so the spend is separable from ordinary turn traffic.
+/// Pricing, turn-usage accumulation, and attribution behave exactly like
+/// [`record_tool_loop_cost_usage`]. Returns `(total_tokens, cost_usd)` on
+/// success, `None` when no cost-tracking context is scoped or the usage
+/// carries no tokens.
+pub fn record_context_compaction_cost_usage(
+    model_provider_name: &str,
+    model: &str,
+    usage: &zeroclaw_providers::traits::TokenUsage,
+) -> Option<(u64, f64)> {
+    record_tool_loop_cost_usage_inner_with_live(
+        model_provider_name,
+        model,
+        usage,
+        // A summary call never represents the turn's accepted response, so it
+        // must not replace the accepted context-window fill telemetry.
+        false,
+        None,
+        Some(crate::agent::turn::compaction::COST_SCOPE),
     )
 }
 
@@ -519,6 +544,7 @@ fn record_tool_loop_cost_usage_inner_with_live(
     usage: &zeroclaw_providers::traits::TokenUsage,
     updates_context_window_fill: bool,
     live_override: Option<ModelRates>,
+    scope: Option<&str>,
 ) -> Option<(u64, f64)> {
     let input_tokens = usage.input_tokens.unwrap_or(0);
     let output_tokens = usage.output_tokens.unwrap_or(0);
@@ -575,11 +601,12 @@ fn record_tool_loop_cost_usage_inner_with_live(
         .ok()
         .flatten();
     if let Some(tracker) = &ctx.tracker
-        && let Err(error) = tracker.record_usage_attributed(
+        && let Err(error) = tracker.record_usage_attributed_scoped(
             cost_usage.clone(),
             ctx.agent_alias.as_deref(),
             None,
             conversation_id,
+            scope.map(str::to_string),
         )
     {
         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Provider).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": model, "error": format!("{}", error)})), "Failed to record cost tracking usage: ");
@@ -1908,6 +1935,7 @@ mod tests {
                     &usage,
                     true,
                     Some(live),
+                    None,
                 )
             }))
             .expect("live write pricing should complete the configured rates");

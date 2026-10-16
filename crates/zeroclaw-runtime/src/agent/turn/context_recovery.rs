@@ -128,14 +128,11 @@ pub(crate) async fn try_recover_context_overflow(
         // With compaction enabled, offer the same span to the summary engine
         // first (span sized by the recovery's own trim on a clone). On
         // failure the raw trim below runs on the untouched history.
+        let mut compaction_outcome: Option<super::compaction::CompactionOutcome> = None;
         let result = if compaction.is_enabled() {
             let mut owned = owned;
-            let probe = trim_to_recent_turns_with_crumb(
-                owned.clone(),
-                budget,
-                *crumb_present,
-            );
-            let compacted = compaction
+            let probe = trim_to_recent_turns_with_crumb(owned.clone(), budget, *crumb_present);
+            let outcome = compaction
                 .maybe_compact(
                     "overflow_recovery",
                     &mut owned,
@@ -145,9 +142,9 @@ pub(crate) async fn try_recover_context_overflow(
                     turn_provider_name,
                     turn_model,
                 )
-                .await
-                .is_some();
-            if compacted {
+                .await;
+            compaction_outcome = outcome.clone();
+            if outcome.is_some() {
                 crate::agent::history_trim::TrimResult {
                     tokens_before: probe.tokens_before,
                     tokens_after: crate::agent::history::estimate_history_tokens(&owned),
@@ -230,6 +227,21 @@ pub(crate) async fn try_recover_context_overflow(
                         ),
                         tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
                         unsatisfiable_floor: None,
+                        compaction: compaction_outcome
+                            .as_ref()
+                            .map(super::compaction::event_info)
+                            .or_else(|| {
+                                compaction.is_enabled().then(|| {
+                                    super::compaction::event_info(
+                                        &super::compaction::CompactionOutcome::breadcrumb_fallback(
+                                            dropped_messages,
+                                            0,
+                                            compaction
+                                                .provider_label(turn_provider_name, turn_model),
+                                        ),
+                                    )
+                                })
+                            }),
                         retained_context: Some(super::retained_context_snapshot(
                             injected_memory_preamble,
                             history,
@@ -714,6 +726,7 @@ mod tests {
                 tokens_after_source,
                 unsatisfiable_floor: _,
                 retained_context: _,
+                ..
             } => {
                 assert!(dropped_messages > 0, "must report dropped messages");
                 assert!(dropped_turns > 0, "must report dropped turns");

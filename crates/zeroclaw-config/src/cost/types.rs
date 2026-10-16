@@ -217,6 +217,12 @@ pub struct CostRecord {
         skip_serializing_if = "Option::is_none"
     )]
     pub task_id: Option<String>,
+    /// Feature scope this record belongs to — e.g. `"context_compaction"` for
+    /// context-summary compaction LLM calls. `None` for ordinary turn
+    /// traffic. Additive for the append-only JSONL ledger: rows written
+    /// before the field existed read back as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 impl CostRecord {
@@ -229,6 +235,7 @@ impl CostRecord {
             conversation_id: None,
             agent_alias: None,
             task_id: None,
+            scope: None,
         }
     }
 
@@ -245,6 +252,7 @@ impl CostRecord {
             conversation_id: None,
             agent_alias,
             task_id: None,
+            scope: None,
         }
     }
 
@@ -262,6 +270,7 @@ impl CostRecord {
             conversation_id: None,
             agent_alias,
             task_id,
+            scope: None,
         }
     }
 
@@ -270,6 +279,14 @@ impl CostRecord {
     /// back as `None`.
     pub fn with_conversation_id(mut self, conversation_id: Option<String>) -> Self {
         self.conversation_id = conversation_id;
+        self
+    }
+
+    /// Attach the feature scope this spend belongs to (e.g.
+    /// `"context_compaction"`). Follows the same additive-ledger contract as
+    /// [`Self::with_conversation_id`].
+    pub fn with_scope(mut self, scope: Option<String>) -> Self {
+        self.scope = scope;
         self
     }
 }

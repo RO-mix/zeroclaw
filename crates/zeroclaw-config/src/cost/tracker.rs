@@ -596,6 +596,20 @@ impl CostTracker {
         task_id: Option<String>,
         conversation_id: Option<String>,
     ) -> Result<()> {
+        self.record_usage_attributed_scoped(usage, agent_alias, task_id, conversation_id, None)
+    }
+
+    /// [`Self::record_usage_attributed`] plus a feature scope (e.g.
+    /// `"context_compaction"`) stamped on the persisted record so
+    /// feature-level spend can be separated from ordinary turn traffic.
+    pub fn record_usage_attributed_scoped(
+        &self,
+        usage: TokenUsage,
+        agent_alias: Option<&str>,
+        task_id: Option<String>,
+        conversation_id: Option<String>,
+        scope: Option<String>,
+    ) -> Result<()> {
         self.record_usage_with_owned_task_attribution_inner_with_sync(
             usage,
             agent_alias,
@@ -603,6 +617,7 @@ impl CostTracker {
             conversation_id,
             true,
             File::sync_all,
+            scope,
         )
     }
 
@@ -629,6 +644,7 @@ impl CostTracker {
             None,
             honor_enabled,
             File::sync_all,
+            None,
         )
     }
 
@@ -640,6 +656,7 @@ impl CostTracker {
         conversation_id: Option<String>,
         honor_enabled: bool,
         sync_file: fn(&File) -> std::io::Result<()>,
+        scope: Option<String>,
     ) -> Result<()> {
         let (enabled, track_per_agent) = self.mode();
         if honor_enabled && !enabled {
@@ -669,7 +686,8 @@ impl CostTracker {
         let recorded_alias = effective_alias.clone();
         let record =
             CostRecord::with_attribution(&self.session_id, effective_alias.clone(), task_id, usage)
-                .with_conversation_id(conversation_id);
+                .with_conversation_id(conversation_id)
+                .with_scope(scope);
         // The UTC day this record belongs to. The ledger's rebuild folds
         // the row into this day's aggregates and no other day's, so the
         // descendant accumulator keys on the same day and the two agree
@@ -1752,6 +1770,7 @@ mod tests {
                 None,
                 true,
                 fail_sync,
+                None,
             )
             .unwrap_err();
 

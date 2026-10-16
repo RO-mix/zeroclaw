@@ -1298,6 +1298,9 @@ async fn enforce_reported_budget(
         ratio,
     )
     .await;
+    // FR9: surfaced on the trim event below — either the summary outcome or
+    // a breadcrumb-fallback record when compaction was enabled but failed.
+    let mut compaction_outcome: Option<compaction::CompactionOutcome> = None;
     let mut result = if compaction.is_enabled() {
         // Size the compaction span with the caller's own trim (run on a
         // clone): the summary must replace exactly what the breadcrumb would
@@ -1311,7 +1314,7 @@ async fn enforce_reported_budget(
             tool_schema_tokens,
             taken_had_crumb,
         );
-        let compaction_outcome = compaction
+        let outcome = compaction
             .maybe_compact(
                 "reported_budget",
                 &mut taken,
@@ -1322,7 +1325,8 @@ async fn enforce_reported_budget(
                 turn_model,
             )
             .await;
-        match compaction_outcome {
+        compaction_outcome = outcome.clone();
+        match outcome {
             Some(_) => {
                 // Compaction spliced the span in place; the projection loops
                 // below still re-check the provider-facing population and may
@@ -1497,6 +1501,20 @@ async fn enforce_reported_budget(
                     tokens_before_source: Some(tokens_before_source),
                     tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
                     unsatisfiable_floor: None,
+                    compaction: compaction_outcome
+                        .as_ref()
+                        .map(compaction::event_info)
+                        .or_else(|| {
+                            compaction.is_enabled().then(|| {
+                                compaction::event_info(
+                                    &compaction::CompactionOutcome::breadcrumb_fallback(
+                                        result.dropped_messages,
+                                        0,
+                                        compaction.provider_label(turn_provider_name, turn_model),
+                                    ),
+                                )
+                            })
+                        }),
                     retained_context: Some(retained_context_snapshot(
                         injected_memory_preamble,
                         history,
@@ -2552,8 +2570,8 @@ async fn run_tool_call_loop_impl<'a>(
                 // If the durable trim inserted a fresh breadcrumb, mirror it
                 // in the post-hook request so the dispatched population
                 // matches the persisted history.
-                let crumb_now = post_hook_had_crumb
-                    || (!post_hook_had_crumb && turn_state.crumb_present);
+                let crumb_now =
+                    post_hook_had_crumb || (!post_hook_had_crumb && turn_state.crumb_present);
                 if crumb_now && !post_hook_had_crumb {
                     crate::agent::history_trim::insert_breadcrumb_deduped(
                         &mut trimmed_post_hook,
@@ -2665,6 +2683,24 @@ async fn run_tool_call_loop_impl<'a>(
                 tokens_after_dispatch,
                 dispatch_token_source,
             );
+            // FR9: the trim event carries the compaction detail — the last
+            // round's summary outcome, or a breadcrumb-fallback record when
+            // compaction was enabled but could not run (summarizer failure,
+            // sub-threshold span).
+            let compaction_event_info = trim_result
+                .compaction
+                .as_ref()
+                .map(compaction::event_info)
+                .or_else(|| {
+                    compaction_planner.is_enabled().then(|| {
+                        compaction::event_info(&compaction::CompactionOutcome::breadcrumb_fallback(
+                            trim_result.dropped_messages,
+                            0,
+                            compaction_planner
+                                .provider_label(active_model_provider_name, provider_request_model),
+                        ))
+                    })
+                });
             if let Some(tx) = event_tx.as_ref() {
                 let _ = tx
                     .send(TurnEvent::HistoryTrimmed {
@@ -2678,6 +2714,7 @@ async fn run_tool_call_loop_impl<'a>(
                         tokens_before_source: Some(dispatch_token_source),
                         tokens_after_source: Some(dispatch_token_source),
                         unsatisfiable_floor: exceeds_model_window.then_some(true),
+                        compaction: compaction_event_info.clone(),
                         retained_context: Some(retained_context_snapshot(
                             injected_memory_preamble,
                             turn_state.history,
@@ -2721,6 +2758,7 @@ async fn run_tool_call_loop_impl<'a>(
                         tokens_before_source: Some(dispatch_token_source),
                         tokens_after_source: Some(dispatch_token_source),
                         unsatisfiable_floor: Some(true),
+                        compaction: None,
                         retained_context: Some(retained_context_snapshot(
                             injected_memory_preamble,
                             turn_state.history,
@@ -5225,11 +5263,9 @@ struct DisabledRouteProvider;
 #[cfg(test)]
 impl zeroclaw_api::attribution::Attributable for DisabledRouteProvider {
     fn role(&self) -> zeroclaw_api::attribution::Role {
-        zeroclaw_api::attribution::Role::Provider(
-            zeroclaw_api::attribution::ProviderKind::Model(
-                zeroclaw_api::attribution::ModelProviderKind::Custom,
-            ),
-        )
+        zeroclaw_api::attribution::Role::Provider(zeroclaw_api::attribution::ProviderKind::Model(
+            zeroclaw_api::attribution::ModelProviderKind::Custom,
+        ))
     }
     fn alias(&self) -> &str {
         "disabled-route"

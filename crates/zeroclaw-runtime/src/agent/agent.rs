@@ -440,6 +440,8 @@ impl HistoryTrimNotice {
             tokens_after_source: None,
             unsatisfiable_floor: None,
             retained_context: Some(self.retained_context),
+
+            compaction: None,
         }
     }
 }

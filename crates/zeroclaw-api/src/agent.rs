@@ -152,6 +152,13 @@ pub enum TurnEvent {
         /// authoritative "unsatisfiable" signal. `None`/absent for ordinary
         /// trims.
         unsatisfiable_floor: Option<bool>,
+        /// Context-compaction detail when the trim ran with
+        /// `[runtime_profiles.<alias>.context_compression] enabled`: present
+        /// both when the removed span became a narrative summary and when
+        /// compaction fell back to the static breadcrumb trim. `None` for
+        /// trims from builds/configs without compaction — ordinary
+        /// breadcrumb behavior.
+        compaction: Option<ContextCompactionInfo>,
         /// Native RPC-only provider context captured by the owning turn before
         /// the trim is announced. Wire and observer adapters deliberately
         /// ignore this field; it is never serialized as a turn event.
@@ -228,6 +235,33 @@ pub enum TurnEvent {
         /// `input_tokens`) or no estimate could be formed.
         estimated_input_tokens: Option<u64>,
     },
+}
+
+/// Context-compaction detail attached to [`TurnEvent::HistoryTrimmed`] (FR9).
+/// Present whenever a trim ran with
+/// `[runtime_profiles.<alias>.context_compression] enabled` — both when the
+/// removed span was replaced by a narrative summary and when compaction fell
+/// back to the static breadcrumb trim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextCompactionInfo {
+    /// `"summary"` — the span became one first-person narrative summary;
+    /// `"breadcrumb"` — compaction fell back to the static trim.
+    pub mode: &'static str,
+    /// Rows the trim removed from the span.
+    pub span_messages: usize,
+    /// Estimated tokens of the summarized agent work.
+    pub span_tokens: usize,
+    /// Tokens of the accepted summary (reported, else estimated). Zero on
+    /// breadcrumb fallback.
+    pub summary_tokens: usize,
+    /// Genuine user messages kept verbatim out of the span.
+    pub kept_user_messages: usize,
+    /// `provider/model` that served — or, on fallback, would have served —
+    /// the summary.
+    pub provider: String,
+    /// True when the breadcrumb trim ran because compaction failed or was
+    /// not worth a round-trip.
+    pub fell_back: bool,
 }
 
 /// Provider-facing context captured at a trim boundary. This remains attached

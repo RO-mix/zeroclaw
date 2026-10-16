@@ -328,6 +328,8 @@ pub(crate) async fn finish_after_max_iterations(
                                     history,
                                     *crumb_present,
                                 )),
+
+                                compaction: None,
                             })
                             .await;
                     }

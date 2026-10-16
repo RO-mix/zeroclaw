@@ -13739,6 +13739,7 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<St
             tokens_after_source,
             unsatisfiable_floor,
             retained_context: _,
+            ..
         } => SessionUpdateEvent::HistoryTrimmed {
             session_id: session_id.to_string(),
             dropped_messages: *dropped_messages,
@@ -27422,6 +27423,8 @@ mod tests {
             tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
             unsatisfiable_floor: None,
             retained_context: None,
+
+            compaction: None,
         };
         let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
@@ -27456,6 +27459,8 @@ mod tests {
             tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
             unsatisfiable_floor: None,
             retained_context: None,
+
+            compaction: None,
         };
         let json = notification_for_turn_event("s1", &event).unwrap();
         let v = parse(&json);
@@ -31067,6 +31072,8 @@ mod tests {
             tokens_after_source: None,
             unsatisfiable_floor: None,
             retained_context: None,
+
+            compaction: None,
         };
 
         dispatcher
