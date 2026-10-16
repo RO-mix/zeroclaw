@@ -13738,7 +13738,6 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<St
             tokens_before_source,
             tokens_after_source,
             unsatisfiable_floor,
-            retained_context: _,
             ..
         } => SessionUpdateEvent::HistoryTrimmed {
             session_id: session_id.to_string(),

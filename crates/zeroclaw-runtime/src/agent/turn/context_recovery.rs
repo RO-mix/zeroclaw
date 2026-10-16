@@ -724,8 +724,6 @@ mod tests {
                 tokens_after,
                 tokens_before_source,
                 tokens_after_source,
-                unsatisfiable_floor: _,
-                retained_context: _,
                 ..
             } => {
                 assert!(dropped_messages > 0, "must report dropped messages");
