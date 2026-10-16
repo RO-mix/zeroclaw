@@ -284,89 +284,52 @@ impl Default for EvalHarnessConfig {
 fn default_cc_enabled() -> bool {
     false
 }
-fn default_threshold_ratio() -> f64 {
-    0.50
+fn default_cc_trigger_tokens() -> usize {
+    1024
 }
-fn default_protect_first_n() -> usize {
-    3
-}
-fn default_protect_last_n() -> usize {
-    4
-}
-fn default_cc_max_passes() -> u32 {
-    3
-}
-fn default_summary_max_chars() -> usize {
-    4000
-}
-fn default_source_max_chars() -> usize {
-    50_000
-}
-fn default_cc_timeout_secs() -> u64 {
-    60
-}
-fn default_identifier_policy() -> String {
-    "strict".to_string()
-}
-fn default_tool_result_retrim_chars() -> usize {
-    2_000
+fn default_cc_summary_max_output_tokens() -> u32 {
+    500
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
 #[prefix = "agent.context_compression"]
 pub struct ContextCompressionConfig {
-    /// The runtime context compressor was removed; no runtime execution path
-    /// consumes this flag, so setting it to `true` currently has no effect.
-    /// Defaults to `false` to match actual runtime behavior;
-    /// `Config::collect_warnings` reads an explicit `true` only to report
-    /// `context_compression_unsupported`.
+    /// Master switch for narrative summary compaction. When `true`, context
+    /// trims (pre-dispatch, terminal budget enforcement, overflow recovery)
+    /// first attempt to compress the removable span into one first-person
+    /// LLM summary; on any summarizer failure the runtime falls back to the
+    /// static breadcrumb trim. When `false` (default) the trim pipeline is
+    /// byte-identical to a build without compaction.
     #[serde(default = "default_cc_enabled")]
     pub enabled: bool,
-    #[serde(default = "default_threshold_ratio")]
-    pub threshold_ratio: f64,
-    #[serde(default = "default_protect_first_n")]
-    pub protect_first_n: usize,
-    #[serde(default = "default_protect_last_n")]
-    pub protect_last_n: usize,
-    #[serde(default = "default_cc_max_passes")]
-    pub max_passes: u32,
-    #[serde(default = "default_summary_max_chars")]
-    pub summary_max_chars: usize,
-    #[serde(default = "default_source_max_chars")]
-    pub source_max_chars: usize,
-    #[serde(default = "default_cc_timeout_secs")]
-    pub timeout_secs: u64,
-    /// Summarizer provider as a `<type>.<alias>` reference into `providers.models`.
+    /// Minimum estimated size (tokens) of the removable agent work required
+    /// before a summary LLM call is attempted. Spans below this threshold go
+    /// straight to the breadcrumb trim — a round-trip is not worth it for a
+    /// few hundred tokens. `0` means "always attempt".
+    #[serde(default = "default_cc_trigger_tokens")]
+    pub trigger_tokens: usize,
+    /// Cap on the summarizer's output tokens. The value is stated in the
+    /// summarization prompt and verified against the reported (or estimated)
+    /// output; a summary that exceeds its budget is discarded and the
+    /// breadcrumb trim runs instead. Must be greater than 0 when `enabled`.
+    #[serde(default = "default_cc_summary_max_output_tokens")]
+    pub summary_max_output_tokens: u32,
+    /// Summarizer provider as a `<type>.<alias>` reference into
+    /// `providers.models`. Empty (default) = reuse the current turn's
+    /// provider and model. Validated in `Config::validate()`.
     #[serde(default)]
     pub summary_provider: crate::providers::ModelProviderRef,
-    /// DEPRECATED bare model id retained as a compatibility fallback.
-    #[serde(default)]
-    pub summary_model: Option<String>,
-    #[serde(default = "default_identifier_policy")]
-    pub identifier_policy: String,
-    #[serde(default = "default_tool_result_retrim_chars")]
-    pub tool_result_retrim_chars: usize,
-    #[serde(default)]
-    pub tool_result_trim_exempt: Vec<String>,
 }
 
 impl Default for ContextCompressionConfig {
     fn default() -> Self {
         Self {
             enabled: default_cc_enabled(),
-            threshold_ratio: default_threshold_ratio(),
-            protect_first_n: default_protect_first_n(),
-            protect_last_n: default_protect_last_n(),
-            max_passes: default_cc_max_passes(),
-            summary_max_chars: default_summary_max_chars(),
-            source_max_chars: default_source_max_chars(),
-            timeout_secs: default_cc_timeout_secs(),
+            trigger_tokens: default_cc_trigger_tokens(),
+            summary_max_output_tokens: default_cc_summary_max_output_tokens(),
             summary_provider: crate::providers::ModelProviderRef::default(),
-            summary_model: None,
-            identifier_policy: default_identifier_policy(),
-            tool_result_retrim_chars: default_tool_result_retrim_chars(),
-            tool_result_trim_exempt: Vec::new(),
         }
     }
 }
@@ -953,14 +916,27 @@ mod tests {
         assert_eq!(ThinkingLevel::Max.default_budget_tokens(), Some(50_000));
     }
 
-    // The runtime context compressor was removed; nothing reads
-    // `context_compression` at runtime anymore, so the default must be
-    // `false` (a `true` default would mislead users into thinking the
-    // knob does something). See `context_compression_unsupported` in
-    // `schema.rs` for the companion validation warning.
+    // Compaction is opt-in: the default must be `false` so a build without
+    // the flag configured keeps the historical breadcrumb-only trim
+    // behavior. See `maybe_compact_before_trim` in the runtime for the
+    // consumer.
     #[test]
     fn context_compression_config_defaults_to_disabled() {
         assert!(!ContextCompressionConfig::default().enabled);
+    }
+
+    #[test]
+    fn context_compression_rejects_unknown_fields() {
+        let toml = r#"
+            enabled = true
+            threshold_ratio = 0.9
+        "#;
+        let err = toml::from_str::<ContextCompressionConfig>(toml)
+            .expect_err("a field left over from the removed compressor must be rejected");
+        assert!(
+            err.to_string().contains("threshold_ratio"),
+            "error names the unknown field: {err}"
+        );
     }
 
     #[test]

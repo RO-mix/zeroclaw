@@ -75,11 +75,6 @@ pub const SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD: &str =
 ///   warning is the non-fatal surface for callers (channel doctor,
 ///   config-load tracing) that need the diagnostic even when a config that
 ///   failed `validate()` is still allowed to boot.
-/// - `context_compression_unsupported`: a `runtime_profiles.<alias>.context_compression`
-///   knob (`enabled = true`, or any other field set to a non-default value)
-///   has no runtime consumer — the context compressor was removed —
-///   so it currently has no effect. One warning per non-default field (see
-///   `collect_context_compression_ignored_warnings` in `schema.rs`).
 /// - `proxy_conflicts_with_dns_pinned_tools`: the configured proxy scope
 ///   selects `http_request` and/or `web_fetch`, whose validated DNS answers
 ///   require direct transport and therefore make the selected tool fail.

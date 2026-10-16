@@ -1315,7 +1315,7 @@ mod tests {
         assert_eq!(runtime.max_tool_result_chars, Some(50_000));
         assert_eq!(runtime.max_context_tokens, Some(32_000));
         assert!(!runtime.context_compression.enabled);
-        assert_eq!(runtime.context_compression.tool_result_retrim_chars, 2_000);
+        assert_eq!(runtime.context_compression.summary_max_output_tokens, 500);
         assert_eq!(
             cfg.risk_profiles["default"].auto_approve,
             [
