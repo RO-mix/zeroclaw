@@ -48029,7 +48029,8 @@ allowed_users = []
             runtime_profile = "fast"
         "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        cfg.validate().expect("revived context_compression block must validate");
+        cfg.validate()
+            .expect("revived context_compression block must validate");
         assert!(
             !cfg.collect_warnings()
                 .iter()
@@ -48115,9 +48116,7 @@ allowed_users = []
                 .expect_err("enabled context_compression with a zero summary budget must fail")
         );
         assert!(
-            msg.contains(
-                "runtime_profiles.fast.context_compression.summary_max_output_tokens"
-            ),
+            msg.contains("runtime_profiles.fast.context_compression.summary_max_output_tokens"),
             "error names the field: {msg}"
         );
     }
