@@ -1663,6 +1663,52 @@ mod tests {
     }
 
     #[test]
+    fn scoped_usage_persists_feature_scope_and_legacy_rows_stay_none() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        // Ordinary turn traffic: no scope.
+        tracker
+            .record_usage(TokenUsage::new("test/model", 1000, 500, 0, 1.0, 2.0, 0.0))
+            .unwrap();
+        // Context-compaction summary call: distinct feature scope (FR8).
+        tracker
+            .record_usage_attributed_scoped(
+                TokenUsage::new("test/model", 800, 120, 0, 1.0, 2.0, 0.0),
+                Some("alpha"),
+                None,
+                Some("session-1".to_string()),
+                Some("context_compaction".to_string()),
+            )
+            .unwrap();
+
+        let path = resolve_storage_path(tmp.path()).unwrap();
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].get("scope").is_none(),
+            "pre-scope rows and ordinary traffic must not carry a scope: {}",
+            lines[0]
+        );
+        assert_eq!(
+            lines[1].get("scope").and_then(serde_json::Value::as_str),
+            Some("context_compaction"),
+            "scoped usage must persist the feature scope: {}",
+            lines[1]
+        );
+        assert_eq!(
+            lines[1]
+                .get("conversation_id")
+                .and_then(serde_json::Value::as_str),
+            Some("session-1"),
+            "session attribution must survive alongside the scope"
+        );
+    }
+
+    #[test]
     fn recovers_concatenated_records_from_legacy_ledger() {
         let tmp = TempDir::new().unwrap();
         // Write two real, valid records through the normal (now-atomic) path.

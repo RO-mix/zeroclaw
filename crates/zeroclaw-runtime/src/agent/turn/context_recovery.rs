@@ -1040,4 +1040,200 @@ mod tests {
 
         zeroclaw_log::clear_broadcast_hook();
     }
+
+    // ── Story 1.5: compaction through the recovery trigger ──────────
+
+    /// Scripted summarizer for the integration tests: `Ok(text)` or `Err`.
+    struct ScriptedSummarizer {
+        result: std::result::Result<String, String>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for ScriptedSummarizer {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "scripted-summarizer"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl zeroclaw_providers::ModelProvider for ScriptedSummarizer {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            unimplemented!("compaction uses the structured chat API")
+        }
+        async fn chat(
+            &self,
+            _request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            let text = self.result.clone().map_err(anyhow::Error::msg)?;
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some(text),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    /// Enabled compaction profile for agent `alpha` (trigger_tokens = 0 so
+    /// every removable span qualifies).
+    fn enabled_compaction_planner() -> (
+        zeroclaw_config::schema::Config,
+        super::super::compaction::CompactionPlanner,
+    ) {
+        let toml = r#"
+            [providers.models.custom.default]
+            api_key = "k"
+            model = "m-main"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [runtime_profiles.fast.context_compression]
+            enabled = true
+            trigger_tokens = 0
+
+            [agents.alpha]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+            runtime_profile = "fast"
+        "#;
+        let cfg: zeroclaw_config::schema::Config = toml::from_str(toml).unwrap();
+        let planner = super::super::compaction::CompactionPlanner::resolve(Some(&cfg), Some("alpha"));
+        assert!(planner.is_enabled(), "fixture profile must enable compaction");
+        (cfg, planner)
+    }
+
+    #[tokio::test]
+    async fn recovery_with_compaction_replaces_span_with_summary_and_reports_payload() {
+        let (_cfg, planner) = enabled_compaction_planner();
+        let mut history = overflowing_history();
+        let summarizer = ScriptedSummarizer {
+            result: Ok(
+                "I have scanned the workspace and established the layout; I was \
+                 fixing the recovery trim and remain unsure about the test count."
+                    .to_string(),
+            ),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut crumb = false;
+
+        let recovered = super::try_recover_context_overflow(
+            &mut None,
+            &mut history,
+            &anyhow::Error::msg("maximum context length exceeded"),
+            1,
+            Some(&tx),
+            None,
+            &NoopObserver,
+            limits(32_000),
+            Some("alpha"),
+            "turn-compact",
+            &planner,
+            &summarizer,
+            "custom.default",
+            "m-main",
+            &mut crumb,
+        )
+        .await;
+
+        assert_eq!(recovered, ContextRecovery::Recovered);
+        // The span became ONE marked summary; user turn heads inside the span
+        // survived verbatim (I2).
+        let summaries = history
+            .iter()
+            .filter(|m| super::super::compaction::is_compaction_summary(m))
+            .count();
+        assert_eq!(summaries, 1, "exactly one summary marker must exist");
+        assert!(
+            history.iter().any(|m| m.content.starts_with("turn 0 "))
+                || history.iter().any(|m| m.content.starts_with("turn 1 ")),
+            "a genuine user turn from the removed span must be kept verbatim"
+        );
+        let event = rx.try_recv().expect("recovery must emit a TurnEvent");
+        match event {
+            zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                compaction: Some(info),
+                ..
+            } => {
+                assert_eq!(info.mode, "summary");
+                assert!(!info.fell_back);
+                assert!(info.span_messages > 0);
+                assert_eq!(info.provider, "custom.default/m-main");
+            }
+            other => panic!("expected HistoryTrimmed with compaction payload, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_with_failing_summarizer_falls_back_and_reports_fallback_payload() {
+        let (_cfg, planner) = enabled_compaction_planner();
+        let mut history = overflowing_history();
+        let summarizer = ScriptedSummarizer {
+            result: Err("summarizer unavailable".to_string()),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut crumb = false;
+
+        let recovered = super::try_recover_context_overflow(
+            &mut None,
+            &mut history,
+            &anyhow::Error::msg("maximum context length exceeded"),
+            1,
+            Some(&tx),
+            None,
+            &NoopObserver,
+            limits(32_000),
+            Some("alpha"),
+            "turn-fallback",
+            &planner,
+            &summarizer,
+            "custom.default",
+            "m-main",
+            &mut crumb,
+        )
+        .await;
+
+        // FR7/I4: the turn still recovers via the breadcrumb trim.
+        assert_eq!(recovered, ContextRecovery::Recovered);
+        let breadcrumb_text = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
+        assert!(
+            history.iter().any(|m| m.content == breadcrumb_text),
+            "fallback must leave the model-visible breadcrumb"
+        );
+        assert!(
+            !history
+                .iter()
+                .any(|m| super::super::compaction::is_compaction_summary(m)),
+            "a failed compaction must not leave a summary marker"
+        );
+        let event = rx.try_recv().expect("recovery must emit a TurnEvent");
+        match event {
+            zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                compaction: Some(info),
+                ..
+            } => {
+                assert_eq!(info.mode, "breadcrumb");
+                assert!(info.fell_back);
+                assert_eq!(info.provider, "custom.default/m-main");
+            }
+            other => panic!("expected HistoryTrimmed with fallback payload, got {other:?}"),
+        }
+    }
 }

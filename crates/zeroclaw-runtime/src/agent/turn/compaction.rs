@@ -999,4 +999,130 @@ mod tests {
             "the old summary row must fold into the new one, not stack"
         );
     }
+
+    // ── Story 1.5: planner resolution, event payload ────────────────
+
+    /// Minimal config fixture: agent `alpha` on runtime profile `fast` whose
+    /// context_compression block is enabled.
+    fn compaction_config_toml(cc_block: &str) -> String {
+        format!(
+            r#"
+            [providers.models.custom.default]
+            api_key = "k"
+            model = "m-main"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+            [providers.models.custom.cheap]
+            api_key = "k"
+            model = "m-cheap"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [runtime_profiles.fast.context_compression]
+            {cc_block}
+
+            [agents.alpha]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+            runtime_profile = "fast"
+            "#
+        )
+    }
+
+    #[test]
+    fn planner_resolves_enabled_profile_and_stays_disabled_otherwise() {
+        let cfg: zeroclaw_config::schema::Config = toml::from_str(&compaction_config_toml(
+            "enabled = true\ntrigger_tokens = 64",
+        ))
+        .unwrap();
+        let planner = CompactionPlanner::resolve(Some(&cfg), Some("alpha"));
+        assert!(planner.is_enabled());
+        assert_eq!(
+            planner.provider_label("custom.default", "m-main"),
+            "custom.default/m-main",
+            "no override: the turn's own route serves the summary"
+        );
+
+        // Disabled profile -> inert planner (I3).
+        let cfg: zeroclaw_config::schema::Config = toml::from_str(&compaction_config_toml(
+            "enabled = false",
+        ))
+        .unwrap();
+        assert!(!CompactionPlanner::resolve(Some(&cfg), Some("alpha")).is_enabled());
+
+        // No config / no agent alias / unknown agent -> inert.
+        assert!(!CompactionPlanner::resolve(None, Some("alpha")).is_enabled());
+        assert!(!CompactionPlanner::resolve(Some(&cfg), None).is_enabled());
+        assert!(!CompactionPlanner::resolve(Some(&cfg), Some("nobody")).is_enabled());
+    }
+
+    #[test]
+    fn planner_routes_summary_provider_override() {
+        let cfg: zeroclaw_config::schema::Config = toml::from_str(&compaction_config_toml(
+            "enabled = true\nsummary_provider = \"custom.cheap\"",
+        ))
+        .unwrap();
+        let planner = CompactionPlanner::resolve(Some(&cfg), Some("alpha"));
+        assert!(planner.is_enabled());
+        assert_eq!(
+            planner.provider_label("custom.default", "m-main"),
+            "custom.cheap/m-cheap",
+            "the override alias and its own model must label the summary route"
+        );
+
+        // Agent-level override beats the profile-level ref
+        // (effective_summary_provider precedence).
+        let toml_with_agent_override = compaction_config_toml(
+            "enabled = true\nsummary_provider = \"custom.cheap\"",
+        ) + "\nsummary_provider = \"custom.default\"\n";
+        let cfg: zeroclaw_config::schema::Config =
+            toml::from_str(&toml_with_agent_override).unwrap();
+        let planner = CompactionPlanner::resolve(Some(&cfg), Some("alpha"));
+        assert_eq!(
+            planner.provider_label("custom.default", "m-main"),
+            "custom.default/m-main",
+        );
+    }
+
+    #[test]
+    fn event_info_maps_summary_and_fallback_modes() {
+        let mut history = long_history();
+        let mock = MockSummarizer::text("I have established the plan.");
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(compact_history(
+                &mut history,
+                false,
+                6,
+                &enabled_config(),
+                &mock,
+                "custom.default",
+                "m-main",
+            ))
+            .expect("compaction succeeds");
+        let info = event_info(&outcome);
+        assert_eq!(info.mode, "summary");
+        assert!(!info.fell_back);
+        assert_eq!(info.span_messages, 6);
+        assert!(info.span_tokens > 0);
+        assert_eq!(info.summary_tokens, 120);
+        assert_eq!(info.kept_user_messages, 2);
+        assert_eq!(info.provider, "custom.default/m-main");
+
+        let fallback = CompactionOutcome::breadcrumb_fallback(
+            4,
+            0,
+            "custom.default/m-main".to_string(),
+        );
+        let info = event_info(&fallback);
+        assert_eq!(info.mode, "breadcrumb");
+        assert!(info.fell_back);
+        assert_eq!(info.span_messages, 4);
+        assert_eq!(info.summary_tokens, 0);
+    }
 }
