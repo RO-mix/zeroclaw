@@ -9,9 +9,13 @@
 //!
 //! Invariants (see the feature architecture doc):
 //! - I1: leading system messages never enter the compaction span.
-//! - I2: genuine user messages never enter the summary input — they are kept
-//!   verbatim in the transcript; only agent work (assistant/tool rows and
-//!   prompt-mode tool-result carriers) is summarized.
+//! - I2: verbatim-keepable user messages never enter the summary input —
+//!   they stay in the transcript under the D3 head+tail rule (oldest
+//!   `COMPACT_USER_HEAD_TOKENS` + newest messages up to
+//!   `COMPACT_USER_KEPT_MAX_TOKENS` total; the middle collapses into ONE
+//!   elision note). Only agent work (assistant/tool rows, prompt-mode
+//!   tool-result carriers, and every origin-marked non-user row) is
+//!   summarized.
 //! - I3: with the config disabled the engine is never invoked.
 //! - I4: any summarizer failure leaves the history untouched so the caller
 //!   can run its existing breadcrumb trim.
@@ -32,6 +36,22 @@ use zeroclaw_providers::{ChatMessage, ChatRequest, ModelProvider};
 /// distinguishable from real user turns.
 pub(crate) const COMPACTION_SUMMARY_PREFIX: &str = "[Compaction summary:";
 
+/// Structural marker prefix of the synthetic note that replaces user
+/// messages dropped by the D3 head+tail selection. Same convention as
+/// [`COMPACTION_SUMMARY_PREFIX`]: an internal, English, model-facing marker
+/// identified by prefix + role, distinguishable from a real user turn.
+pub(crate) const USER_MESSAGES_ELIDED_PREFIX: &str = "[Compaction elision:";
+
+/// D3 verbatim-keep head budget: the oldest user messages are kept while
+/// they fit this many estimated tokens (Kimi `COMPACT_USER_MESSAGE_HEAD_TOKENS`).
+pub(crate) const COMPACT_USER_HEAD_TOKENS: usize = 2_048;
+
+/// D3 verbatim-keep total budget: head plus tail user messages are kept
+/// while their combined estimate stays within this many tokens
+/// (Kimi `COMPACT_USER_MESSAGE_MAX_TOKENS`); beyond it the middle collapses
+/// into one elision note.
+pub(crate) const COMPACT_USER_KEPT_MAX_TOKENS: usize = 20_000;
+
 /// CostTracker scope for summary-compaction LLM calls (FR8).
 pub(crate) const COST_SCOPE: &str = "context_compaction";
 
@@ -49,9 +69,16 @@ error messages. Do not invent facts and do not address the user. Stay under \
 the stated token budget.";
 
 /// True when `msg` is a compaction summary marker rather than a genuine
-/// transcript row.
+/// transcript row. The origin stamp is authoritative once present; the
+/// prefix check remains for rows persisted before origin marking existed.
 pub(crate) fn is_compaction_summary(msg: &ChatMessage) -> bool {
-    msg.role == "user" && msg.content.starts_with(COMPACTION_SUMMARY_PREFIX)
+    msg.origin == Some(zeroclaw_api::model_provider::MessageOrigin::CompactionSummary)
+        || (msg.role == "user" && msg.content.starts_with(COMPACTION_SUMMARY_PREFIX))
+}
+
+/// True when `msg` is a D3 elision note rather than a genuine transcript row.
+fn is_user_elision_note(msg: &ChatMessage) -> bool {
+    msg.role == "user" && msg.content.starts_with(USER_MESSAGES_ELIDED_PREFIX)
 }
 
 /// Which reduction ran for one trim event.
@@ -68,26 +95,109 @@ pub(crate) enum CompactionMode {
 pub(crate) struct CompactionSpan {
     /// Contiguous transcript rows the caller's trim would drop.
     pub(crate) range: std::ops::Range<usize>,
-    /// Agent-work rows to feed the summarizer, in original order.
+    /// Agent-work rows to feed the summarizer, in original order. Every
+    /// origin-marked non-user row (injection, task, retry, skill activation,
+    /// an older compaction summary) lands here regardless of role, as do
+    /// prompt-mode tool-result carriers and legacy heuristic matches.
     pub(crate) summary_input: Vec<ChatMessage>,
-    /// Genuine user messages inside the span, kept verbatim in original
-    /// order (I2).
+    /// User rows that survive the span verbatim, in original order, after
+    /// the D3 head+tail selection: the oldest messages within
+    /// [`COMPACT_USER_HEAD_TOKENS`], then — only when the middle was elided
+    /// — ONE elision note, then the newest messages within the remaining
+    /// budget. The note lives in this contour (not in `summary_input`):
+    /// the summarizer must restate elided user content as narrative, while
+    /// the transcript keeps an explicit breadcrumb that user input was
+    /// dropped. Under the total budget this is simply every keepable user
+    /// row, identical to the pre-D3 behavior.
     pub(crate) kept_users: Vec<ChatMessage>,
     /// Estimated tokens of `summary_input` — the number `trigger_tokens`
     /// gates on.
     pub(crate) span_tokens: usize,
+    /// How many verbatim-keepable user rows the D3 selection replaced with
+    /// the elision note (0 when the total estimate fit the keep budget).
+    pub(crate) elided_user_messages: usize,
 }
 
-/// A user message is a genuine turn head when it is neither a prompt-mode
-/// tool-result carrier nor a compaction summary marker. Breadcrumb rows
-/// cannot appear inside the span: the owner-recorded crumb sits before the
-/// body by contract.
-fn is_genuine_user_message(msg: &ChatMessage) -> bool {
-    msg.role == "user"
-        && !msg
-            .content
-            .starts_with(zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX)
-        && !is_compaction_summary(msg)
+/// A user row is verbatim-keepable when its origin says it is genuine user
+/// input, or — for legacy rows without an origin stamp — when it is neither
+/// a prompt-mode tool-result carrier nor a synthetic compaction marker.
+/// Breadcrumb rows cannot appear inside the span: the owner-recorded crumb
+/// sits before the body by contract.
+fn is_verbatim_keepable_user(msg: &ChatMessage) -> bool {
+    match msg.origin {
+        Some(zeroclaw_api::model_provider::MessageOrigin::User) => true,
+        // Origin-marked non-user rows (injection/task/retry/skill_activation/
+        // compaction_summary) summarize as agent work even when role==user.
+        Some(_) => false,
+        None => {
+            msg.role == "user"
+                && !msg
+                    .content
+                    .starts_with(zeroclaw_api::tool_carrier::TOOL_RESULTS_PREFIX)
+                && !is_compaction_summary(msg)
+                && !is_user_elision_note(msg)
+        }
+    }
+}
+
+/// Estimate a single row's tokens with the shared history heuristic.
+fn estimate_message_tokens(msg: &ChatMessage) -> usize {
+    estimate_history_tokens(std::slice::from_ref(msg))
+}
+
+/// Build the synthetic D3 elision note. Origin `injection`, same convention
+/// as the compaction summary row.
+fn user_messages_elided_note(elided: usize) -> ChatMessage {
+    ChatMessage::user(format!(
+        "{USER_MESSAGES_ELIDED_PREFIX} {elided} earlier user messages elided - \
+         see session journal]"
+    ))
+    .with_origin(zeroclaw_api::model_provider::MessageOrigin::Injection)
+}
+
+/// D3 head+tail selection over the span's verbatim-keepable user rows
+/// (Kimi `selectCompactionUserMessages`, whole-message granularity: a row
+/// that does not fit a budget is elided rather than truncated, keeping
+/// surviving rows byte-verbatim). Returns the rows to splice after the
+/// summary — head, then ONE elision note when anything was dropped, then
+/// tail — plus the number of elided rows.
+fn select_kept_user_rows(users: &[ChatMessage]) -> (Vec<ChatMessage>, usize) {
+    let total: usize = users.iter().map(estimate_message_tokens).sum();
+    if total <= COMPACT_USER_KEPT_MAX_TOKENS {
+        return (users.to_vec(), 0);
+    }
+
+    let mut kept = Vec::with_capacity(users.len());
+    let mut head_budget = COMPACT_USER_HEAD_TOKENS;
+    let mut head_end = 0;
+    while head_end < users.len() && head_budget > 0 {
+        let tokens = estimate_message_tokens(&users[head_end]);
+        if tokens > head_budget {
+            break;
+        }
+        kept.push(users[head_end].clone());
+        head_budget -= tokens;
+        head_end += 1;
+    }
+
+    let mut tail_budget = COMPACT_USER_KEPT_MAX_TOKENS.saturating_sub(COMPACT_USER_HEAD_TOKENS);
+    let mut tail_start = users.len();
+    let mut tail = Vec::new();
+    while tail_start > head_end && tail_budget > 0 {
+        let tokens = estimate_message_tokens(&users[tail_start - 1]);
+        if tokens > tail_budget {
+            break;
+        }
+        tail.push(users[tail_start - 1].clone());
+        tail_budget -= tokens;
+        tail_start -= 1;
+    }
+    tail.reverse();
+
+    let elided = tail_start - head_end;
+    kept.push(user_messages_elided_note(elided));
+    kept.extend(tail);
+    (kept, elided)
 }
 
 /// Partition the caller-selected span into summarizable agent work and
@@ -118,10 +228,10 @@ pub(crate) fn select_compaction_span(
     }
 
     let mut summary_input = Vec::new();
-    let mut kept_users = Vec::new();
+    let mut verbatim_users = Vec::new();
     for msg in &history[range.clone()] {
-        if is_genuine_user_message(msg) {
-            kept_users.push(msg.clone());
+        if is_verbatim_keepable_user(msg) {
+            verbatim_users.push(msg.clone());
         } else {
             summary_input.push(msg.clone());
         }
@@ -129,6 +239,7 @@ pub(crate) fn select_compaction_span(
     if summary_input.is_empty() {
         return None;
     }
+    let (kept_users, elided_user_messages) = select_kept_user_rows(&verbatim_users);
     let span_tokens = estimate_history_tokens(&summary_input);
     if span_tokens < trigger_tokens {
         return None;
@@ -138,6 +249,7 @@ pub(crate) fn select_compaction_span(
         summary_input,
         kept_users,
         span_tokens,
+        elided_user_messages,
     })
 }
 
@@ -197,8 +309,11 @@ pub(crate) struct CompactionOutcome {
     pub(crate) span_messages: usize,
     /// Estimated tokens of the summarized agent work.
     pub(crate) span_tokens: usize,
-    /// Genuine user messages kept verbatim out of the span.
+    /// Genuine user messages kept verbatim out of the span (D3 head+tail
+    /// rows; the elision note is synthetic and not counted here).
     pub(crate) kept_user_messages: usize,
+    /// User messages replaced by the D3 elision note.
+    pub(crate) elided_user_messages: usize,
     /// The verbatim-kept user rows, in splice order (summary first, then
     /// these) — the trim trigger mirrors them into its rebuilt request.
     pub(crate) kept_users: Vec<ChatMessage>,
@@ -226,6 +341,7 @@ impl CompactionOutcome {
             span_messages,
             span_tokens,
             kept_user_messages: 0,
+            elided_user_messages: 0,
             kept_users: Vec::new(),
             summary: None,
             summary_tokens: 0,
@@ -274,6 +390,7 @@ pub(crate) fn record_compaction_trace(outcome: &CompactionOutcome, trigger: &str
                 "span_tokens": outcome.span_tokens,
                 "summary_tokens": outcome.summary_tokens,
                 "kept_user_messages": outcome.kept_user_messages,
+                "elided_user_messages": outcome.elided_user_messages,
                 "provider": outcome.provider,
                 "fell_back": outcome.fell_back,
                 "cost_scope": COST_SCOPE,
@@ -378,7 +495,7 @@ pub(crate) async fn compact_history(
         span.summary_input.len()
     ))
     .with_origin(zeroclaw_api::model_provider::MessageOrigin::CompactionSummary);
-    let kept_user_messages = span.kept_users.len();
+    let kept_user_messages = span.kept_users.len() - usize::from(span.elided_user_messages > 0);
     let kept_users = span.kept_users.clone();
     history.splice(
         span.range.clone(),
@@ -389,6 +506,7 @@ pub(crate) async fn compact_history(
         span_messages: span.range.len(),
         span_tokens: span.span_tokens,
         kept_user_messages,
+        elided_user_messages: span.elided_user_messages,
         kept_users,
         summary: Some(summary),
         summary_tokens,
@@ -998,6 +1116,219 @@ mod tests {
         assert_eq!(
             summaries, 1,
             "the old summary row must fold into the new one, not stack"
+        );
+    }
+
+    #[test]
+    fn select_span_respects_origin_marking_over_role() {
+        use zeroclaw_api::model_provider::MessageOrigin;
+        // Origin-marked user-ROLE rows that are NOT genuine user input must
+        // summarize as agent work; only origin==User (or the None heuristic)
+        // stays in the verbatim keep contour.
+        let history = vec![
+            sys("s"),
+            user("recalled memory facts").with_origin(MessageOrigin::Injection),
+            asst("early work"),
+            user("genuine unmarked request"),
+            user("marked genuine request").with_origin(MessageOrigin::User),
+            user("background task notice").with_origin(MessageOrigin::Task),
+            user("retry feedback").with_origin(MessageOrigin::Retry),
+            user("skill boilerplate").with_origin(MessageOrigin::SkillActivation),
+            asst("current"),
+        ];
+        let span = select_compaction_span(&history, false, 8, 0).expect("span selectable");
+        assert_eq!(span.kept_users.len(), 2);
+        assert_message_eq(&span.kept_users[0], &user("genuine unmarked request"));
+        assert_message_eq(&span.kept_users[1], &user("marked genuine request"));
+        assert_eq!(span.elided_user_messages, 0);
+        let summarized: Vec<&str> = span
+            .summary_input
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        for marked in [
+            "recalled memory facts",
+            "background task notice",
+            "retry feedback",
+            "skill boilerplate",
+        ] {
+            assert!(
+                summarized.contains(&marked),
+                "origin-marked row must summarize as agent work: {summarized:?}"
+            );
+        }
+        assert!(
+            !summarized.contains(&"genuine unmarked request"),
+            "heuristic-kept user row must stay out of the summary input: {summarized:?}"
+        );
+        assert!(
+            !summarized.contains(&"marked genuine request"),
+            "origin=User row must stay out of the summary input: {summarized:?}"
+        );
+    }
+
+    #[test]
+    fn select_span_elides_middle_user_rows_beyond_keep_budget() {
+        // 30 user rows of identical ~1k estimated tokens each — well past
+        // COMPACT_USER_KEPT_MAX_TOKENS — inside one span with agent work.
+        let big = "u".repeat(4_000);
+        let mut history = vec![sys("s")];
+        let mut expected_users = Vec::new();
+        for i in 0..30 {
+            let m = user(&format!("user {i:02} {big}"));
+            expected_users.push(m.clone());
+            history.push(m);
+        }
+        history.push(asst("agent work after users"));
+
+        let est_each = estimate_history_tokens(std::slice::from_ref(&expected_users[0]));
+        assert!(
+            expected_users.windows(2).all(|w| {
+                estimate_history_tokens(std::slice::from_ref(&w[0]))
+                    == estimate_history_tokens(std::slice::from_ref(&w[1]))
+            }),
+            "fixture rows must estimate identically"
+        );
+        assert!(
+            est_each * 30 > COMPACT_USER_KEPT_MAX_TOKENS,
+            "fixture must exceed the keep budget"
+        );
+
+        let span = select_compaction_span(&history, false, 31, 0).expect("span selectable");
+        let head_count = COMPACT_USER_HEAD_TOKENS / est_each;
+        let tail_count = (COMPACT_USER_KEPT_MAX_TOKENS - COMPACT_USER_HEAD_TOKENS) / est_each;
+        let elided = 30 - head_count - tail_count;
+        assert!(
+            elided > 0,
+            "fixture must leave a middle to elide (head={head_count}, tail={tail_count})"
+        );
+        assert_eq!(span.elided_user_messages, elided);
+        assert_eq!(span.kept_users.len(), head_count + 1 + tail_count);
+
+        // Head rows survive byte-verbatim, in original order.
+        for (k, kept) in span.kept_users.iter().take(head_count).enumerate() {
+            assert_message_eq(kept, &expected_users[k]);
+        }
+        // Exactly one elision note separates head and tail…
+        let note = &span.kept_users[head_count];
+        assert!(is_user_elision_note(note), "elision note: {note:?}");
+        assert_eq!(
+            note.origin,
+            Some(zeroclaw_api::model_provider::MessageOrigin::Injection)
+        );
+        assert!(
+            note.content
+                .contains(&format!("{elided} earlier user messages")),
+            "note must state the elided count: {note:?}"
+        );
+        // …and the tail rows are the newest user rows, byte-verbatim.
+        for (k, kept) in span.kept_users[head_count + 1..].iter().enumerate() {
+            assert_message_eq(kept, &expected_users[30 - tail_count + k]);
+        }
+        // The note lives in the kept-user contour, NOT in the summarizer
+        // input; the summary input stays agent work only.
+        assert_eq!(span.summary_input.len(), 1);
+        assert_message_eq(&span.summary_input[0], &asst("agent work after users"));
+    }
+
+    #[test]
+    fn select_span_legacy_none_origin_keeps_heuristic_classification() {
+        // Regression: rows without an origin stamp must classify exactly as
+        // before origin marking — role==user is kept verbatim unless the row
+        // structurally looks like a synthetic marker.
+        let history = vec![
+            sys("s"),
+            user(&format!(
+                "{USER_MESSAGES_ELIDED_PREFIX} 3 earlier user messages elided - see session journal]"
+            )),
+            user(&format!(
+                "{COMPACTION_SUMMARY_PREFIX} 2 earlier message(s) condensed]\nold"
+            )),
+            user("real request"),
+            asst("work"),
+        ];
+        let span = select_compaction_span(&history, false, 4, 0).expect("span selectable");
+        assert_eq!(span.kept_users.len(), 1);
+        assert_message_eq(&span.kept_users[0], &user("real request"));
+        assert_eq!(span.summary_input.len(), 3);
+        assert_eq!(span.elided_user_messages, 0);
+    }
+
+    #[tokio::test]
+    async fn compact_history_splices_elision_note_between_verbatim_head_and_tail() {
+        let big = "u".repeat(4_000);
+        let mut history = vec![sys("s")];
+        for i in 0..30 {
+            history.push(user(&format!("user {i:02} {big}")));
+        }
+        history.push(asst("agent work after users"));
+        let before_len = history.len();
+
+        let mock = MockSummarizer::text("I have summarized the earlier agent work.");
+        let outcome = compact_history(
+            &mut history,
+            false,
+            31,
+            &enabled_config(),
+            &mock,
+            "custom.default",
+            "m-main",
+        )
+        .await
+        .expect("compaction succeeds");
+
+        assert_eq!(outcome.mode, CompactionMode::Summary);
+        assert!(outcome.kept_user_messages > 0);
+        assert_eq!(
+            outcome.elided_user_messages + outcome.kept_user_messages,
+            30
+        );
+        // The summarizer saw only the agent work, never a user row.
+        let seen = mock.seen_messages();
+        assert!(
+            seen[1..].iter().all(|m| !m.content.contains("user 00")),
+            "no user row may reach the summarizer: {seen:?}"
+        );
+
+        // Transcript: system, summary, verbatim head, elision note, tail.
+        let summary_pos = history
+            .iter()
+            .position(is_compaction_summary)
+            .expect("summary marker present");
+        assert_eq!(
+            history.len(),
+            before_len - 31 + 1 + outcome.kept_user_messages + 1,
+            "span replaced by summary + verbatim users + one elision note"
+        );
+        let note_pos = history
+            .iter()
+            .position(is_user_elision_note)
+            .expect("elision note present");
+        assert!(
+            note_pos > summary_pos,
+            "elision note sits after the summary and the verbatim head"
+        );
+        assert!(
+            is_user_elision_note(&history[note_pos]),
+            "elision note: {history:?}"
+        );
+        // Verbatim head: the OLDEST user rows survive right after the
+        // summary (D3 protects the original task statement)…
+        assert_message_eq(&history[summary_pos + 1], &user(&format!("user 00 {big}")));
+        // …and the NEWEST user row is the last kept row of the splice.
+        assert_message_eq(
+            history.last().expect("tail row survives"),
+            &user(&format!("user 29 {big}")),
+        );
+        // The elision note persists through serde as an ordinary row with
+        // its origin intact.
+        let serialized = serde_json::to_string(&history).expect("history serializes");
+        let reloaded: Vec<ChatMessage> =
+            serde_json::from_str(&serialized).expect("history reloads");
+        assert_eq!(
+            reloaded.iter().filter(|m| is_user_elision_note(m)).count(),
+            1,
+            "exactly one elision note survives persistence"
         );
     }
 
