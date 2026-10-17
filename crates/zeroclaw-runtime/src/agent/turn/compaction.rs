@@ -151,18 +151,35 @@ impl OverflowRecoveryPolicy {
     }
 }
 
-/// First-person narrative system prompt. Model-facing runtime text (same
-/// class as tool instructions), English per the logging/text contract.
+/// First-person handoff-summary system prompt (D4, Kimi
+/// `compaction-instruction.md`): the summary is a direct task for the model
+/// that resumes this task once the earlier conversation is cleared — written
+/// in the conversation's own language, the latest user request protected
+/// above everything, done work at high fidelity, unverified claims marked
+/// honestly, and an invested forward plan. Model-facing runtime text (same
+/// class as tool instructions), English per the logging/text contract; the
+/// summary itself is instructed to follow the conversation's language.
 const SUMMARY_SYSTEM_PROMPT: &str = "You are compacting an agent's conversation \
-history. You will receive earlier agent work — assistant replies, tool calls, \
-and tool results — that no longer fits the context window. The user's own \
-messages are kept verbatim elsewhere and must not be restated. Write a \
-first-person narrative summary from the agent's perspective in present-perfect \
-tense covering exactly four things: what was done, what was established, what \
-is in progress, and what remains unknown. Preserve concrete facts the agent \
-would need to continue: file paths, identifiers, commands, decisions, and \
-error messages. Do not invent facts and do not address the user. Stay under \
-the stated token budget.";
+history into a handoff summary for the model that resumes this task once the \
+earlier conversation is cleared. You receive earlier agent work — assistant \
+replies, tool calls, and tool results — that no longer fits the context \
+window; the user's own messages are kept verbatim elsewhere and must not be \
+restated. Write a first-person narrative from the agent's perspective, in the \
+SAME LANGUAGE the conversation was using — never switch to English just \
+because these instructions are in English. Do not impose rigid section \
+headings; let the shape follow the task. Cover, in this priority order: \
+first, the latest request actually being served — what the user asked for, \
+including any acceptance criteria they stated — in enough detail to \
+continue, because protecting the current ask matters above everything else; \
+second, what has actually been done, at high fidelity, with the exact file \
+paths, commands, identifiers, and the results themselves (key values, \
+outputs, error lines), keeping only the final working version of anything \
+tried more than once; third, what is still unknown or unverified — name the \
+gaps plainly and mark hypotheses and never-confirmed claims as unverified, \
+never as fact; fourth, the forward plan — the exact next step and the \
+remaining sequence to finish, including decisions already made for those \
+steps. Do not invent facts, do not address the user, and stay under the \
+stated token budget.";
 
 /// True when `msg` is a compaction summary marker rather than a genuine
 /// transcript row. The origin stamp is authoritative once present; the
@@ -441,6 +458,24 @@ pub(crate) fn select_compaction_span(
     })
 }
 
+/// D4 user-side instruction for `summarize_span` (Kimi
+/// `compaction-instruction.md`): restates the token budget and pins the
+/// summary language to the conversation's language — "Write it in the same
+/// language the conversation has been using — do not switch to English".
+fn summary_user_instruction(span_input: &[ChatMessage], max_output_tokens: u32) -> String {
+    format!(
+        "Token budget for the summary: at most {max_output_tokens} tokens. \
+         Write the summary in the same language as the conversation you are \
+         about to read — do not switch languages.\n\n\
+         Earlier agent work to summarize:\n{}",
+        span_input
+            .iter()
+            .map(|m| format!("{}: {}", m.role, m.content))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
 /// One LLM round-trip that compresses `span_input` into a first-person
 /// narrative. Returns the summary text, the provider-reported usage (when
 /// available), and the locally estimated input tokens of the request.
@@ -456,15 +491,7 @@ pub(crate) async fn summarize_span(
     Option<zeroclaw_api::model_provider::TokenUsage>,
     usize,
 )> {
-    let budget_note = format!(
-        "Token budget for the summary: at most {max_output_tokens} tokens.\n\n\
-         Earlier agent work to summarize:\n{}",
-        span_input
-            .iter()
-            .map(|m| format!("{}: {}", m.role, m.content))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
+    let budget_note = summary_user_instruction(span_input, max_output_tokens);
     let messages = [
         ChatMessage::system(SUMMARY_SYSTEM_PROMPT),
         ChatMessage::user(budget_note),
@@ -2311,5 +2338,59 @@ mod tests {
         assert_eq!(policy.min_reduction_tokens, 1_000);
         assert!(policy.allows_attempt(4));
         assert!(!policy.allows_attempt(5));
+    }
+
+    // ── D4: handoff summary prompt (compaction-instruction.md port) ──
+
+    #[test]
+    fn summary_system_prompt_is_a_handoff_direct_task() {
+        // D4 markers from Kimi's `compaction-instruction.md`: same language
+        // as the conversation, the latest request protected above
+        // everything (with acceptance criteria), high-fidelity done-work,
+        // honest unverified marking, and an invested forward plan — while
+        // the standing guarantees (first-person narrative, no invention, no
+        // addressing the user, token budget) survive.
+        let prompt = SUMMARY_SYSTEM_PROMPT.to_lowercase();
+        for marker in [
+            "same language",
+            "first-person",
+            "latest request",
+            "acceptance criteria",
+            "unverified",
+            "forward plan",
+            "file paths",
+            "commands",
+            "error lines",
+            "do not invent",
+            "do not address the user",
+            "token budget",
+        ] {
+            assert!(prompt.contains(marker), "prompt misses {marker:?}");
+        }
+        // Direct-task framing: the summary serves the model resuming after
+        // the conversation is cleared.
+        assert!(
+            prompt.contains("handoff summary"),
+            "prompt must frame the summary as a handoff: {prompt}"
+        );
+    }
+
+    #[test]
+    fn summary_user_instruction_pins_language_and_budget() {
+        let instruction = summary_user_instruction(&[asst("travail antérieur")], 500);
+        let lower = instruction.to_lowercase();
+        assert!(
+            lower.contains("same language"),
+            "the user instruction must require the conversation's language: \
+             {instruction}"
+        );
+        assert!(
+            instruction.contains("500"),
+            "the token budget must be stated in the user instruction: {instruction}"
+        );
+        assert!(
+            instruction.contains("travail antérieur"),
+            "the span content must follow the instruction: {instruction}"
+        );
     }
 }
