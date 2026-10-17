@@ -671,6 +671,8 @@ mod tests {
             ChatMessage {
                 role: "tool".into(),
                 content: "Error: connection refused".into(),
+
+                origin: None,
             },
         ];
         let executions = extract_skill_executions_from_history(&history);

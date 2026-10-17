@@ -1168,6 +1168,8 @@ mod tests {
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "hello".into(),
+
+            origin: None,
         }];
         let request = ChatRequest {
             messages: &messages,
@@ -1209,6 +1211,8 @@ mod tests {
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "hello".into(),
+
+            origin: None,
         }];
         let request = ChatRequest {
             messages: &messages,
@@ -1289,6 +1293,8 @@ data: [DONE]
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "hello".into(),
+
+            origin: None,
         }];
         let request = crate::traits::ChatRequest {
             messages: &messages,
@@ -1527,10 +1533,14 @@ data: [DONE]
             ChatMessage {
                 role: "system".into(),
                 content: "be concise".into(),
+
+                origin: None,
             },
             ChatMessage {
                 role: "user".into(),
                 content: "hello".into(),
+
+                origin: None,
             },
         ];
 
@@ -1579,10 +1589,14 @@ data: [DONE]
             ChatMessage {
                 role: "assistant".into(),
                 content: "Previous answer".into(),
+
+                origin: None,
             },
             ChatMessage {
                 role: "user".into(),
                 content: "Follow-up".into(),
+
+                origin: None,
             },
         ];
 
@@ -1666,6 +1680,8 @@ data: [DONE]
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "What is the date?".into(),
+
+            origin: None,
         }];
         let tools = vec![serde_json::json!({
             "type": "function",
@@ -1764,7 +1780,7 @@ data: [DONE]
             role: "assistant".into(),
             content: r#"{"content":"Using tool","tool_calls":[{"id":"call_abc","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#
                 .into(),
-        }];
+            origin: None,}];
 
         let converted = OpenRouterModelProvider::convert_messages(&messages);
         assert_eq!(converted.len(), 1);
@@ -1792,6 +1808,8 @@ data: [DONE]
         let messages = vec![ChatMessage {
             role: "tool".into(),
             content: r#"{"tool_call_id":"call_xyz","content":"done"}"#.into(),
+
+            origin: None,
         }];
 
         let converted = OpenRouterModelProvider::convert_messages(&messages);
@@ -1915,10 +1933,14 @@ data: [DONE]
             ChatMessage {
                 role: "system".into(),
                 content: "Be helpful".into(),
+
+                origin: None,
             },
             ChatMessage {
                 role: "user".into(),
                 content: "Hi".into(),
+
+                origin: None,
             },
         ];
         let native = OpenRouterModelProvider::convert_messages(&messages);
@@ -2101,6 +2123,8 @@ data: [DONE]
         let messages = vec![ChatMessage {
             role: "assistant".into(),
             content: history_json.to_string(),
+
+            origin: None,
         }];
         let native = OpenRouterModelProvider::convert_messages(&messages);
         assert_eq!(native.len(), 1);
@@ -2124,6 +2148,8 @@ data: [DONE]
         let messages = vec![ChatMessage {
             role: "assistant".into(),
             content: history_json.to_string(),
+
+            origin: None,
         }];
         let native = OpenRouterModelProvider::convert_messages(&messages);
         assert_eq!(native.len(), 1);
@@ -2141,7 +2167,7 @@ data: [DONE]
             role: "assistant".into(),
             content: r#"{"content":"trying","tool_calls":[{"id":"call_bad","name":"shell","arguments":"{\"command\":\"rm -rf"}]}"#
                 .into(),
-        }];
+            origin: None,}];
 
         let converted = OpenRouterModelProvider::convert_messages(&messages);
         let tool_calls = converted[0].tool_calls.as_ref().unwrap();
@@ -2160,7 +2186,7 @@ data: [DONE]
             role: "assistant".into(),
             content: r#"{"content":"using","tool_calls":[{"id":"call_ok","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#
                 .into(),
-        }];
+            origin: None,}];
 
         let converted = OpenRouterModelProvider::convert_messages(&messages);
         let tool_calls = converted[0].tool_calls.as_ref().unwrap();
@@ -2176,7 +2202,7 @@ data: [DONE]
             role: "assistant".into(),
             content: r#"{"content":"testing","tool_calls":[{"id":"c1","name":"f","arguments":"null"},{"id":"c2","name":"g","arguments":"[]"},{"id":"c3","name":"h","arguments":"42"}]}"#
                 .into(),
-        }];
+            origin: None,}];
 
         let converted = OpenRouterModelProvider::convert_messages(&messages);
         let tool_calls = converted[0].tool_calls.as_ref().unwrap();
@@ -2477,6 +2503,8 @@ data: [DONE]
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "hello".into(),
+
+            origin: None,
         }];
 
         let mut stream = model_provider.stream_chat(

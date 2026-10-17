@@ -322,7 +322,7 @@ mod tests {
             ChatMessage::user(format!("{preamble}current request")),
             ChatMessage::assistant("current progress"),
             ChatMessage::assistant(crate::agent::loop_::build_native_assistant_history("", &[call], Some("private reasoning"))),
-            ChatMessage { role: "tool".into(), content: serde_json::json!({"tool_call_id": "listing-call", "content": "/tmp/listed-image.png"}).to_string() },
+            ChatMessage { role: "tool".into(), content: serde_json::json!({"tool_call_id": "listing-call", "content": "/tmp/listed-image.png"}).to_string(), origin: None,},
             ChatMessage::user(genuine.clone()),
         ];
         let mut injected = Some(super::super::MemoryPreamble {
@@ -1113,8 +1113,12 @@ mod tests {
             runtime_profile = "fast"
         "#;
         let cfg: zeroclaw_config::schema::Config = toml::from_str(toml).unwrap();
-        let planner = super::super::compaction::CompactionPlanner::resolve(Some(&cfg), Some("alpha"));
-        assert!(planner.is_enabled(), "fixture profile must enable compaction");
+        let planner =
+            super::super::compaction::CompactionPlanner::resolve(Some(&cfg), Some("alpha"));
+        assert!(
+            planner.is_enabled(),
+            "fixture profile must enable compaction"
+        );
         (cfg, planner)
     }
 

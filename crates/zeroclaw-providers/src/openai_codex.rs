@@ -2536,18 +2536,26 @@ data: [DONE]
             ChatMessage {
                 role: "system".into(),
                 content: "You are helpful.".into(),
+
+                origin: None,
             },
             ChatMessage {
                 role: "user".into(),
                 content: "Hi".into(),
+
+                origin: None,
             },
             ChatMessage {
                 role: "assistant".into(),
                 content: "Hello!".into(),
+
+                origin: None,
             },
             ChatMessage {
                 role: "user".into(),
                 content: "Thanks".into(),
+
+                origin: None,
             },
         ];
         let (instructions, input) = build_responses_input(&messages);
@@ -2571,6 +2579,8 @@ data: [DONE]
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "Hello".into(),
+
+            origin: None,
         }];
         let (instructions, input) = build_responses_input(&messages);
         assert_eq!(instructions, DEFAULT_CODEX_INSTRUCTIONS);
@@ -2583,10 +2593,14 @@ data: [DONE]
             ChatMessage {
                 role: "tool".into(),
                 content: r#"{"tool_call_id":"call_123","content":"result"}"#.into(),
+
+                origin: None,
             },
             ChatMessage {
                 role: "user".into(),
                 content: "Go".into(),
+
+                origin: None,
             },
         ];
         let (instructions, input) = build_responses_input(&messages);
@@ -2603,6 +2617,8 @@ data: [DONE]
         let messages = vec![ChatMessage {
             role: "tool".into(),
             content: "legacy plain text result".into(),
+
+            origin: None,
         }];
 
         let (_, input) = build_responses_input(&messages);
@@ -2623,6 +2639,8 @@ data: [DONE]
         let messages = vec![ChatMessage {
             role: "tool".into(),
             content: r#"{"content":"legacy result","status":"ok"}"#.into(),
+
+            origin: None,
         }];
 
         let (_, input) = build_responses_input(&messages);
@@ -2649,6 +2667,8 @@ data: [DONE]
                     "content": "legacy result"
                 })
                 .to_string(),
+
+                origin: None,
             }];
 
             let (_, input) = build_responses_input(&messages);

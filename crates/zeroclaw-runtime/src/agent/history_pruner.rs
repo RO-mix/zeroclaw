@@ -230,6 +230,8 @@ mod tests {
         ChatMessage {
             role: role.to_string(),
             content: content.to_string(),
+
+            origin: None,
         }
     }
 

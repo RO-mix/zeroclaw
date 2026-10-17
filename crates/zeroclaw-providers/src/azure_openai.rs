@@ -1513,7 +1513,7 @@ mod tests {
             role: "assistant".into(),
             content: r#"{"content":"trying","tool_calls":[{"id":"call_bad","name":"shell","arguments":"{\"command\":\"rm -rf"}]}"#
                 .into(),
-        }];
+            origin: None,}];
 
         let native = AzureOpenAiModelProvider::convert_messages(&messages);
         let tool_calls = native[0].tool_calls.as_ref().unwrap();
@@ -1532,7 +1532,7 @@ mod tests {
             role: "assistant".into(),
             content: r#"{"content":"using","tool_calls":[{"id":"call_ok","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#
                 .into(),
-        }];
+            origin: None,}];
 
         let native = AzureOpenAiModelProvider::convert_messages(&messages);
         let tool_calls = native[0].tool_calls.as_ref().unwrap();

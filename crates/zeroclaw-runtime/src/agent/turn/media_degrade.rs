@@ -97,6 +97,8 @@ mod tests {
         ConversationMessage::Chat(ChatMessage {
             role: role.to_string(),
             content,
+
+            origin: None,
         })
     }
 

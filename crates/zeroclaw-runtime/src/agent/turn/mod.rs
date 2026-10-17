@@ -1909,6 +1909,12 @@ async fn run_tool_call_loop_impl<'a>(
             if !context.is_empty() {
                 let existing = &turn_state.history[last_user_idx].content;
                 turn_state.history[last_user_idx].content = format!("{context}{existing}");
+                // The row now carries a volatile injected preamble (stripped
+                // again at persist/replay by `strip_memory_context_preamble`);
+                // origin marks that semantic exactly as the volatile
+                // preambles the port design maps to `injection`.
+                turn_state.history[last_user_idx].origin =
+                    Some(zeroclaw_api::model_provider::MessageOrigin::Injection);
                 *injected_memory_preamble = Some(MemoryPreamble {
                     preamble: context,
                     index: last_user_idx,
@@ -2076,7 +2082,8 @@ async fn run_tool_call_loop_impl<'a>(
                     // (do not append it) when it is.
                     IngressDecision::Drop { .. } => continue,
                 }
-                let msg = ChatMessage::user(steering_input.into_text());
+                let msg = ChatMessage::user(steering_input.into_text())
+                    .with_origin(zeroclaw_api::model_provider::MessageOrigin::Injection);
                 has_new_user_input |= !msg.content.trim_start().starts_with("[Tool results]");
                 turn_state.push_dual(msg);
             }
@@ -3220,7 +3227,8 @@ async fn run_tool_call_loop_impl<'a>(
                      but ZeroClaw could not parse it into a valid tool call. Use the supported \
                      tool-call schema, or answer in natural language if no tool is needed."
                         .to_string(),
-                );
+                )
+                .with_origin(zeroclaw_api::model_provider::MessageOrigin::Retry);
                 turn_state.push_dual(msg);
                 continue;
             }

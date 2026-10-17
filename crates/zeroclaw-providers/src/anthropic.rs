@@ -5085,10 +5085,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             ChatMessage {
                 role: "system".to_string(),
                 content: "System prompt".to_string(),
+
+                origin: None,
             },
             ChatMessage {
                 role: "user".to_string(),
                 content: "Hello".to_string(),
+
+                origin: None,
             },
         ];
         // Only 1 non-system message — should not cache
@@ -5102,12 +5106,16 @@ data: {\"type\":\"message_stop\"}\n\n";
         let mut messages = vec![ChatMessage {
             role: "system".to_string(),
             content: "System prompt".to_string(),
+
+            origin: None,
         }];
         // Add 3 non-system messages
         for i in 0..3 {
             messages.push(ChatMessage {
                 role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
                 content: format!("Message {i}"),
+
+                origin: None,
             });
         }
         assert!(AnthropicModelProvider::should_cache_conversation(&messages));
@@ -5118,6 +5126,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         let messages = vec![ChatMessage {
             role: "user".to_string(),
             content: "Hello".to_string(),
+
+            origin: None,
         }];
         // Exactly 1 non-system message — should not cache
         assert!(!AnthropicModelProvider::should_cache_conversation(
@@ -5129,10 +5139,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             ChatMessage {
                 role: "user".to_string(),
                 content: "Hello".to_string(),
+
+                origin: None,
             },
             ChatMessage {
                 role: "assistant".to_string(),
                 content: "Hi".to_string(),
+
+                origin: None,
             },
         ];
         assert!(AnthropicModelProvider::should_cache_conversation(&messages));
@@ -5582,6 +5596,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         let messages = vec![ChatMessage {
             role: "system".to_string(),
             content: "Short system prompt".to_string(),
+
+            origin: None,
         }];
 
         let (system_prompt, _) =
@@ -5608,6 +5624,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         let messages = vec![ChatMessage {
             role: "system".to_string(),
             content: large_content.clone(),
+
+            origin: None,
         }];
 
         let (system_prompt, _) =
@@ -5698,18 +5716,26 @@ data: {\"type\":\"message_stop\"}\n\n";
             ChatMessage {
                 role: "system".to_string(),
                 content: "You are helpful.".to_string(),
+
+                origin: None,
             },
             ChatMessage {
                 role: "user".to_string(),
                 content: "gen a 2 sum in golang".to_string(),
+
+                origin: None,
             },
             ChatMessage {
                 role: "assistant".to_string(),
                 content: "```go\nfunc twoSum(nums []int) {}\n```".to_string(),
+
+                origin: None,
             },
             ChatMessage {
                 role: "user".to_string(),
                 content: "what's meaning of make here?".to_string(),
+
+                origin: None,
             },
         ];
 
@@ -6080,6 +6106,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             role: "user".to_string(),
             content: "Check this image: [IMAGE:data:image/jpeg;base64,/9j/4AAQ] What do you see?"
                 .to_string(),
+
+            origin: None,
         }];
 
         let (_, native_msgs) =
@@ -6122,6 +6150,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         let messages = vec![ChatMessage {
             role: "user".to_string(),
             content: format!("[IMAGE:data:image/png;base64,{CANONICAL_PNG_B64}]"),
+
+            origin: None,
         }];
 
         let (_, native_msgs) =
@@ -6152,6 +6182,8 @@ data: {\"type\":\"message_stop\"}\n\n";
         let messages = vec![ChatMessage {
             role: "user".to_string(),
             content: "Hello, how are you?".to_string(),
+
+            origin: None,
         }];
 
         let (_, native_msgs) =
@@ -6197,10 +6229,14 @@ data: {\"type\":\"message_stop\"}\n\n";
             ChatMessage {
                 role: "system".to_string(),
                 content: "You are helpful.".to_string(),
+
+                origin: None,
             },
             ChatMessage {
                 role: "user".to_string(),
                 content: "Do two things.".to_string(),
+
+                origin: None,
             },
             ChatMessage {
                 role: "assistant".to_string(),
@@ -6212,6 +6248,8 @@ data: {\"type\":\"message_stop\"}\n\n";
                     ]
                 })
                 .to_string(),
+
+                origin: None,
             },
             ChatMessage {
                 role: "tool".to_string(),
@@ -6220,6 +6258,8 @@ data: {\"type\":\"message_stop\"}\n\n";
                     "content": "file1.txt\nfile2.txt"
                 })
                 .to_string(),
+
+                origin: None,
             },
             ChatMessage {
                 role: "tool".to_string(),
@@ -6228,6 +6268,8 @@ data: {\"type\":\"message_stop\"}\n\n";
                     "content": "/home/user"
                 })
                 .to_string(),
+
+                origin: None,
             },
         ];
 
@@ -6265,6 +6307,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             ChatMessage {
                 role: "user".to_string(),
                 content: "Do a thing.".to_string(),
+
+                origin: None,
             },
             ChatMessage {
                 role: "assistant".to_string(),
@@ -6275,10 +6319,14 @@ data: {\"type\":\"message_stop\"}\n\n";
                     ]
                 })
                 .to_string(),
+
+                origin: None,
             },
             ChatMessage {
                 role: "user".to_string(),
                 content: "Actually, never mind.".to_string(),
+
+                origin: None,
             },
         ];
 
@@ -6321,6 +6369,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             ChatMessage {
                 role: "user".to_string(),
                 content: "Do a thing.".to_string(),
+
+                origin: None,
             },
             ChatMessage {
                 role: "assistant".to_string(),
@@ -6331,6 +6381,8 @@ data: {\"type\":\"message_stop\"}\n\n";
                     ]
                 })
                 .to_string(),
+
+                origin: None,
             },
         ];
 
@@ -6356,6 +6408,8 @@ data: {\"type\":\"message_stop\"}\n\n";
             ChatMessage {
                 role: "user".to_string(),
                 content: "Hello".to_string(),
+
+                origin: None,
             },
             ChatMessage {
                 role: "assistant".to_string(),
@@ -6366,6 +6420,8 @@ data: {\"type\":\"message_stop\"}\n\n";
                     ]
                 })
                 .to_string(),
+
+                origin: None,
             },
             ChatMessage {
                 role: "tool".to_string(),
@@ -6374,10 +6430,14 @@ data: {\"type\":\"message_stop\"}\n\n";
                     "content": "hi"
                 })
                 .to_string(),
+
+                origin: None,
             },
             ChatMessage {
                 role: "user".to_string(),
                 content: "Thanks!".to_string(),
+
+                origin: None,
             },
         ];
 

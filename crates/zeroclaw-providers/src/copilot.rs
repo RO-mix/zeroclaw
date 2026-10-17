@@ -1113,7 +1113,7 @@ mod tests {
             role: "assistant".into(),
             content: r#"{"content":"trying","tool_calls":[{"id":"call_bad","name":"shell","arguments":"{\"command\":\"rm -rf"}]}"#
                 .into(),
-        }];
+            origin: None,}];
 
         let api_messages = CopilotModelProvider::convert_messages(&messages);
         assert_eq!(api_messages.len(), 1);
@@ -1133,7 +1133,7 @@ mod tests {
             role: "assistant".into(),
             content: r#"{"content":"using","tool_calls":[{"id":"call_ok","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#
                 .into(),
-        }];
+            origin: None,}];
 
         let api_messages = CopilotModelProvider::convert_messages(&messages);
         let tool_calls = api_messages[0].tool_calls.as_ref().unwrap();

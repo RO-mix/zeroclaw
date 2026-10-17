@@ -344,6 +344,8 @@ mod tests {
         ChatMessage {
             role: role.into(),
             content: content.into(),
+
+            origin: None,
         }
     }
 

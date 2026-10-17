@@ -1461,7 +1461,11 @@ impl AcpSessionStore {
             // scores the parent row once for its text and each unmatched
             // result once, so the reload must present the same entries.
             if ins.is_empty() {
-                out.push(ConversationMessage::Chat(ChatMessage { role, content }));
+                out.push(ConversationMessage::Chat(ChatMessage {
+                    role,
+                    content,
+                    origin: None,
+                }));
                 if !outs.is_empty() {
                     out.push(ConversationMessage::ToolResults(outs));
                 }
@@ -1876,6 +1880,8 @@ impl AcpSessionStore {
                     ConversationMessage::Chat(ChatMessage {
                         role: SYNTHETIC_INTERRUPTION_ROLE.to_string(),
                         content: chat.content.clone(),
+
+                        origin: None,
                     })
                 }
                 other => other.clone(),
@@ -3155,6 +3161,8 @@ impl ProjectedGroup {
                         self.role.clone()
                     },
                     content: self.content.clone(),
+
+                    origin: None,
                 }));
             }
             return Ok(messages);
@@ -3168,6 +3176,8 @@ impl ProjectedGroup {
             messages.push(ConversationMessage::Chat(ChatMessage {
                 role: "assistant".to_string(),
                 content: self.content.clone(),
+
+                origin: None,
             }));
         }
 
@@ -5060,6 +5070,8 @@ mod tests {
                     ConversationMessage::Chat(ChatMessage {
                         role: "user".into(),
                         content: String::new(),
+
+                        origin: None,
                     }),
                 ],
             )

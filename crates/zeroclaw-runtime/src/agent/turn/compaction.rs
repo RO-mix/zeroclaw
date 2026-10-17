@@ -376,7 +376,8 @@ pub(crate) async fn compact_history(
     let summary = ChatMessage::user(format!(
         "{COMPACTION_SUMMARY_PREFIX} {} earlier message(s) condensed]\n{text}",
         span.summary_input.len()
-    ));
+    ))
+    .with_origin(zeroclaw_api::model_provider::MessageOrigin::CompactionSummary);
     let kept_user_messages = span.kept_users.len();
     let kept_users = span.kept_users.clone();
     history.splice(
@@ -1048,10 +1049,8 @@ mod tests {
         );
 
         // Disabled profile -> inert planner (I3).
-        let cfg: zeroclaw_config::schema::Config = toml::from_str(&compaction_config_toml(
-            "enabled = false",
-        ))
-        .unwrap();
+        let cfg: zeroclaw_config::schema::Config =
+            toml::from_str(&compaction_config_toml("enabled = false")).unwrap();
         assert!(!CompactionPlanner::resolve(Some(&cfg), Some("alpha")).is_enabled());
 
         // No config / no agent alias / unknown agent -> inert.
@@ -1076,9 +1075,9 @@ mod tests {
 
         // Agent-level override beats the profile-level ref
         // (effective_summary_provider precedence).
-        let toml_with_agent_override = compaction_config_toml(
-            "enabled = true\nsummary_provider = \"custom.cheap\"",
-        ) + "\nsummary_provider = \"custom.default\"\n";
+        let toml_with_agent_override =
+            compaction_config_toml("enabled = true\nsummary_provider = \"custom.cheap\"")
+                + "\nsummary_provider = \"custom.default\"\n";
         let cfg: zeroclaw_config::schema::Config =
             toml::from_str(&toml_with_agent_override).unwrap();
         let planner = CompactionPlanner::resolve(Some(&cfg), Some("alpha"));
@@ -1114,11 +1113,8 @@ mod tests {
         assert_eq!(info.kept_user_messages, 2);
         assert_eq!(info.provider, "custom.default/m-main");
 
-        let fallback = CompactionOutcome::breadcrumb_fallback(
-            4,
-            0,
-            "custom.default/m-main".to_string(),
-        );
+        let fallback =
+            CompactionOutcome::breadcrumb_fallback(4, 0, "custom.default/m-main".to_string());
         let info = event_info(&fallback);
         assert_eq!(info.mode, "breadcrumb");
         assert!(info.fell_back);

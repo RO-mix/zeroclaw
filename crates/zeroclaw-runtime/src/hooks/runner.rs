@@ -1344,6 +1344,8 @@ mod tests {
         let mut messages = vec![ChatMessage {
             role: "user".into(),
             content: "hi".into(),
+
+            origin: None,
         }];
         let mut model = "gpt-4o".into();
         let result = runner.run_before_llm_call(&mut messages, &mut model).await;
@@ -1385,6 +1387,8 @@ mod tests {
         let mut messages = vec![ChatMessage {
             role: "user".into(),
             content: "original request".into(),
+
+            origin: None,
         }];
         let mut model = "original-model".into();
 

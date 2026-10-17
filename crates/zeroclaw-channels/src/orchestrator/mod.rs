@@ -112,6 +112,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use zeroclaw_api::memory_traits::MemoryStrategy;
+use zeroclaw_api::model_provider::MessageOrigin;
 use zeroclaw_api::session_keys::sanitize_session_key;
 use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingLevel};
 use zeroclaw_config::schema::Config;
@@ -9259,7 +9260,7 @@ async fn process_channel_message_body(
     let Some(known_prefix) = append_sender_turn(
         ctx.as_ref(),
         &history_key,
-        ChatMessage::user(&timestamped_content),
+        ChatMessage::user(&timestamped_content).with_origin(MessageOrigin::User),
     ) else {
         // The durable transcript and its breadcrumb provenance could not both
         // be verified (see `append_sender_turn`). Running this turn anyway

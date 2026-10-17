@@ -19141,6 +19141,8 @@ Let me check the result."#;
             ChatMessage {
                 role: "tool".to_string(),
                 content: "ok".to_string(),
+
+                origin: None,
             },
         ]
     }
@@ -19333,6 +19335,8 @@ Let me check the result."#;
             ChatMessage {
                 role: "tool".to_string(),
                 content: "ok".to_string(),
+
+                origin: None,
             },
         ];
 

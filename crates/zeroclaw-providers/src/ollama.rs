@@ -1675,7 +1675,7 @@ mod tests {
         let messages = vec![ChatMessage {
             role: "assistant".into(),
             content: r#"{"content":null,"tool_calls":[{"id":"call_1","name":"shell","arguments":"{\"command\":\"ls\"}"}]}"#.into(),
-        }];
+            origin: None,}];
 
         let converted = model_provider.convert_messages(&messages);
 
@@ -1699,11 +1699,11 @@ mod tests {
             ChatMessage {
                 role: "assistant".into(),
                 content: r#"{"content":null,"tool_calls":[{"id":"call_7","name":"file_read","arguments":"{\"path\":\"README.md\"}"}]}"#.into(),
-            },
+                origin: None,},
             ChatMessage {
                 role: "tool".into(),
                 content: r#"{"tool_call_id":"call_7","content":"ok"}"#.into(),
-            },
+                origin: None,},
         ];
 
         let converted = model_provider.convert_messages(&messages);
@@ -1721,6 +1721,8 @@ mod tests {
         let messages = vec![ChatMessage {
             role: "user".into(),
             content: "Inspect this screenshot [IMAGE:data:image/png;base64,abcd==]".into(),
+
+            origin: None,
         }];
 
         let converted = model_provider.convert_messages(&messages);

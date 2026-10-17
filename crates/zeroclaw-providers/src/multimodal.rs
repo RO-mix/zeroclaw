@@ -1174,6 +1174,8 @@ pub fn strip_message_media(message: &ChatMessage) -> ChatMessage {
             return ChatMessage {
                 role: message.role.clone(),
                 content: rebuild_carrier(&message.role, &message.content, &parts, &emptied),
+
+                origin: None,
             };
         }
         // Legacy carrier: the body is text; nothing to degrade.
@@ -1182,6 +1184,8 @@ pub fn strip_message_media(message: &ChatMessage) -> ChatMessage {
     ChatMessage {
         role: message.role.clone(),
         content: strip_media_markers_model_visible(message),
+
+        origin: None,
     }
 }
 
@@ -1390,6 +1394,8 @@ pub fn sanitize_audio_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]
                     return ChatMessage {
                         role: m.role.clone(),
                         content: rebuild_carrier(&m.role, &m.content, &parts, &retained),
+
+                        origin: None,
                     };
                 }
                 return m.clone();
@@ -1399,6 +1405,8 @@ pub fn sanitize_audio_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]
             ChatMessage {
                 role: m.role.clone(),
                 content,
+
+                origin: None,
             }
         })
         .collect();
@@ -1546,6 +1554,8 @@ pub fn sanitize_image_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]
                     return ChatMessage {
                         role: m.role.clone(),
                         content: rebuild_carrier(&m.role, &m.content, &parts, &retained),
+
+                        origin: None,
                     };
                 }
                 return m.clone();
@@ -1559,6 +1569,8 @@ pub fn sanitize_image_markers(messages: &[ChatMessage]) -> Cow<'_, [ChatMessage]
             ChatMessage {
                 role: m.role.clone(),
                 content,
+
+                origin: None,
             }
         })
         .collect();
@@ -1781,6 +1793,8 @@ fn strip_tool_result_image_markers(message: &ChatMessage) -> ChatMessage {
     ChatMessage {
         role: message.role.clone(),
         content: rebuild_carrier(&message.role, &message.content, &parts, &emptied),
+
+        origin: None,
     }
 }
 
@@ -1867,6 +1881,8 @@ async fn normalize_carrier_attachments(
                 &rebuilt_parts,
                 &rebuilt_parts.attachments,
             ),
+
+            origin: None,
         },
         !normalized.data_uris.is_empty(),
     ))
@@ -2086,6 +2102,8 @@ async fn prepare_messages_inner(
             normalized_messages.push(ChatMessage {
                 role: message.role.clone(),
                 content,
+
+                origin: None,
             });
             continue;
         }
@@ -2112,6 +2130,8 @@ async fn prepare_messages_inner(
         normalized_messages.push(ChatMessage {
             role: message.role.clone(),
             content,
+
+            origin: None,
         });
     }
 
@@ -2219,12 +2239,16 @@ pub fn omit_provider_image_ids(
                 return ChatMessage {
                     role: message.role.clone(),
                     content: rebuild_carrier(&message.role, &message.content, &parts, &retained),
+
+                    origin: None,
                 };
             }
 
             ChatMessage {
                 role: message.role.clone(),
                 content: omit_provider_image_ids_from_content(&message.content, omitted),
+
+                origin: None,
             }
         })
         .collect()
@@ -2273,6 +2297,8 @@ fn trim_images_by_age(messages: &[ChatMessage], max_turns: usize) -> Vec<ChatMes
                 ChatMessage {
                     role: m.role.clone(),
                     content: text,
+
+                    origin: None,
                 }
             } else {
                 m.clone()
@@ -2447,6 +2473,8 @@ fn trim_message_images(message: &ChatMessage, drop_here: usize) -> ChatMessage {
         return ChatMessage {
             role: message.role.clone(),
             content: rebuild_carrier(&message.role, &message.content, &parts, &retained),
+
+            origin: None,
         };
     }
 
@@ -2460,12 +2488,16 @@ fn trim_message_images(message: &ChatMessage, drop_here: usize) -> ChatMessage {
         return ChatMessage {
             role: message.role.clone(),
             content: serde_json::Value::Object(obj).to_string(),
+
+            origin: None,
         };
     }
 
     ChatMessage {
         role: message.role.clone(),
         content: trim_image_markers(&message.content, drop_here),
+
+        origin: None,
     }
 }
 
@@ -9196,6 +9228,8 @@ mod tests {
             ChatMessage {
                 role: "assistant".to_string(),
                 content: "I generated the screenshot.".to_string(),
+
+                origin: None,
             },
             ChatMessage::user("What happened next?".to_string()),
         ];
@@ -9245,6 +9279,8 @@ mod tests {
             ChatMessage {
                 role: "assistant".to_string(),
                 content: "I generated the screenshot.".to_string(),
+
+                origin: None,
             },
             ChatMessage::user("Continue.".to_string()),
         ];
@@ -9430,6 +9466,8 @@ mod tests {
             ChatMessage {
                 role: "assistant".to_string(),
                 content: "I generated the screenshot.".to_string(),
+
+                origin: None,
             },
             ChatMessage::user(format!(
                 "Now inspect this [IMAGE:{}]",
@@ -9750,11 +9788,15 @@ mod tests {
             ChatMessage {
                 role: "assistant".to_string(),
                 content: "Done.".to_string(),
+
+                origin: None,
             },
             ChatMessage::user("Next question".to_string()),
             ChatMessage {
                 role: "assistant".to_string(),
                 content: "Answered.".to_string(),
+
+                origin: None,
             },
             ChatMessage::user("Follow-up".to_string()),
         ];
@@ -9775,6 +9817,8 @@ mod tests {
             ChatMessage {
                 role: "assistant".to_string(),
                 content: "On it.".to_string(),
+
+                origin: None,
             },
             ChatMessage::user(prompt_carrier(
                 "<tool_result name=\"image_gen\">Generated</tool_result>",
@@ -9783,6 +9827,8 @@ mod tests {
             ChatMessage {
                 role: "assistant".to_string(),
                 content: "Checked.".to_string(),
+
+                origin: None,
             },
             ChatMessage::user(prompt_carrier(
                 "<tool_result name=\"weather\">Sunny, 25C</tool_result>",
@@ -9808,6 +9854,8 @@ mod tests {
             ChatMessage {
                 role: "assistant".to_string(),
                 content: "Done.".to_string(),
+
+                origin: None,
             },
             ChatMessage::user("Next question".to_string()),
         ];
@@ -9840,6 +9888,8 @@ mod tests {
             ChatMessage {
                 role: "assistant".to_string(),
                 content: "Checking the weather next.".to_string(),
+
+                origin: None,
             },
             ChatMessage::tool(native_carrier("tc2", "Sunny, 25C", &[])),
         ];
@@ -9859,6 +9909,8 @@ mod tests {
             ChatMessage {
                 role: "assistant".to_string(),
                 content: "hello".to_string(),
+
+                origin: None,
             },
             ChatMessage::user("look at this [IMAGE:/tmp/a.png]".to_string()),
         ];
@@ -10387,6 +10439,8 @@ mod tests {
             ChatMessage {
                 role: "assistant".to_string(),
                 content: "[IMAGE:/tmp/assistant.png]\nAssistant generated".to_string(),
+
+                origin: None,
             },
             ChatMessage::user("[IMAGE:/tmp/user1.png]\nFirst".to_string()),
             ChatMessage::user("[IMAGE:/tmp/user2.png]\nSecond".to_string()),
@@ -10470,11 +10524,15 @@ mod tests {
             ChatMessage {
                 role: "assistant".to_string(),
                 content: "I see a photo.".to_string(),
+
+                origin: None,
             },
             ChatMessage::user("[IMAGE:/tmp/2.png]\nWhat about this?".to_string()),
             ChatMessage {
                 role: "assistant".to_string(),
                 content: "That's a chart.".to_string(),
+
+                origin: None,
             },
             ChatMessage::user("[IMAGE:/tmp/3.png]\nAnd this one".to_string()),
         ];

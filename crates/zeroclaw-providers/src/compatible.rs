@@ -3310,6 +3310,8 @@ impl OpenAiCompatibleModelProvider {
                         ChatMessage {
                             role: message.role.clone(),
                             content: Self::sanitize_tool_result_message(&message.content),
+
+                            origin: None,
                         }
                     } else {
                         message.clone()
@@ -4185,6 +4187,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let user_msg = ChatMessage {
             role: "user".to_string(),
             content: message.to_string(),
+
+            origin: None,
         };
         let normalized_user = self
             .normalize_messages_for_upstream(std::slice::from_ref(&user_msg))
@@ -4885,6 +4889,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let user_msg = ChatMessage {
                 role: "user".to_string(),
                 content: message_owned,
+
+                origin: None,
             };
             let normalized_user = match provider
                 .normalize_messages_for_upstream(std::slice::from_ref(&user_msg))
@@ -12608,6 +12614,8 @@ mod tests {
         let msg = ChatMessage {
             role: "user".into(),
             content: format!("Caption please [IMAGE:{}]", path_str),
+
+            origin: None,
         };
 
         // Omit-policy tool-result stripping must not touch user-message
@@ -12665,6 +12673,8 @@ mod tests {
         let msg = ChatMessage {
             role: "user".into(),
             content: markers,
+
+            origin: None,
         };
 
         let configured = zeroclaw_config::schema::MultimodalConfig {
@@ -12973,6 +12983,8 @@ mod tests {
         let messages = vec![ChatMessage {
             role: "user".to_string(),
             content: "hello".to_string(),
+
+            origin: None,
         }];
         let tools = vec![serde_json::json!({
             "type": "function",
@@ -15777,6 +15789,8 @@ mod tests {
             ChatMessage {
                 role: "assistant".to_string(),
                 content: ChatMessage::pruned_tool_exchange_summary(1),
+
+                origin: None,
             },
             ChatMessage::pruned_context_separator(),
             ChatMessage::assistant(

@@ -45,11 +45,56 @@ impl ThinkingDisplay {
     }
 }
 
+/// Structural origin of a transcript row.
+///
+/// Mirrors Kimi Code's `PromptOrigin` taxonomy (kind: user | injection |
+/// compaction_summary | task | retry | skill_activation). Compaction and
+/// future undo/notification-dedup mechanics classify rows by origin instead
+/// of content heuristics. `None` on a [`ChatMessage`] means "legacy row":
+/// every code path keeps its pre-marking behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageOrigin {
+    /// Genuine end-user input arriving from a channel surface.
+    User,
+    /// Runtime-injected context (memory-recall preamble, steering
+    /// injections, compaction elision notes).
+    Injection,
+    /// Synthetic narrative summary produced by context compaction.
+    CompactionSummary,
+    /// Background-task / cron delivery notification (install points land
+    /// with the push-delivery port; the variant is the forward hook).
+    Task,
+    /// Re-materialized turn input after a malformed-protocol retry.
+    Retry,
+    /// Skill-activation boilerplate (forward hook; no install point yet).
+    SkillActivation,
+}
+
+impl MessageOrigin {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Injection => "injection",
+            Self::CompactionSummary => "compaction_summary",
+            Self::Task => "task",
+            Self::Retry => "retry",
+            Self::SkillActivation => "skill_activation",
+        }
+    }
+}
+
 /// A single message in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// Structural origin marker stamped when the row is built. `None` =
+    /// legacy row written before origin marking existed: consumers fall
+    /// back to their content/role heuristics. Serialized only when set, so
+    /// persisted sessions stay byte-compatible in both directions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<MessageOrigin>,
 }
 
 pub const PRUNED_TOOL_EXCHANGE_SUMMARY_PREFIX: &str = "[Tool exchange:";
@@ -61,6 +106,7 @@ impl ChatMessage {
         Self {
             role: "system".into(),
             content: content.into(),
+            origin: None,
         }
     }
 
@@ -68,6 +114,7 @@ impl ChatMessage {
         Self {
             role: "user".into(),
             content: content.into(),
+            origin: None,
         }
     }
 
@@ -75,6 +122,7 @@ impl ChatMessage {
         Self {
             role: "assistant".into(),
             content: content.into(),
+            origin: None,
         }
     }
 
@@ -82,7 +130,15 @@ impl ChatMessage {
         Self {
             role: "tool".into(),
             content: content.into(),
+            origin: None,
         }
+    }
+
+    /// Stamp the structural origin at the construction site (the origin
+    /// fact is created here, not derived later from content).
+    pub fn with_origin(mut self, origin: MessageOrigin) -> Self {
+        self.origin = Some(origin);
+        self
     }
 
     pub fn pruned_tool_exchange_summary(tool_count: usize) -> String {
