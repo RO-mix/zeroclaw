@@ -145,12 +145,14 @@ pub(crate) async fn try_recover_context_overflow(
                 )
                 .await;
             compaction_outcome = outcome.clone();
-            if outcome.is_some() {
+            if let Some(done) = outcome {
                 crate::agent::history_trim::TrimResult {
                     tokens_before: probe.tokens_before,
                     tokens_after: crate::agent::history::estimate_history_tokens(&owned),
                     history: owned,
-                    dropped_messages: probe.dropped_messages,
+                    // D2: the recent-window clamp may shrink the span below
+                    // the probe's; report the rows actually removed.
+                    dropped_messages: done.span_messages,
                     dropped_turns: probe.dropped_turns,
                     kept_turns: probe.kept_turns,
                     trimmed: true,

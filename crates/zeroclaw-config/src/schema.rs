@@ -25268,6 +25268,34 @@ impl Config {
                     "runtime_profiles.{palias}.context_compression.summary_max_output_tokens must be greater than 0 when context_compression.enabled = true",
                 );
             }
+            // D2 strategy ratios must lie in (0, 1): outside that range the
+            // trigger formula degenerates (a ratio >= 1 fires on any span, a
+            // ratio <= 0 never fires), which is a misconfiguration, not a
+            // policy choice.
+            if let Some(ratio) = cc.trigger_ratio
+                && !(ratio > 0.0 && ratio < 1.0)
+            {
+                validation_bail!(
+                    InvalidNumericRange,
+                    format!("runtime_profiles.{palias}.context_compression.trigger_ratio"),
+                    "runtime_profiles.{palias}.context_compression.trigger_ratio must be in (0, 1) (got {ratio})",
+                );
+            }
+            for (field, value) in [
+                ("max_recent_size_ratio", cc.max_recent_size_ratio),
+                (
+                    "min_overflow_reduction_ratio",
+                    cc.min_overflow_reduction_ratio,
+                ),
+            ] {
+                if !(value > 0.0 && value < 1.0) {
+                    validation_bail!(
+                        InvalidNumericRange,
+                        format!("runtime_profiles.{palias}.context_compression.{field}"),
+                        "runtime_profiles.{palias}.context_compression.{field} must be in (0, 1) (got {value})",
+                    );
+                }
+            }
             let value = cc.summary_provider.trim();
             if value.is_empty() {
                 continue;
@@ -48135,6 +48163,49 @@ allowed_users = []
         let cfg: Config = toml::from_str(toml).unwrap();
         cfg.validate()
             .expect("disabled context_compression must not validate the summary budget");
+    }
+
+    // D2 strategy ratios outside (0, 1) degenerate the trigger formula —
+    // fail loud at validation time, for every ratio knob.
+    #[tokio::test]
+    async fn context_compression_strategy_ratios_out_of_range_rejected() {
+        let base = r#"
+            [risk_profiles.default]
+            level = "supervised"
+
+            [runtime_profiles.fast]
+            max_context_tokens = 100_000
+        "#;
+        for (field, value) in [
+            ("trigger_ratio", "1.5"),
+            ("trigger_ratio", "0.0"),
+            ("max_recent_size_ratio", "1.0"),
+            ("min_overflow_reduction_ratio", "-0.1"),
+        ] {
+            let toml = format!(
+                "{base}\n[runtime_profiles.fast.context_compression]\nenabled = true\n{field} = {value}\n"
+            );
+            let cfg: Config = toml::from_str(&toml).unwrap();
+            let msg = format!(
+                "{:#}",
+                cfg.validate()
+                    .expect_err("an out-of-range strategy ratio must fail validation")
+            );
+            assert!(
+                msg.contains(&format!(
+                    "runtime_profiles.fast.context_compression.{field}"
+                )),
+                "error names the {field} field: {msg}"
+            );
+        }
+
+        // In-range values validate clean.
+        let toml = format!(
+            "{base}\n[runtime_profiles.fast.context_compression]\nenabled = true\ntrigger_ratio = 0.85\nmax_recent_size_ratio = 0.2\nmin_overflow_reduction_ratio = 0.05\n"
+        );
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        cfg.validate()
+            .expect("in-range strategy ratios must validate");
     }
 
     // The legacy pre-V3 `[agent.context_compression]` top-level table is

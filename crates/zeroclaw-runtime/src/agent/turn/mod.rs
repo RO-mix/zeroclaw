@@ -1164,10 +1164,12 @@ async fn surface_oversized_dispatch_if_needed(
                 .await;
         }
         if let Some(done) = compaction_outcome.as_ref() {
-            // The span rows were removed and replaced in place; account the
-            // same `dropped_messages` the breadcrumb trim would have, and
-            // collect the inserted rows for the caller's post-hook rebuild.
-            dropped_messages = span_len;
+            // The span rows were removed and replaced in place. D2: the
+            // strategy's recent-window clamp may shrink the span below the
+            // caller's `span_len`, so account the rows compaction actually
+            // removed (`done.span_messages`), not the caller's request.
+            // Collect the inserted rows for the caller's post-hook rebuild.
+            dropped_messages = done.span_messages;
             if let Some(summary) = done.summary.clone() {
                 inserted_rows.push(summary);
             }
@@ -1333,16 +1335,18 @@ async fn enforce_reported_budget(
             .await;
         compaction_outcome = outcome.clone();
         match outcome {
-            Some(_) => {
+            Some(done) => {
                 // Compaction spliced the span in place; the projection loops
                 // below still re-check the provider-facing population and may
-                // drop further whole turns exactly as after a raw trim.
+                // drop further whole turns exactly as after a raw trim. D2:
+                // the recent-window clamp may shrink the span below the
+                // probe's, so report the rows actually removed.
                 let tokens_after = crate::agent::history::estimate_history_tokens(&taken);
                 crate::agent::history_trim::TrimResult {
                     tokens_before: probe.tokens_before,
                     tokens_after,
                     history: taken,
-                    dropped_messages: probe.dropped_messages,
+                    dropped_messages: done.span_messages,
                     dropped_turns: probe.dropped_turns,
                     kept_turns: probe.kept_turns,
                     trimmed: true,
@@ -2004,6 +2008,16 @@ async fn run_tool_call_loop_impl<'a>(
     // Usage describes the completed request, not a prediction of the next
     // hook-selected model, schemas, or prepared messages.
     let mut pending_reported_usage: Option<ReportedRequestUsage> = seed_reported_usage;
+
+    // D2: bounded in-loop overflow recovery (Kimi `maxOverflowCompactionAttempts`
+    // / `minOverflowReductionRatio`). Each context-overflow recovery that
+    // actually trims counts as one attempt; an attempt that removes less
+    // than the policy's minimum reduction stops the loop, as does exhausting
+    // the attempt budget — the turn fails instead of re-overflowing the
+    // provider forever.
+    let overflow_recovery_policy =
+        compaction_planner.overflow_recovery_policy(context_limits.model_context_window);
+    let mut overflow_recovery_attempts: u32 = 0;
 
     for iteration in 0..max_iterations {
         let mut has_new_user_input = iteration == 0;
@@ -3091,24 +3105,78 @@ async fn run_tool_call_loop_impl<'a>(
                 // complete.
                 emit_rejected_attempt_usage(ctx.event_tx, &attempts).await;
                 record_llm_failure(&ctx, provider_request_model, llm_started_at, iteration, &e);
-                let recovered = try_recover_context_overflow(
-                    injected_memory_preamble,
-                    turn_state.history,
-                    &e,
-                    iteration,
-                    event_tx.as_ref(),
-                    on_delta.as_ref(),
-                    observer,
-                    ctx.context_limits,
-                    agent_alias,
-                    turn_id,
-                    &compaction_planner,
-                    active_model_provider,
-                    active_model_provider_name,
-                    provider_request_model,
-                    &mut turn_state.crumb_present,
-                )
-                .await;
+                // D2: only context-window overflows consume the recovery
+                // budget; any other error keeps its historical pass-through.
+                let recovered = if zeroclaw_providers::reliable::is_context_window_exceeded(&e)
+                    && !overflow_recovery_policy.allows_attempt(overflow_recovery_attempts)
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "attempts": overflow_recovery_attempts,
+                                "max_attempts": overflow_recovery_policy.max_attempts,
+                            })),
+                        "Context overflow recovery stopped: attempt budget exhausted"
+                    );
+                    ContextRecovery::Unrecoverable
+                } else {
+                    let tokens_before_recovery =
+                        crate::agent::history::estimate_history_tokens(turn_state.history);
+                    let recovered = try_recover_context_overflow(
+                        injected_memory_preamble,
+                        turn_state.history,
+                        &e,
+                        iteration,
+                        event_tx.as_ref(),
+                        on_delta.as_ref(),
+                        observer,
+                        ctx.context_limits,
+                        agent_alias,
+                        turn_id,
+                        &compaction_planner,
+                        active_model_provider,
+                        active_model_provider_name,
+                        provider_request_model,
+                        &mut turn_state.crumb_present,
+                    )
+                    .await;
+                    if recovered.recovered() {
+                        overflow_recovery_attempts += 1;
+                        // D2 progress condition (`minOverflowReductionRatio`):
+                        // a recovery that barely shrank the history will
+                        // re-overflow on the retry — stop the loop instead.
+                        let tokens_removed = tokens_before_recovery.saturating_sub(
+                            crate::agent::history::estimate_history_tokens(turn_state.history),
+                        );
+                        if !overflow_recovery_policy.made_progress(tokens_removed) {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Reject
+                                )
+                                .with_category(::zeroclaw_log::EventCategory::Agent)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "tokens_removed": tokens_removed,
+                                    "min_reduction_tokens": overflow_recovery_policy.min_reduction_tokens,
+                                })),
+                                "Context overflow recovery stopped: trim made no meaningful progress"
+                            );
+                            return Err(zeroclaw_api::turn_stop::tag(
+                                e,
+                                zeroclaw_api::turn_stop::TurnStop::fatal(
+                                    zeroclaw_api::turn_stop::TurnStopCode::ContextOverflow,
+                                    "context window exceeded and recovery trim made no meaningful progress",
+                                ),
+                            ));
+                        }
+                    }
+                    recovered
+                };
                 if recovered.recovered() {
                     continue;
                 }

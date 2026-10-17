@@ -291,6 +291,29 @@ fn default_cc_summary_max_output_tokens() -> u32 {
     500
 }
 
+/// Default for `ContextCompressionConfig::max_overflow_compaction_attempts`
+/// (Kimi `DEFAULT_COMPACTION_CONFIG.maxOverflowCompactionAttempts`).
+pub const DEFAULT_CC_MAX_OVERFLOW_COMPACTION_ATTEMPTS: u32 = 3;
+/// Default for `ContextCompressionConfig::min_overflow_reduction_ratio`
+/// (Kimi `DEFAULT_COMPACTION_CONFIG.minOverflowReductionRatio`).
+pub const DEFAULT_CC_MIN_OVERFLOW_REDUCTION_RATIO: f64 = 0.05;
+
+fn default_cc_reserved_output_tokens() -> u32 {
+    50_000
+}
+fn default_cc_max_recent_messages() -> usize {
+    4
+}
+fn default_cc_max_recent_size_ratio() -> f64 {
+    0.2
+}
+fn default_cc_max_overflow_compaction_attempts() -> u32 {
+    DEFAULT_CC_MAX_OVERFLOW_COMPACTION_ATTEMPTS
+}
+fn default_cc_min_overflow_reduction_ratio() -> f64 {
+    DEFAULT_CC_MIN_OVERFLOW_REDUCTION_RATIO
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -307,7 +330,9 @@ pub struct ContextCompressionConfig {
     /// Minimum estimated size (tokens) of the removable agent work required
     /// before a summary LLM call is attempted. Spans below this threshold go
     /// straight to the breadcrumb trim — a round-trip is not worth it for a
-    /// few hundred tokens. `0` means "always attempt".
+    /// few hundred tokens. `0` means "always attempt". When `trigger_ratio`
+    /// is set, the planner narrows this gate to the strategy threshold; the
+    /// effective gate is the minimum of the two.
     #[serde(default = "default_cc_trigger_tokens")]
     pub trigger_tokens: usize,
     /// Cap on the summarizer's output tokens. The value is stated in the
@@ -321,6 +346,56 @@ pub struct ContextCompressionConfig {
     /// provider and model. Validated in `Config::validate()`.
     #[serde(default)]
     pub summary_provider: crate::providers::ModelProviderRef,
+    /// Opt-in ratio trigger ported from Kimi's compaction strategy
+    /// (`triggerRatio`; `None` = legacy behavior, the default). When set,
+    /// the runtime profile's `max_context_tokens` is the effective context
+    /// window and the span gate is narrowed to
+    /// `min(window * trigger_ratio, window - reserved_output_tokens)` —
+    /// i.e. compaction qualifies when the removable span reaches that
+    /// threshold; `trigger_tokens` remains an absolute ceiling (the
+    /// effective gate is the minimum of the two). Setting this also
+    /// activates the recent-window clamp (`max_recent_messages` /
+    /// `max_recent_size_ratio`). Must lie in (0, 1); validated in
+    /// `Config::validate()`.
+    #[serde(default)]
+    pub trigger_ratio: Option<f64>,
+    /// Output reserve kept free of history (Kimi `reservedContextSize`):
+    /// with a ratio trigger, compaction qualifies once the used context
+    /// reaches `window - reserved_output_tokens`, even when the ratio
+    /// threshold is higher. Only meaningful together with `trigger_ratio`.
+    #[serde(default = "default_cc_reserved_output_tokens")]
+    pub reserved_output_tokens: u32,
+    /// Recent-window floor in messages (Kimi `maxRecentMessages`): the
+    /// preserved tail is at least the newest `max_recent_messages` rows,
+    /// so a compaction span never reaches deeper than that boundary
+    /// (combined with `max_recent_size_ratio`: the span stops at the later
+    /// of the two tail boundaries). Only applies when `trigger_ratio` is
+    /// set.
+    #[serde(default = "default_cc_max_recent_messages")]
+    pub max_recent_messages: usize,
+    /// Recent-window token share (Kimi `maxRecentSizeRatio`): the
+    /// preserved tail must hold this share of the effective context window
+    /// before the span may reach deeper than it. Only applies when
+    /// `trigger_ratio` is set and the profile declares
+    /// `max_context_tokens`. Must lie in (0, 1); validated in
+    /// `Config::validate()`.
+    #[serde(default = "default_cc_max_recent_size_ratio")]
+    pub max_recent_size_ratio: f64,
+    /// Per-turn cap on in-loop context-overflow recovery attempts (Kimi
+    /// `maxOverflowCompactionAttempts`). The recovery trim retries a
+    /// provider call that overflowed the context window; this bounds how
+    /// often that may happen before the turn fails. Applies whether or not
+    /// narrative compaction itself is enabled.
+    #[serde(default = "default_cc_max_overflow_compaction_attempts")]
+    pub max_overflow_compaction_attempts: u32,
+    /// Minimum progress one overflow recovery attempt must achieve (Kimi
+    /// `minOverflowReductionRatio`): the attempt must remove at least
+    /// `ceil(window * min_overflow_reduction_ratio)` estimated tokens of
+    /// history, or recovery stops instead of re-overflowing the provider.
+    /// `window` is the resolved model context window. Must lie in (0, 1);
+    /// validated in `Config::validate()`.
+    #[serde(default = "default_cc_min_overflow_reduction_ratio")]
+    pub min_overflow_reduction_ratio: f64,
 }
 
 impl Default for ContextCompressionConfig {
@@ -330,6 +405,12 @@ impl Default for ContextCompressionConfig {
             trigger_tokens: default_cc_trigger_tokens(),
             summary_max_output_tokens: default_cc_summary_max_output_tokens(),
             summary_provider: crate::providers::ModelProviderRef::default(),
+            trigger_ratio: None,
+            reserved_output_tokens: default_cc_reserved_output_tokens(),
+            max_recent_messages: default_cc_max_recent_messages(),
+            max_recent_size_ratio: default_cc_max_recent_size_ratio(),
+            max_overflow_compaction_attempts: default_cc_max_overflow_compaction_attempts(),
+            min_overflow_reduction_ratio: default_cc_min_overflow_reduction_ratio(),
         }
     }
 }
@@ -937,6 +1018,45 @@ mod tests {
             err.to_string().contains("threshold_ratio"),
             "error names the unknown field: {err}"
         );
+    }
+
+    // D2 strategy params are additive: a config written before they existed
+    // must deserialize to the documented defaults.
+    #[test]
+    fn context_compression_strategy_fields_default_when_absent() {
+        let cc: ContextCompressionConfig = toml::from_str("enabled = true").unwrap();
+        assert_eq!(cc.trigger_ratio, None);
+        assert_eq!(cc.reserved_output_tokens, 50_000);
+        assert_eq!(cc.max_recent_messages, 4);
+        assert!((cc.max_recent_size_ratio - 0.2).abs() < f64::EPSILON);
+        assert_eq!(
+            cc.max_overflow_compaction_attempts,
+            DEFAULT_CC_MAX_OVERFLOW_COMPACTION_ATTEMPTS
+        );
+        assert!(
+            (cc.min_overflow_reduction_ratio - DEFAULT_CC_MIN_OVERFLOW_REDUCTION_RATIO).abs()
+                < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn context_compression_strategy_fields_roundtrip() {
+        let toml = r#"
+            enabled = true
+            trigger_ratio = 0.85
+            reserved_output_tokens = 12_000
+            max_recent_messages = 6
+            max_recent_size_ratio = 0.1
+            max_overflow_compaction_attempts = 5
+            min_overflow_reduction_ratio = 0.02
+        "#;
+        let cc: ContextCompressionConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cc.trigger_ratio, Some(0.85));
+        assert_eq!(cc.reserved_output_tokens, 12_000);
+        assert_eq!(cc.max_recent_messages, 6);
+        assert!((cc.max_recent_size_ratio - 0.1).abs() < f64::EPSILON);
+        assert_eq!(cc.max_overflow_compaction_attempts, 5);
+        assert!((cc.min_overflow_reduction_ratio - 0.02).abs() < f64::EPSILON);
     }
 
     #[test]

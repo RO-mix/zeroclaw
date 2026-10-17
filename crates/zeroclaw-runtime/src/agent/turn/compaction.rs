@@ -63,6 +63,94 @@ pub(crate) const COMPACT_USER_KEPT_MAX_TOKENS: usize = 20_000;
 /// CostTracker scope for summary-compaction LLM calls (FR8).
 pub(crate) const COST_SCOPE: &str = "context_compaction";
 
+/// D2 recent-window guard, ported from Kimi's compaction strategy
+/// (`DEFAULT_COMPACTION_CONFIG.maxRecentMessages` / `maxRecentSizeRatio`):
+/// bounds how deep into the newest transcript rows a compaction span may
+/// reach. Active only in the opt-in ratio-trigger strategy mode
+/// (`trigger_ratio` set); in legacy mode the span stays exactly what the
+/// caller's breadcrumb trim would drop.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RecentWindow {
+    /// `maxRecentMessages`: the preserved tail is at least this many newest
+    /// transcript rows.
+    max_messages: usize,
+    /// `maxRecentSizeRatio`: the preserved tail must hold this share of the
+    /// effective context window before the span may reach deeper.
+    max_size_ratio: f64,
+    /// Effective context window (the profile's `max_context_tokens`) the
+    /// token share is taken of. `0` = unknown: the token boundary is not
+    /// applied (the message boundary still is).
+    window_tokens: usize,
+}
+
+impl RecentWindow {
+    /// Largest span length (rows starting at `body_start`) that leaves the
+    /// required recent tail untouched. Mirrors `computeCompactCount`'s walk
+    /// in `strategy.ts`: the preserved tail is the smaller of the newest
+    /// `max_messages` rows and the newest `max_size_ratio` share of the
+    /// window, so the span boundary is the later (larger index) of the two
+    /// tail boundaries.
+    fn clamp_span_len(&self, history: &[ChatMessage], body_start: usize, span_len: usize) -> usize {
+        let body_len = history.len().saturating_sub(body_start);
+        let boundary = self
+            .msg_tail_boundary(history.len())
+            .max(self.token_tail_boundary(history));
+        span_len
+            .min(body_len)
+            .min(boundary.saturating_sub(body_start))
+    }
+
+    /// Index where the tail of `max_messages` newest rows begins.
+    fn msg_tail_boundary(&self, history_len: usize) -> usize {
+        history_len.saturating_sub(self.max_messages)
+    }
+
+    /// Index where the newest rows' estimated tokens first reach
+    /// `max_size_ratio` of the window. `0` when even the whole history is
+    /// under that floor — the token condition can never fire (exactly like
+    /// `recentSize >= maxSize * maxRecentSizeRatio` never triggering), so
+    /// the message boundary alone governs.
+    fn token_tail_boundary(&self, history: &[ChatMessage]) -> usize {
+        if self.window_tokens == 0 || self.max_size_ratio <= 0.0 {
+            return 0;
+        }
+        let floor = (self.window_tokens as f64 * self.max_size_ratio).ceil() as usize;
+        let mut accumulated = 0usize;
+        let mut boundary = history.len();
+        while boundary > 0 && accumulated < floor {
+            boundary -= 1;
+            accumulated = accumulated.saturating_add(estimate_message_tokens(&history[boundary]));
+        }
+        if accumulated < floor { 0 } else { boundary }
+    }
+}
+
+/// D2 overflow-recovery bound, ported from Kimi's compaction strategy
+/// (`maxOverflowCompactionAttempts` / `minOverflowReductionRatio`) onto the
+/// in-loop trim-retry seam: a provider call that overflowed the context
+/// window is retried after a recovery trim at most `max_attempts` times per
+/// turn, and one attempt must remove at least `min_reduction_tokens` of
+/// estimated history or the loop stops.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OverflowRecoveryPolicy {
+    pub(crate) max_attempts: u32,
+    /// `max(1, ceil(window * min_overflow_reduction_ratio))` — the minimum
+    /// tokens one recovery attempt must remove.
+    pub(crate) min_reduction_tokens: usize,
+}
+
+impl OverflowRecoveryPolicy {
+    pub(crate) fn allows_attempt(&self, attempts_so_far: u32) -> bool {
+        attempts_so_far < self.max_attempts
+    }
+
+    /// `reduceCompactOnOverflow`'s progress condition: the attempt's
+    /// reduction must meet the minimum or recovery stops.
+    pub(crate) fn made_progress(&self, tokens_removed: usize) -> bool {
+        tokens_removed >= self.min_reduction_tokens
+    }
+}
+
 /// First-person narrative system prompt. Model-facing runtime text (same
 /// class as tool instructions), English per the logging/text contract.
 const SUMMARY_SYSTEM_PROMPT: &str = "You are compacting an agent's conversation \
@@ -669,9 +757,15 @@ pub(crate) struct CompactionPlanner {
 struct CompactionPlan {
     /// Snapshot of the revived profile block; `enabled` is always true here
     /// (the planner is disabled otherwise), `summary_provider` stays on the
-    /// config — route selection is the planner's job.
+    /// config — route selection is the planner's job. D2: with
+    /// `trigger_ratio` set, `trigger_tokens` holds the EFFECTIVE span gate
+    /// (the strategy threshold narrowed against the configured ceiling), so
+    /// downstream consumers keep reading one canonical value.
     cfg: zeroclaw_config::scattered_types::ContextCompressionConfig,
     route: CompactionRoute,
+    /// D2 recent-window guard; `None` = legacy mode, the span is exactly the
+    /// caller's trim decision.
+    recent: Option<RecentWindow>,
 }
 
 enum CompactionRoute {
@@ -697,6 +791,16 @@ impl CompactionPlanner {
     /// `summary_provider` override (unbuildable at runtime despite passing
     /// config validation) degrades to the turn's own provider instead of
     /// disabling compaction — the feature still works, just not routed.
+    ///
+    /// D2 strategy mode: when the profile sets `trigger_ratio`, the profile's
+    /// `max_context_tokens` is the effective context window and the span gate
+    /// is narrowed to the Kimi strategy threshold
+    /// `min(window * trigger_ratio, window - reserved_output_tokens)` — the
+    /// used-context formula `shouldCompact` in `strategy.ts` — while
+    /// `trigger_tokens` stays an absolute ceiling (the effective gate is the
+    /// minimum of the two). Without a configured window the ratio trigger is
+    /// ignored with a warning and the legacy gate stands. The recent-window
+    /// clamp activates in the same mode.
     pub(crate) fn resolve(
         config: Option<&zeroclaw_config::schema::Config>,
         agent_alias: Option<&str>,
@@ -707,10 +811,46 @@ impl CompactionPlanner {
         let Some(profile) = config.runtime_profile_for_agent(alias) else {
             return Self::disabled();
         };
-        let cfg = profile.context_compression.clone();
+        let mut cfg = profile.context_compression.clone();
         if !cfg.enabled {
             return Self::disabled();
         }
+        let window_tokens = profile.max_context_tokens.unwrap_or(0);
+        // D2: narrow the span gate in strategy mode. The ratio is config-
+        // validated into (0, 1), so both arms are positive; each arm mirrors
+        // one disjunct of `shouldCompact`, and the reserved arm is inert
+        // unless `0 < reserved < window` (the `shouldUseReservedContext`
+        // guard).
+        let recent = cfg.trigger_ratio.map(|ratio| {
+            if window_tokens > 0 {
+                let ratio_arm = ((window_tokens as f64) * ratio) as usize;
+                let reserved = cfg.reserved_output_tokens as usize;
+                let reserved_arm = if reserved > 0 && reserved < window_tokens {
+                    window_tokens - reserved
+                } else {
+                    usize::MAX
+                };
+                cfg.trigger_tokens = cfg.trigger_tokens.min(ratio_arm.min(reserved_arm));
+            } else {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "agent": alias,
+                            "trigger_ratio": ratio,
+                        })),
+                    "Context compaction: trigger_ratio is set but the runtime profile has no \
+                     max_context_tokens; the ratio trigger is ignored and trigger_tokens stands"
+                );
+            }
+            RecentWindow {
+                max_messages: cfg.max_recent_messages,
+                max_size_ratio: cfg.max_recent_size_ratio,
+                window_tokens,
+            }
+        });
         let route = config
             .effective_summary_provider(alias)
             .filter(|provider_ref| !provider_ref.trim().is_empty())
@@ -744,7 +884,35 @@ impl CompactionPlanner {
             })
             .unwrap_or(CompactionRoute::TurnModel);
         Self {
-            plan: Some(CompactionPlan { cfg, route }),
+            plan: Some(CompactionPlan { cfg, route, recent }),
+        }
+    }
+
+    /// D2 overflow-recovery bound for the in-loop trim retry. Configured
+    /// values come from the enabled plan; an inert planner (compaction off,
+    /// no profile) still gets the documented defaults, so the legacy
+    /// trim-retry loop is bounded too. `context_window` is the resolved
+    /// model context window; `0`/unknown reduces the progress floor to one
+    /// token so any actual trim still counts.
+    pub(crate) fn overflow_recovery_policy(&self, context_window: usize) -> OverflowRecoveryPolicy {
+        let (attempts, ratio) = match &self.plan {
+            Some(plan) => (
+                plan.cfg.max_overflow_compaction_attempts,
+                plan.cfg.min_overflow_reduction_ratio,
+            ),
+            None => (
+                zeroclaw_config::scattered_types::DEFAULT_CC_MAX_OVERFLOW_COMPACTION_ATTEMPTS,
+                zeroclaw_config::scattered_types::DEFAULT_CC_MIN_OVERFLOW_REDUCTION_RATIO,
+            ),
+        };
+        let min_reduction_tokens = if context_window == 0 {
+            1
+        } else {
+            ((context_window as f64) * ratio).ceil().max(1.0) as usize
+        };
+        OverflowRecoveryPolicy {
+            max_attempts: attempts.max(1),
+            min_reduction_tokens,
         }
     }
 
@@ -812,6 +980,36 @@ impl CompactionPlanner {
                 name.as_str(),
                 model.as_deref().unwrap_or(turn_model),
             ),
+        };
+        // D2: in strategy mode the span must leave the recent window
+        // untouched (Kimi `maxRecentMessages`/`maxRecentSizeRatio`). The
+        // clamp shrinks the span from the tail side only; the D3 head+tail
+        // user keep lives in `kept_users` inside the span and is unaffected.
+        // A span clamped to zero declines compaction so the caller's
+        // breadcrumb trim runs unchanged.
+        let span_len = match &plan.recent {
+            Some(recent) => {
+                let leading_system = history.iter().take_while(|m| m.role == "system").count();
+                let body_start = leading_system + usize::from(crumb_present);
+                let clamped = recent.clamp_span_len(history, body_start, span_len);
+                if clamped == 0 {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "fallback": "breadcrumb",
+                                "requested_span": span_len,
+                            })),
+                        "Context compaction declined: the requested span reaches into the \
+                         protected recent window"
+                    );
+                    return None;
+                }
+                clamped
+            }
+            None => span_len,
         };
         // D1: the recovery footer points at the runtime-trace journal — the
         // live writer's resolved path (never a hardcoded home directory), or
@@ -1811,5 +2009,307 @@ mod tests {
         assert!(info.fell_back);
         assert_eq!(info.span_messages, 4);
         assert_eq!(info.summary_tokens, 0);
+    }
+
+    // ── D2: trigger strategy params (strategy.ts port) ──────────────
+
+    /// Config fixture for the D2 strategy mode: profile `fast` carries
+    /// `max_context_tokens` (the effective context window) beside the
+    /// context_compression block.
+    fn strategy_config_toml(cc_block: &str) -> String {
+        format!(
+            r#"
+            [providers.models.custom.default]
+            api_key = "k"
+            model = "m-main"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [runtime_profiles.fast]
+            max_context_tokens = 100_000
+
+            [runtime_profiles.fast.context_compression]
+            {cc_block}
+
+            [agents.alpha]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+            runtime_profile = "fast"
+            "#
+        )
+    }
+
+    #[test]
+    fn planner_trigger_ratio_narrows_the_span_gate() {
+        // strategy.ts shouldCompact: used >= window * triggerRatio OR
+        // used + reserved >= window  ->  threshold
+        //   = min(window * trigger_ratio, window - reserved_output_tokens).
+        // trigger_tokens stays an absolute ceiling: the effective gate is
+        // the minimum of the two.
+        let cfg: zeroclaw_config::schema::Config = toml::from_str(&strategy_config_toml(
+            "enabled = true\ntrigger_tokens = 60_000\ntrigger_ratio = 0.9",
+        ))
+        .unwrap();
+        let planner = CompactionPlanner::resolve(Some(&cfg), Some("alpha"));
+        let plan = planner.plan.as_ref().expect("enabled plan");
+        // window = 100_000: ratio arm = 90_000, reserved arm (default
+        // 50_000) = 50_000 -> strategy threshold 50_000 < ceiling 60_000.
+        assert_eq!(plan.cfg.trigger_tokens, 50_000);
+        assert!(plan.recent.is_some(), "strategy mode activates the clamp");
+
+        // A smaller ratio lowers the threshold: the planner qualifies
+        // smaller spans (compacts earlier).
+        let cfg: zeroclaw_config::schema::Config = toml::from_str(&strategy_config_toml(
+            "enabled = true\ntrigger_tokens = 60_000\ntrigger_ratio = 0.25",
+        ))
+        .unwrap();
+        let planner = CompactionPlanner::resolve(Some(&cfg), Some("alpha"));
+        assert_eq!(
+            planner
+                .plan
+                .as_ref()
+                .expect("enabled plan")
+                .cfg
+                .trigger_tokens,
+            25_000
+        );
+
+        // A smaller reserve raises the reserved arm toward the ratio arm.
+        let cfg: zeroclaw_config::schema::Config = toml::from_str(&strategy_config_toml(
+            "enabled = true\ntrigger_tokens = 60_000\ntrigger_ratio = 0.9\nreserved_output_tokens = 10_000",
+        ))
+        .unwrap();
+        let planner = CompactionPlanner::resolve(Some(&cfg), Some("alpha"));
+        assert_eq!(
+            planner
+                .plan
+                .as_ref()
+                .expect("enabled plan")
+                .cfg
+                .trigger_tokens,
+            60_000,
+            "min(90_000, 90_000) = 90_000; the 60_000 ceiling binds"
+        );
+
+        // The default 1_024-token ceiling is far below any strategy
+        // threshold, so it keeps winning: legacy-sized spans still qualify.
+        let cfg: zeroclaw_config::schema::Config =
+            toml::from_str(&strategy_config_toml("enabled = true\ntrigger_ratio = 0.9")).unwrap();
+        let planner = CompactionPlanner::resolve(Some(&cfg), Some("alpha"));
+        assert_eq!(
+            planner
+                .plan
+                .as_ref()
+                .expect("enabled plan")
+                .cfg
+                .trigger_tokens,
+            1_024
+        );
+    }
+
+    #[test]
+    fn planner_without_trigger_ratio_keeps_legacy_gate_and_no_clamp() {
+        let cfg: zeroclaw_config::schema::Config =
+            toml::from_str(&strategy_config_toml("enabled = true\ntrigger_tokens = 64")).unwrap();
+        let planner = CompactionPlanner::resolve(Some(&cfg), Some("alpha"));
+        let plan = planner.plan.as_ref().expect("enabled plan");
+        assert_eq!(plan.cfg.trigger_tokens, 64);
+        assert!(
+            plan.recent.is_none(),
+            "no trigger_ratio: the span is exactly the caller's trim decision"
+        );
+    }
+
+    #[test]
+    fn planner_trigger_ratio_without_window_ignores_the_ratio() {
+        let cfg: zeroclaw_config::schema::Config = toml::from_str(&compaction_config_toml(
+            "enabled = true\ntrigger_tokens = 64\ntrigger_ratio = 0.9",
+        ))
+        .unwrap();
+        let planner = CompactionPlanner::resolve(Some(&cfg), Some("alpha"));
+        let plan = planner.plan.as_ref().expect("enabled plan");
+        assert_eq!(
+            plan.cfg.trigger_tokens, 64,
+            "no max_context_tokens on the profile: the ratio trigger cannot \
+             be computed and the configured gate stands"
+        );
+    }
+
+    #[test]
+    fn recent_window_clamps_span_by_message_boundary() {
+        let history = long_history();
+        // Huge window: the token floor is unreachable, so only the message
+        // boundary governs. body = 9 rows (indexes 1..=9).
+        let recent = RecentWindow {
+            max_messages: 2,
+            max_size_ratio: 0.2,
+            window_tokens: 1_000_000,
+        };
+        assert_eq!(
+            recent.clamp_span_len(&history, 1, 8),
+            7,
+            "span must stop before the newest 2 rows"
+        );
+        assert_eq!(
+            recent.clamp_span_len(&history, 1, 3),
+            3,
+            "span already fits"
+        );
+        // max_messages = 0 disables the message boundary.
+        let recent = RecentWindow {
+            max_messages: 0,
+            max_size_ratio: 0.2,
+            window_tokens: 1_000_000,
+        };
+        assert_eq!(recent.clamp_span_len(&history, 1, 9), 9);
+    }
+
+    #[test]
+    fn recent_window_clamps_span_by_token_boundary() {
+        // Six identical big rows (~1_000 est. tokens each) after the system
+        // row; window sized so the 0.2 share equals exactly three rows.
+        let big = "x".repeat(4_000);
+        let est = estimate_message_tokens(&asst(&big));
+        let history = vec![
+            sys("s"),
+            asst(&big),
+            asst(&big),
+            asst(&big),
+            asst(&big),
+            asst(&big),
+            asst(&big),
+        ];
+        let recent = RecentWindow {
+            max_messages: 4,
+            max_size_ratio: 0.2,
+            window_tokens: est * 15, // floor = 0.2 * 15 rows = 3 rows
+        };
+        // Token boundary (len - 3) is later than the message boundary
+        // (len - 4): the span stops after 3 rows of tail survive.
+        assert_eq!(recent.clamp_span_len(&history, 1, 6), 3);
+
+        // max_messages raised: the token boundary still governs.
+        let recent = RecentWindow {
+            max_messages: 6,
+            max_size_ratio: 0.2,
+            window_tokens: est * 15,
+        };
+        assert_eq!(recent.clamp_span_len(&history, 1, 6), 3);
+
+        // Window far above the whole history: the size condition can never
+        // fire (strategy.ts's `recentSize >= maxSize * maxRecentSizeRatio`
+        // never triggers) and the message boundary alone governs.
+        let recent = RecentWindow {
+            max_messages: 2,
+            max_size_ratio: 0.2,
+            window_tokens: est * 1_000,
+        };
+        assert_eq!(recent.clamp_span_len(&history, 1, 6), 4);
+    }
+
+    #[tokio::test]
+    async fn maybe_compact_clamps_span_to_the_recent_window() {
+        let cfg: zeroclaw_config::schema::Config = toml::from_str(&strategy_config_toml(
+            "enabled = true\ntrigger_tokens = 0\ntrigger_ratio = 0.9\nmax_recent_messages = 2",
+        ))
+        .unwrap();
+        let planner = CompactionPlanner::resolve(Some(&cfg), Some("alpha"));
+        let mut history = long_history();
+        let mock = MockSummarizer::text("I have summarized the earlier agent work.");
+        let outcome = planner
+            .maybe_compact(
+                "pre_dispatch",
+                Some("turn-test"),
+                &mut history,
+                false,
+                8,
+                &mock,
+                "custom.default",
+                "m-main",
+            )
+            .await
+            .expect("compaction succeeds");
+        assert_eq!(
+            outcome.span_messages, 7,
+            "requested span 8 clamped to body(9) - max_recent_messages(2)"
+        );
+        assert_eq!(outcome.kept_user_messages, 2);
+        // The newest turn is untouched by the clamp.
+        assert_message_eq(history.last().expect("nonempty"), &asst("current answer"));
+        assert!(
+            history.iter().any(|m| m.content == "turn three request"),
+            "the newest user turn survives the clamped compaction: {history:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_compact_declines_when_the_span_is_all_recent_window() {
+        let cfg: zeroclaw_config::schema::Config = toml::from_str(&strategy_config_toml(
+            "enabled = true\ntrigger_tokens = 0\ntrigger_ratio = 0.9\nmax_recent_messages = 50",
+        ))
+        .unwrap();
+        let planner = CompactionPlanner::resolve(Some(&cfg), Some("alpha"));
+        let mut history = long_history();
+        let original = history.clone();
+        let mock = MockSummarizer::text("should never be used");
+        let outcome = planner
+            .maybe_compact(
+                "pre_dispatch",
+                Some("turn-test"),
+                &mut history,
+                false,
+                8,
+                &mock,
+                "custom.default",
+                "m-main",
+            )
+            .await;
+        assert!(
+            outcome.is_none(),
+            "a span clamped to zero declines compaction (I4 breadcrumb fallback)"
+        );
+        assert_eq!(history_json(&history), history_json(&original));
+        assert!(
+            mock.seen_messages().is_empty(),
+            "a declined compaction must not issue an LLM call"
+        );
+    }
+
+    #[test]
+    fn overflow_recovery_policy_defaults_overrides_and_progress() {
+        // Inert planner: the documented defaults still bound the legacy
+        // trim-retry loop.
+        let planner = CompactionPlanner::disabled();
+        let policy = planner.overflow_recovery_policy(100_000);
+        assert_eq!(policy.max_attempts, 3);
+        assert_eq!(
+            policy.min_reduction_tokens, 5_000,
+            "max(1, ceil(100_000 * 0.05))"
+        );
+        assert!(policy.allows_attempt(0));
+        assert!(policy.allows_attempt(2));
+        assert!(!policy.allows_attempt(3), "the cap is exclusive");
+        assert!(policy.made_progress(5_000));
+        assert!(!policy.made_progress(4_999), "just under 5% is no progress");
+
+        // Unknown window: any actual trim counts.
+        let policy = planner.overflow_recovery_policy(0);
+        assert_eq!(policy.min_reduction_tokens, 1);
+
+        // Enabled profile overrides.
+        let cfg: zeroclaw_config::schema::Config = toml::from_str(&compaction_config_toml(
+            "enabled = true\nmax_overflow_compaction_attempts = 5\nmin_overflow_reduction_ratio = 0.1",
+        ))
+        .unwrap();
+        let planner = CompactionPlanner::resolve(Some(&cfg), Some("alpha"));
+        let policy = planner.overflow_recovery_policy(10_000);
+        assert_eq!(policy.max_attempts, 5);
+        assert_eq!(policy.min_reduction_tokens, 1_000);
+        assert!(policy.allows_attempt(4));
+        assert!(!policy.allows_attempt(5));
     }
 }
