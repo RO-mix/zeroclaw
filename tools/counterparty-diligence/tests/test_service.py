@@ -38,8 +38,11 @@ class _StubPbDown:
 
 
 class _StubNpchk:
+    def __init__(self, state="1"):
+        self._state = state
+
     def check_inn(self, inn, kpp=""):
-        return {"inn": inn, "state": "2"}
+        return {"inn": inn, "state": self._state}
 
 
 class _StubSanctions:
@@ -104,3 +107,12 @@ def test_facts_cached_for_inn(monkeypatch, tmp_path):
     cached = svc.cache.get_facts("7707001234")
     assert cached and any(f.field == "inn" for f in cached)
     svc.cache.close()
+
+
+def test_npchk_state_2_is_clean(monkeypatch, tmp_path):
+    svc = _make_service(monkeypatch, tmp_path, _StubEgrul(), _StubPb())
+    svc.npchk = _StubNpchk(state="2")  # registered, date not requested
+    result = svc.check(inn="7707001234")
+    flags = {c["flag"] for c in result["scorecard"]["contributions"]}
+    assert "npchk_bad" not in flags
+    assert result["scorecard"]["score"] == 75  # only mass_address

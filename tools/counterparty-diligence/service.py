@@ -18,7 +18,7 @@ from dossier import render, MODULE_VERSION
 from sources.base import Fact, utc_now_iso
 from sources.egrul import EgrulClient, company_facts
 from sources.pb_stoplists import PbClient
-from sources.npchk import NpchkClient
+from sources.npchk import NpchkClient, OK_STATES
 from sources.sanctions import SanctionsScreener
 
 BASE_DIR = Path(__file__).parent
@@ -127,7 +127,7 @@ class DiligenceService:
             {"flag": flag, "source": "pb_stoplists", "retrieved_at": retrieved_at}
             for flag in pb_flags
         ]
-        if npchk_record and npchk_record["state"] != "0":
+        if npchk_record and npchk_record["state"] not in OK_STATES:
             flags.append({"flag": "npchk_bad", "source": "npchk",
                           "retrieved_at": retrieved_at})
         if sanctions_matches:

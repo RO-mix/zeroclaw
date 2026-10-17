@@ -13,6 +13,13 @@ CONF_CONFIRMED = "confirmed"
 CONF_INDIRECT = "indirect"
 CONF_UNVERIFIED = "unverified"
 
+# WAF note: FNS gateways (npchk in particular) answer 403 to the default
+# python-requests User-Agent; a browser UA is required.
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
+)
+
 
 @dataclass
 class Fact:
@@ -54,6 +61,7 @@ def make_session(config: dict) -> requests.Session:
     """
     session = requests.Session()
     session.trust_env = bool(config.get("proxy", {}).get("enabled", False))
+    session.headers["User-Agent"] = BROWSER_USER_AGENT  # override python-requests default
     return session
 
 
