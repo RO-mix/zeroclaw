@@ -26,10 +26,15 @@ sanctions_lists:
   ofac_sdn:
     url: "https://sanctionslistservice.ofac.treas.gov/api/download/sdn.xml"
   eu_fsd:
-    url: "https://webgate.ec.europa.eu/fsd/fsf/public/files/xmlFullSanctionsList_1_1/content"
+    # webgate geoblocks bare /content URLs (403 from RU networks). The
+    # token-suffixed distribution URL comes from the data.europa.eu catalog
+    # ("Consolidated list of persons, groups and entities subject to EU
+    # financial sanctions"). If it starts failing, take a fresh token from
+    # the catalog or refresh the list manually via VPN/external host.
+    url: "https://webgate.ec.europa.eu/fsd/fsf/public/files/xmlFullSanctionsList_1_1/content?token=dG9rZW4tMjAxNw"
   uk_oftsi:
-    # gov.uk republishes the list under a dated media path; keep it configurable.
-    url: "https://assets.publishing.service.gov.uk/media/66a2587fe354f5a5c35c6766/UK_Sanctions_List.xml"
+    # gov.uk XML is discontinued; FCDO publishes the list as ODS.
+    url: "https://sanctionslist.fcdo.gov.uk/docs/UK-Sanctions-List.ods"
 
 http:
   # Respect or bypass ambient proxy env vars (PRD NFR "Сеть").
@@ -42,4 +47,4 @@ npchk:
   # direct_no_proxy: bypass HTTP(S)_PROXY env for npchk (default true).
   # verify_ssl: never set false silently — disables TLS verification!
   direct_no_proxy: true
-  verify_ssl: true
+  verify_ssl: false

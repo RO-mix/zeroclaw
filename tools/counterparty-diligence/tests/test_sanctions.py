@@ -7,7 +7,7 @@ sys.path.insert(0, str(ROOT))
 from cache import Cache  # noqa: E402
 from sources.sanctions import (  # noqa: E402
     normalize_name, transliterate, name_variants, match_name,
-    token_similarity, parse_ofac_sdn, parse_eu_fsd, parse_uk_list,
+    token_similarity, parse_ofac_sdn, parse_eu_fsd, parse_uk_ods,
     SanctionsScreener,
 )
 
@@ -75,13 +75,53 @@ def test_parse_eu_fsd_fixture():
     assert "ZAO ZAKAT" in aliases  # raw alias; legal form stripped at normalization
 
 
-def test_parse_uk_fixture():
-    version, entries = parse_uk_list(
-        (FIXTURES / "uk_sanctions.xml").read_text("utf-8"))
-    assert version.startswith("2026-10-10")
+def test_parse_uk_ods_fixture():
+    data = (FIXTURES / "uk_sanctions_list.ods").read_bytes()
+    version, entries = parse_uk_ods(data)
+    assert version == "2026-10-16"  # "[Report for: 16-Oct-2026]"
     aliases = [e["alias"] for e in entries]
-    assert "SERGEY SMIRNOV" in aliases
-    assert "S SMIRNOV" in aliases
+    assert "SERGEY SMIRNOV" in aliases        # Name 1 + Name 2 joined
+    assert "S SMIRNOV" in aliases             # Alias row
+    assert "СЕРГЕЙ СМИРНОВ" in aliases        # non-latin script variant
+    assert aliases.count("REPEATED ENTITY") == 1  # rows-repeated expanded + deduped
+    by_alias = {e["alias"]: e for e in entries}
+    assert by_alias["S SMIRNOV"]["raw"]["uk_alias_strength"] == "strong"
+
+
+def test_parse_uk_ods_last_modified_fallback():
+    import zipfile
+    import io as _io
+    minimal = (b'<?xml version="1.0"?><office:document-content '
+               b'xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" '
+               b'xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" '
+               b'xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0">'
+               b'<office:body><office:spreadsheet><table:table>'
+               b'<table:table-row><table:table-cell office:value-type="string">'
+               b'<text:p>x</text:p></table:table-cell></table:table-row>'
+               b'</table:table></office:spreadsheet></office:body>'
+               b'</office:document-content>')
+    buf = _io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("content.xml", minimal)
+    version, entries = parse_uk_ods(
+        buf.getvalue(), last_modified="Fri, 16 Oct 2026 09:30:38 GMT")
+    assert version == "2026-10-16"  # HTTP-date parsed, not sliced
+    assert entries == []
+
+
+def test_screen_uk_entries_cross_script(tmp_path):
+    cache = Cache(tmp_path / "test.sqlite")
+    version, entries = parse_uk_ods(
+        (FIXTURES / "uk_sanctions_list.ods").read_bytes())
+    cache.replace_sanctions_list("uk_oftsi", [
+        {"alias": e["alias"], "normalized_name": normalize_name(e["alias"]),
+         "raw": e["raw"]} for e in entries], version)
+    screener = SanctionsScreener(_config(), cache)
+    matches = screener.screen("Smirnov Sergey")
+    assert any(m["match"] == "fuzzy" for m in matches)
+    matches = screener.screen("Сергей Смирнов")
+    assert any(m["match"] == "exact" for m in matches)  # non-latin alias hit
+    cache.close()
 
 
 # --- screening against a real (tmp) cache ---

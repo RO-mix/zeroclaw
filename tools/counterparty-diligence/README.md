@@ -51,7 +51,7 @@ print(svc.sanctions.refresh_all())   # OFAC SDN + EU FSD + UK OFSI XML -> sqlite
 | ЕГРЮЛ ФНС (egrul.nalog.ru) | `sources/egrul.py` | POST → token → `/search-result/{token}`: ОГРН/ИНН/КПП, наименование, адрес, ОКВЭД, руководитель, дата регистрации, статус. PDF-выписка (`/vyp-download/{token}`) — только URL, вне M1 |
 | Стоп-листы ФНС (pb.nalog.ru) | `sources/pb_stoplists.py` | POST `search-proc.json` → token → `search-result.json`: массовый адрес/руководитель, недостоверный паспорт, задолженность |
 | Недобросовестные поставщики (npchk.nalog.ru) | `sources/npchk.py` | SOAP 1.1 `NdsRequest2` (вручную через requests, без zeep), до 1000 ИНН+КПП+дата; статусы NDS0..NDS5 |
-| Санкции OFAC/EU/UK | `sources/sanctions.py` | Загрузка XML → sqlite-кэш (`sanctions_entries` + версии). Скрининг: нормализация (lower, кавычки/«», ООО/ОАО/…/LTD/LLC/INC, транслит лат↔кирил), матчинг exact \| fuzzy (все токены ⊆ alias или Dice ≥ 0.8) |
+| Санкции OFAC/EU/UK | `sources/sanctions.py` | OFAC: `sdn.xml`; EU: FSD XML (URL с token из каталога data.europa.eu — голый `/content` геоблокируется с 403 из RU-контура; при отказе — свежий token из каталога или ручное обновление через VPN/внешний хост); UK: ODS от FCDO (`sanctionslist.fcdo.gov.uk`, XML больше не публикуется). Парсинг → sqlite-кэш (`sanctions_entries` + версии). Скрининг: нормализация (lower, кавычки/«», ООО/ОАО/…/LTD/LLC/INC, транслит лат↔кирил), матчинг exact \| fuzzy (все токены ⊆ alias или Dice ≥ 0.8) |
 
 Троттлинг (ЕГРЮЛ ≥30с и пр.) — в `config.yaml`; одиночный retry ЕГРЮЛ при
 пустом ответе; при недоступности источника — «не проверено» в warnings,

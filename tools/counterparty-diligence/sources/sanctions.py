@@ -111,7 +111,11 @@ def parse_ofac_sdn(xml_text: str) -> tuple[str, list[dict]]:
 
 
 def parse_eu_fsd(xml_text: str) -> tuple[str, list[dict]]:
-    """EU FSF full sanctions list XML -> (version_date, [{alias, raw}])."""
+    """EU FSF full sanctions list XML -> (version_date, [{alias, raw}]).
+
+    Note: webgate geoblocks bare /content URLs (403 from RU networks); use
+    the token-suffixed distribution URL from the data.europa.eu catalog.
+    """
     root = ET.fromstring(xml_text)
     version = datetime.now(timezone.utc).date().isoformat()
     for attr in ("date", "generationDate", "exportDate", "Version"):
@@ -138,32 +142,111 @@ def parse_eu_fsd(xml_text: str) -> tuple[str, list[dict]]:
     return version, entries
 
 
-def parse_uk_list(xml_text: str) -> tuple[str, list[dict]]:
-    """UK Sanctions List XML -> (version_date, [{alias, raw}])."""
-    root = ET.fromstring(xml_text)
+# --- UK Sanctions List (O DS from sanctionslist.fcdo.gov.uk) -------------
+
+_ODF_NS = {
+    "table": "urn:oasis:names:tc:opendocument:xmlns:table:1.0",
+    "text": "urn:oasis:names:tc:opendocument:xmlns:text:1.0",
+}
+_ODF_TABLE, _ODF_TEXT_P = (_ODF_NS["table"], _ODF_NS["text"])
+_MAX_ROW_REPEAT = 200_000  # guard against runaway number-rows-repeated
+_MONTHS = {"Jan": "01", "Feb": "02", "Mar": "03", "Apr": "04", "May": "05",
+           "Jun": "06", "Jul": "07", "Aug": "08", "Sep": "09", "Oct": "10",
+           "Nov": "11", "Dec": "12"}
+
+
+def _ods_cell_text(cell: ET.Element) -> str:
+    return " ".join("".join(p.itertext())
+                    for p in cell.iter(f"{{{_ODF_TEXT_P}}}p")).strip()
+
+
+def _ods_rows(table: ET.Element) -> list[list[str]]:
+    """Expand an ODS table into logical rows of cell strings."""
+    rows = []
+    for row in table.iter(f"{{{_ODF_TABLE}}}table-row"):
+        repeat = int(row.get(f"{{{_ODF_TABLE}}}number-rows-repeated") or 1)
+        cells = []
+        for cell in row.iter(f"{{{_ODF_TABLE}}}table-cell"):
+            col_repeat = int(
+                cell.get(f"{{{_ODF_TABLE}}}number-columns-repeated") or 1)
+            text = _ods_cell_text(cell)
+            cells.extend([text] * min(col_repeat, 512))
+        for _ in range(min(repeat, _MAX_ROW_REPEAT)):
+            rows.append(list(cells))
+    return rows
+
+
+def parse_uk_ods(data: bytes,
+                 last_modified: Optional[str] = None) -> tuple[str, list[dict]]:
+    """UK Sanctions List ODS -> (version_date, [{alias, raw}]).
+
+    Parses content.xml directly (stdlib zipfile+ElementTree): odfpy's DOM
+    loader cannot handle the live ~8 MB file in reasonable time. Main sheet
+    "UK Sanctions List": row 0 carries "[Report for: DD-Mon-YYYY]", row 1 is
+    the header (Name 1..6 parts, Name type, Alias strength, Name non-latin
+    script). Primary names and aliases both become screening entries;
+    non-latin-script variants are added as extra aliases.
+    """
+    import io
+    import zipfile
+
     version = datetime.now(timezone.utc).date().isoformat()
-    for attr in ("Version", "GeneratedAt", "LastUpdated"):
-        if root.get(attr):
-            version = root.get(attr)[:10]
-            break
-    for el in root.iter():
-        if _strip_ns(el.tag) in ("GeneratedAt", "Version", "LastUpdated"):
-            version = (_text(el) or version)[:10]
-            break
+    if last_modified:
+        try:
+            from email.utils import parsedate_to_datetime
+            version = parsedate_to_datetime(last_modified).date().isoformat()
+        except (TypeError, ValueError, IndexError, OverflowError):
+            version = last_modified[:10]
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        root = ET.fromstring(zf.read("content.xml"))
+    table = root.find(f".//{{{_ODF_TABLE}}}table")
+    if table is None:
+        return version, []
+    rows = _ods_rows(table)
+    if not rows:
+        return version, []
+
+    report = " ".join(x for x in rows[0] if x)
+    m = re.search(r"(\d{2})-(\w{3})-(\d{4})", report)
+    if m and m.group(2) in _MONTHS:
+        version = f"{m.group(3)}-{_MONTHS[m.group(2)]}-{m.group(1)}"
+
+    header = rows[1] if len(rows) > 1 else []
+    name_idx = [i for i, h in enumerate(header)
+                if re.fullmatch(r"Name [1-6]", h or "")]
+    type_idx = header.index("Name type") if "Name type" in header else None
+    strength_idx = (header.index("Alias strength")
+                    if "Alias strength" in header else None)
+    nonlatin_idx = (header.index("Name non-latin script")
+                    if "Name non-latin script" in header else None)
+
     entries = []
-    for el in root.iter():
-        if _strip_ns(el.tag) not in ("Name", "Alias"):
+    seen = set()
+    for cells in rows[2:]:
+        parts = [cells[i] for i in name_idx if i < len(cells) and cells[i]]
+        name = " ".join(parts).strip()
+        if not name:
             continue
-        name = (el.get("Name") or "").strip()
-        if name:
-            entries.append({"alias": name, "raw": {"uk_name": name}})
+        raw = {
+            "uk_name_type": cells[type_idx] if type_idx is not None and type_idx < len(cells) else "",
+            "uk_alias_strength": (cells[strength_idx]
+                                  if strength_idx is not None and strength_idx < len(cells) else ""),
+        }
+        for alias in [name] + (
+                [cells[nonlatin_idx]] if nonlatin_idx is not None
+                and nonlatin_idx < len(cells) and cells[nonlatin_idx] else []):
+            if alias not in seen:
+                seen.add(alias)
+                entries.append({"alias": alias, "raw": raw})
     return version, entries
 
 
 LIST_PARSERS = {
-    "ofac_sdn": parse_ofac_sdn,
-    "eu_fsd": parse_eu_fsd,
-    "uk_oftsi": parse_uk_list,
+    "ofac_sdn": lambda data, _lm: parse_ofac_sdn(
+        data.decode("utf-8", "replace")),
+    "eu_fsd": lambda data, _lm: parse_eu_fsd(
+        data.decode("utf-8", "replace")),
+    "uk_oftsi": parse_uk_ods,
 }
 
 
@@ -213,8 +296,18 @@ class SanctionsScreener:
         if not url:
             raise ValueError(f"no URL configured for sanctions list {list_name}")
         resp = self._session.get(url, timeout=http_timeout(self.config))
-        resp.raise_for_status()
-        version, entries = LIST_PARSERS[list_name](resp.content.decode("utf-8", "replace"))
+        try:
+            resp.raise_for_status()
+        except Exception as exc:
+            if list_name == "eu_fsd" and getattr(resp, "status_code", 0) == 403:
+                raise RuntimeError(
+                    "EU FSD geoblocked (403) from this network; update the URL "
+                    "token from the data.europa.eu catalog or refresh manually "
+                    "via VPN/external host"
+                ) from exc
+            raise
+        last_modified = resp.headers.get("Last-Modified", "")
+        version, entries = LIST_PARSERS[list_name](resp.content, last_modified)
         normalized = [
             {"alias": e["alias"],
              "normalized_name": normalize_name(e["alias"]),
