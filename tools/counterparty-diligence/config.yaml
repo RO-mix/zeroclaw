@@ -22,6 +22,13 @@ cache:
   facts_ttl_hours: 24
   db_path: "data/dd-cache.sqlite"
 
+sanctions:
+  foreign:
+    # RU-focus: OFAC/EU/UK screening is optional and OFF by default; the
+    # pipeline never touches foreign lists while disabled. Code stays, the
+    # local sqlite cache with downloaded lists stays on disk unused.
+    enabled: false
+
 sanctions_lists:
   ofac_sdn:
     url: "https://sanctionslistservice.ofac.treas.gov/api/download/sdn.xml"
@@ -37,8 +44,14 @@ sanctions_lists:
     url: "https://sanctionslist.fcdo.gov.uk/docs/UK-Sanctions-List.ods"
 
 http:
-  # Respect or bypass ambient proxy env vars (PRD NFR "Сеть").
+  # HTTP client timeout base and legacy knobs; proxy policy lives in `proxy`.
   trust_env: false
+
+proxy:
+  # RU-focus: all Russian sources (FNS egrul/pb/npchk) are hit DIRECTLY;
+  # ambient HTTP(S)_PROXY/ALL_PROXY env vars are ignored unless enabled
+  # explicitly here. Set true only on hosts where a proxy is required.
+  enabled: false
 
 npchk:
   # npchk.nalog.ru TLS often fails behind intercepting proxies / on hosts

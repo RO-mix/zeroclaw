@@ -281,17 +281,27 @@ def match_name(query_variants: list[str], alias: str,
 
 
 class SanctionsScreener:
-    """Downloads lists into the cache and screens names against it."""
+    """Downloads lists into the cache and screens names against it.
+
+    RU-focus policy: foreign lists (OFAC/EU/UK) are optional; when
+    sanctions.foreign.enabled is false the screener never touches them —
+    screen() returns [], status() reports "disabled (ru-focus)".
+    """
 
     def __init__(self, config: dict, cache, session: Optional[Any] = None):
         self.config = config
         self.cache = cache
         self._session = session or make_session(config)
         self._lists = config.get("sanctions_lists", {})
+        self.foreign_enabled = bool(
+            config.get("sanctions", {}).get("foreign", {}).get("enabled", False))
 
     # loading
 
     def refresh_list(self, list_name: str) -> dict:
+        if not self.foreign_enabled:
+            return {"list_name": list_name,
+                    "error": "disabled (ru-focus)"}
         url = self._lists.get(list_name, {}).get("url")
         if not url:
             raise ValueError(f"no URL configured for sanctions list {list_name}")
@@ -330,6 +340,8 @@ class SanctionsScreener:
     # screening
 
     def screen(self, name: str, fuzzy_threshold: float = 0.8) -> list[dict]:
+        if not self.foreign_enabled:
+            return []
         variants = name_variants(name)
         matches = []
         for entry in self.cache.all_sanctions_entries():
@@ -342,6 +354,8 @@ class SanctionsScreener:
         return matches
 
     def status(self) -> dict:
+        if not self.foreign_enabled:
+            return {"enabled": False, "note": "disabled (ru-focus)"}
         out = {}
         for list_name in self._lists:
             out[list_name] = self.cache.get_list_version(list_name)

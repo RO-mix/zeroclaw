@@ -46,9 +46,14 @@ class RateLimiter:
 
 
 def make_session(config: dict) -> requests.Session:
-    """Session honoring the http.trust_env proxy setting from config."""
+    """Session factory. RU-focus policy: direct connections by default.
+
+    Ambient HTTP(S)_PROXY env vars are ignored unless proxy.enabled is
+    explicitly set to true in config.yaml. Verified symptom: FNS endpoints
+    misbehave (HTTP 500) when the host's proxy/VPN env leaks into requests.
+    """
     session = requests.Session()
-    session.trust_env = bool(config.get("http", {}).get("trust_env", False))
+    session.trust_env = bool(config.get("proxy", {}).get("enabled", False))
     return session
 
 

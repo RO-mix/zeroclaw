@@ -18,6 +18,7 @@ def _config():
     return {"sanctions_lists": {"ofac_sdn": {"url": "unused"},
                                 "eu_fsd": {"url": "unused"},
                                 "uk_oftsi": {"url": "unused"}},
+            "sanctions": {"foreign": {"enabled": True}},
             "http": {"trust_env": False}}
 
 
