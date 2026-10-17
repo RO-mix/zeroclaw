@@ -16,7 +16,26 @@ throttling:
   pb_min_interval_seconds: 5
   npchk_min_interval_seconds: 5
   sanctions_min_interval_seconds: 5
+  rmsp_min_interval_seconds: 30      # FNS host — same politeness as egrul
+  fedresurs_min_interval_seconds: 4  # ~100 req/hour per IP at fedresurs
+  zalogi_min_interval_seconds: 5
+  digitalsleuth_min_interval_seconds: 5
   http_timeout_seconds: 30
+
+zalogi:
+  # Порог «много залогов»: свыше N уведомлений о залоге у должника —
+  # жёлтый флаг zalog_heavy (−10, класс в scoring.yaml).
+  heavy_threshold: 5
+
+domain:
+  # «Молодой домен»: возраст домена < young_age_years при возрасте
+  # юрлица >= mature_company_years → жёлтый флаг young_domain (−10).
+  young_age_years: 1
+  mature_company_years: 3
+
+digitalsleuth:
+  whois_timeout_seconds: 20
+  crtsh_retries: 1          # crt.sh часто отдаёт 502/таймауты — один retry
 
 cache:
   facts_ttl_hours: 24

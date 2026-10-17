@@ -1,0 +1,31 @@
+{
+  "dtQueryEnd": "18.10.2026 00:52:18",
+  "dtQueryBegin": "18.10.2026 00:52:18",
+  "data": [
+    {
+      "id": 1224700016750,
+      "ogrn": "1224700016750",
+      "inn": "7707001234",
+      "isnew": 0,
+      "category": 1,
+      "regioncode": "77",
+      "dtregistry": "10.10.2022 00:00:00",
+      "is_active": 1,
+      "nptype": "UL",
+      "okved1": "35.22",
+      "citytype": "г.",
+      "cityname": "Москва",
+      "name_ex": "Общество с ограниченной ответственностью \"Ромашка\"",
+      "has_licenses": 0,
+      "has_contracts": 0,
+      "is_hitech": 0,
+      "is_partnership": 0,
+      "pr_soc": 0,
+      "is_pp": 1,
+      "cnt": 951,
+      "token": "C178868BB782987FFB81DB31782741141B2FEFD47BA49CCB2A722202C5F9E152FB1989D4F956A9E3D9EAFE2460BFA782"
+    }
+  ],
+  "rowCount": 1,
+  "queryTime": 2
+}

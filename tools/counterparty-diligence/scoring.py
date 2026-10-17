@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
-# Flag keys -> scoring class. Only M1-available red flags are wired:
-# mass address/director (pb), npchk state != 0, sanctions match.
-# Bankruptcy, disqualification and scale-gap flags arrive with M2 sources.
+# Flag keys -> scoring class.
+# Red (−25): M1 mass address/director (pb), npchk state != 0, sanctions
+# match; M2 bankruptcy (Fedresurs).
+# Yellow (−10): M2 pledge load (ФНП) and young domain vs mature company.
+# Plus (+5, cap +15): M2 SME registry confirmation; M1 long registration.
 RED_FLAGS = ("mass_address", "mass_director", "unreliable_passport",
-             "npchk_bad", "sanctions_match")
-YELLOW_FLAGS = ("young_company", "name_changes")
+             "npchk_bad", "sanctions_match", "bankruptcy")
+YELLOW_FLAGS = ("young_company", "name_changes", "zalog_heavy",
+                "young_domain")
 PLUS_FLAGS = ("active_5y_plus", "revenue_growing", "msp_confirmed",
               "own_address", "long_registration")
 

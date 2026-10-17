@@ -70,6 +70,31 @@ def test_each_contribution_has_audit_fields():
 
 
 def test_unknown_flag_ignored():
-    card = scoring.score([_flag("bankruptcy")], CONFIG)  # M2 flag, not wired
+    card = scoring.score([_flag("scale_gap")], CONFIG)  # M3 flag, not wired
     assert card["score"] == 100
     assert card["contributions"] == []
+
+
+# --- M2 wired flags (rmsp / fedresurs / zalogi / digitalsleuth) ---
+
+def test_bankruptcy_is_red_minus_25():
+    card = scoring.score([_flag("bankruptcy")], CONFIG)
+    assert card["score"] == 75
+    (c,) = card["contributions"]
+    assert c["weight"] == -25 and c["flag"] == "bankruptcy"
+
+
+def test_zalog_heavy_and_young_domain_are_yellow():
+    card = scoring.score([_flag("zalog_heavy"), _flag("young_domain")],
+                         CONFIG)
+    assert card["score"] == 80
+    assert {c["flag"]: c["weight"] for c in card["contributions"]} == {
+        "zalog_heavy": -10, "young_domain": -10}
+
+
+def test_msp_confirmed_is_plus_5_within_cap():
+    card = scoring.score([_flag("msp_confirmed"), _flag("own_address")],
+                         CONFIG)
+    assert card["score"] == 110  # base 100 + 2*+5, plus side under the cap
+    plus = sum(c["weight"] for c in card["contributions"] if c["weight"] > 0)
+    assert plus == 10

@@ -36,12 +36,13 @@ DATA = {
 
 def test_markdown_has_all_sections_coverage_disclaimer():
     md = dossier.render(DATA, "md")
-    for section in ("Сводка", "Регистрация", "Владение и управление",
-                    "Финансы", "Суды", "Репутация", "Красные флаги", "Вывод"):
+    for section in ("Сводка", "Регистрация", "Владение и управление", "МСП",
+                    "Финансы", "Банкротство", "Залоги", "Суды",
+                    "Репутация", "Цифровой след", "Красные флаги", "Вывод"):
         assert f"## {section}" in md
-    assert "Покрытие: 6/8 блоков" in md
+    assert "Покрытие: 6/12 блоков" in md
     assert "не является юридическим заключением" in md
-    assert "v1" in md and "M1" in md
+    assert "v1" in md and "M2" in md
     assert "7707001234" in md
     assert "npchk_bad" in md
 
@@ -49,8 +50,8 @@ def test_markdown_has_all_sections_coverage_disclaimer():
 def test_json_format_returns_parseable_dict():
     raw = dossier.render(DATA, "json")
     parsed = json.loads(raw)
-    assert parsed["coverage"] == "6/8"
-    assert parsed["module_version"] == "M1"
+    assert parsed["coverage"] == "6/12"
+    assert parsed["module_version"] == "M2"
     assert parsed["disclaimer"]
     assert set(parsed["sections"]) == set(dossier.SECTION_KEYS)
 

@@ -1,0 +1,23 @@
+[
+  {
+    "id": 123456789,
+    "issuer_name": "C=RU, O=Example CA, CN=Example RSA",
+    "name_value": "www.example.ru\nexample.ru",
+    "min_entry_timestamp": "2024-05-11T00:00:00.000",
+    "not_before": "2024-05-11T00:00:00"
+  },
+  {
+    "id": 123456790,
+    "issuer_name": "C=RU, O=Example CA, CN=Example RSA",
+    "name_value": "*.api.example.ru",
+    "min_entry_timestamp": "2025-01-20T00:00:00.000",
+    "not_before": "2025-01-20T00:00:00"
+  },
+  {
+    "id": 123456791,
+    "issuer_name": "C=RU, O=Example CA, CN=Example RSA",
+    "name_value": "mail.example.ru",
+    "min_entry_timestamp": "2025-03-01T00:00:00.000",
+    "not_before": "2025-03-01T00:00:00"
+  }
+]

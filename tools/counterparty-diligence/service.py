@@ -1,12 +1,18 @@
 """Orchestration: resolve a counterparty, gather facts, score, build dossier.
 
-Wires the M1 adapters (egrul, pb stop-lists, npchk, sanctions) with the
-cache and the scoring model. Degrades to "not checked" when a source fails
-(PRD FR9): the pipeline never falls over because one registry is down.
+Wires the adapters (M1: egrul, pb stop-lists, npchk, sanctions; M2: rmsp,
+fedresurs, zalogi, digitalsleuth) with the cache and the scoring model.
+Degrades to "not checked" when a source fails (PRD FR9): the pipeline
+never falls over because one registry is down.
+
+Levels (PRD FR3): quick = M1 sources; standard = quick + SME registry,
+Fedresurs bankruptcy, FNP pledges, digital footprint (domain if passed);
+full = standard + cross-checks (M3).
 """
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -20,10 +26,17 @@ from sources.egrul import EgrulClient, company_facts
 from sources.pb_stoplists import PbClient
 from sources.npchk import NpchkClient, OK_STATES
 from sources.sanctions import SanctionsScreener
+from sources.rmsp import RmspClient
+from sources.fedresurs import FedresursClient
+from sources.zalogi import ZalogiClient
+from sources.digitalsleuth import DigitalSleuthClient, age_years
 
 BASE_DIR = Path(__file__).parent
 
 NOT_CHECKED = "not_checked"
+
+QUICK_LEVEL_SOURCES = ("pb_stoplists", "npchk", "sanctions")
+STANDARD_EXTRA_SOURCES = ("rmsp", "fedresurs", "zalogi", "digitalsleuth")
 
 
 def load_config(path: Optional[Path] = None) -> dict:
@@ -42,6 +55,10 @@ class DiligenceService:
         self.pb = PbClient(self.config)
         self.npchk = NpchkClient(self.config)
         self.sanctions = SanctionsScreener(self.config, self.cache)
+        self.rmsp = RmspClient(self.config)
+        self.fedresurs = FedresursClient(self.config)
+        self.zalogi = ZalogiClient(self.config)
+        self.digitalsleuth = DigitalSleuthClient(self.config)
 
     # --- fact gathering ---
 
@@ -92,10 +109,69 @@ class DiligenceService:
             warnings.append(f"sanctions: {NOT_CHECKED} ({exc})")
             return [], warnings
 
+    # --- M2 fact gathering (standard level) ---
+
+    def _msp_facts(self, company: dict) -> tuple[list[Fact], list[str]]:
+        warnings = []
+        inn = company.get("inn")
+        if not inn:
+            return [], warnings
+        try:
+            return self.rmsp.facts_for_inn(inn), warnings
+        except Exception as exc:
+            warnings.append(f"rmsp: {NOT_CHECKED} ({exc})")
+            return [], warnings
+
+    def _bankruptcy_facts(self, company: dict) -> tuple[list[Fact], list[str]]:
+        warnings = []
+        inn = company.get("inn")
+        if not inn:
+            return [], warnings
+        try:
+            return self.fedresurs.facts_for_inn(inn), warnings
+        except Exception as exc:
+            warnings.append(f"fedresurs: {NOT_CHECKED} ({exc})")
+            return [], warnings
+
+    def _zalog_facts(self, company: dict) -> tuple[list[Fact], list[str]]:
+        warnings = []
+        inn = company.get("inn")
+        name = company.get("name")
+        if not inn and not name:
+            return [], warnings
+        try:
+            return self.zalogi.facts_for_debtor(inn=inn, name=name), warnings
+        except Exception as exc:
+            warnings.append(f"zalogi: {NOT_CHECKED} ({exc})")
+            return [], warnings
+
+    def _digital_facts(self, domain: Optional[str]) -> tuple[list[Fact], list[str]]:
+        warnings = []
+        if not domain:
+            return [], warnings
+        try:
+            return self.digitalsleuth.collect(domain), warnings
+        except Exception as exc:
+            warnings.append(f"digitalsleuth: {NOT_CHECKED} ({exc})")
+            return [], warnings
+
+    @staticmethod
+    def _fact_map(facts: list[Fact]) -> dict:
+        return {f.field: f.value for f in facts}
+
+    @staticmethod
+    def _company_age_years(company: dict) -> Optional[float]:
+        raw = company.get("registration_date") or ""
+        try:
+            registered = datetime.strptime(raw, "%d.%m.%Y").date()
+        except ValueError:
+            return None
+        return age_years(registered)
+
     # --- public API used by MCP tools ---
 
     def check(self, inn: Optional[str] = None, name: Optional[str] = None,
-              level: str = "quick") -> dict:
+              level: str = "quick", domain: Optional[str] = None) -> dict:
         if not inn and not name:
             raise ValueError("either inn or name is required")
         if level not in ("quick", "standard", "full"):
@@ -122,6 +198,22 @@ class DiligenceService:
         sanctions_matches, w = self._sanctions_matches(company)
         warnings += w
 
+        # M2 sources: standard and full levels only (PRD FR3).
+        msp_facts: list[Fact] = []
+        bankruptcy_facts: list[Fact] = []
+        zalog_facts: list[Fact] = []
+        digital_facts: list[Fact] = []
+        if level in ("standard", "full"):
+            msp_facts, w = self._msp_facts(company)
+            warnings += w
+            bankruptcy_facts, w = self._bankruptcy_facts(company)
+            warnings += w
+            zalog_facts, w = self._zalog_facts(company)
+            warnings += w
+            digital_facts, w = self._digital_facts(domain)
+            warnings += w
+        facts += msp_facts + bankruptcy_facts + zalog_facts + digital_facts
+
         retrieved_at = utc_now_iso()
         flags = [
             {"flag": flag, "source": "pb_stoplists", "retrieved_at": retrieved_at}
@@ -133,6 +225,31 @@ class DiligenceService:
         if sanctions_matches:
             flags.append({"flag": "sanctions_match", "source": "sanctions",
                           "retrieved_at": retrieved_at})
+
+        msp = self._fact_map(msp_facts)
+        bankruptcy = self._fact_map(bankruptcy_facts)
+        zalog = self._fact_map(zalog_facts)
+        digital = self._fact_map(digital_facts)
+        if msp.get("msp.in_registry") is True and msp.get("msp.active", True):
+            flags.append({"flag": "msp_confirmed", "source": "rmsp",
+                          "retrieved_at": retrieved_at})
+        if bankruptcy.get("bankruptcy.is_bankrupt") is True:
+            flags.append({"flag": "bankruptcy", "source": "fedresurs",
+                          "retrieved_at": retrieved_at})
+        zalog_count = zalog.get("zalog.count")
+        threshold = int(self.config.get("zalogi", {}).get("heavy_threshold", 5))
+        if isinstance(zalog_count, int) and zalog_count > threshold:
+            flags.append({"flag": "zalog_heavy", "source": "zalogi",
+                          "retrieved_at": retrieved_at})
+        domain_age = digital.get("domain.age_years")
+        if isinstance(domain_age, (int, float)):
+            young = float(self.config.get("domain", {}).get("young_age_years", 1))
+            mature = float(self.config.get("domain", {}).get(
+                "mature_company_years", 3))
+            company_age = self._company_age_years(company)
+            if domain_age < young and (company_age is None or company_age >= mature):
+                flags.append({"flag": "young_domain", "source": "digitalsleuth",
+                              "retrieved_at": retrieved_at})
 
         scorecard = run_scoring(flags, self.config)
         result_facts = [f.to_dict() for f in facts]
@@ -149,14 +266,18 @@ class DiligenceService:
             "pb_flags": pb_flags,
             "npchk": npchk_record,
             "sanctions_matches": sanctions_matches,
+            "msp": msp,
+            "bankruptcy": bankruptcy,
+            "zalog": zalog,
+            "digital": digital,
             "scorecard": scorecard,
             "level": level,
             "module_version": MODULE_VERSION,
             "warnings": warnings,
         }
 
-    def dossier(self, inn: str, fmt: str = "md") -> str:
-        result = self.check(inn=inn, level="quick")
+    def dossier(self, inn: str, fmt: str = "md", domain: Optional[str] = None) -> str:
+        result = self.check(inn=inn, level="standard", domain=domain)
         if not result.get("ok"):
             raise ValueError(f"cannot build dossier: {result.get('error')}")
         result["coverage_note"] = None
@@ -166,6 +287,9 @@ class DiligenceService:
         """Availability snapshot: sanctions lists report cached versions;
         live sources are probed lazily on first use (egrul throttles >=30s)."""
         status = {"sanctions_lists": self.sanctions.status()}
-        for source in ("egrul", "pb_stoplists", "npchk"):
+        for source in ("egrul", "pb_stoplists", "npchk", "rmsp", "fedresurs",
+                       "zalogi", "digitalsleuth"):
             status[source] = {"reachable": None, "note": "probed on first use"}
+        status["zalogi"]["note"] = ("CAPTCHA-gated at last live check "
+                                    "2026-10-18; degrades to not_checked")
         return status

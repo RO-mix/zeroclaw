@@ -1,0 +1,20 @@
+{
+  "data": [
+    {
+      "regDate": "2024-05-11T00:00:00",
+      "link": "/notification/download?id=1",
+      "pledgors": [{"name": "ООО \"Ромашка\"", "type": "RUSSIAN_ORGANIZATION"}],
+      "pledgees": [{"name": "АО \"Банк\""}],
+      "history": []
+    },
+    {
+      "regDate": "2025-01-20T00:00:00",
+      "link": "/notification/download?id=2",
+      "pledgors": [{"name": "ООО \"Ромашка\"", "type": "RUSSIAN_ORGANIZATION"}],
+      "pledgees": [{"name": "ООО \"Ломбард\""}],
+      "history": []
+    }
+  ],
+  "total": 7,
+  "pages": 1
+}

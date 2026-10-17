@@ -28,29 +28,36 @@ def _get_service() -> DiligenceService:
 
 @mcp.tool()
 async def check(inn: Optional[str] = None, name: Optional[str] = None,
-                level: str = "quick") -> dict:
+                level: str = "quick", domain: Optional[str] = None) -> dict:
     """Check a Russian counterparty by INN (10/12 digits) or exact name.
 
     Gathers facts from FNS registries (EGRUL, stop-lists, dishonest
-    suppliers) and sanctions screening, then scores them 0-100.
-    level: quick (M1) | standard | full (M2+ sources degrade to warnings).
+    suppliers, SME registry), Fedresurs bankruptcy, FNP pledges and
+    sanctions screening, then scores them 0-100.
+    level: quick (M1) | standard (M2: +rmsp, fedresurs, zalogi, digital) |
+    full (M3: cross-checks). domain: company website for the digital
+    footprint (crt.sh/whois); checked at standard/full only.
     """
     result = await asyncio.to_thread(_get_service().check,
-                                     inn=inn, name=name, level=level)
+                                     inn=inn, name=name, level=level,
+                                     domain=domain)
     return result
 
 
 @mcp.tool()
-async def dossier(inn: str, format: str = "md") -> str:
-    """Build a full diligence dossier for an INN.
+async def dossier(inn: str, format: str = "md",
+                  domain: Optional[str] = None) -> str:
+    """Build a full diligence dossier for an INN (standard level, M2 blocks).
 
     format: "md" (default, structured markdown) or "json" (raw dict).
     Includes coverage, scoring model version and a not-a-legal-opinion
-    disclaimer. Requires unambiguous identification by INN.
+    disclaimer. Requires unambiguous identification by INN. domain is the
+    company website for the «Цифровой след» section.
     """
     if format not in ("md", "json"):
         raise ValueError("format must be md|json")
-    return await asyncio.to_thread(_get_service().dossier, inn=inn, fmt=format)
+    return await asyncio.to_thread(_get_service().dossier, inn=inn, fmt=format,
+                                   domain=domain)
 
 
 @mcp.tool()
