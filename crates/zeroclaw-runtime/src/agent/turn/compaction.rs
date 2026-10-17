@@ -42,6 +42,14 @@ pub(crate) const COMPACTION_SUMMARY_PREFIX: &str = "[Compaction summary:";
 /// identified by prefix + role, distinguishable from a real user turn.
 pub(crate) const USER_MESSAGES_ELIDED_PREFIX: &str = "[Compaction elision:";
 
+/// Structural marker prefix of the context-recovery footer spliced right
+/// after the compaction summary (D1, Kimi `context-recovery-footer.md`).
+/// Same convention as [`COMPACTION_SUMMARY_PREFIX`]: an internal, English,
+/// model-facing marker identified by prefix + role (+ origin stamp), so
+/// prefix-scanning heuristics and the span selector recognize it as a
+/// synthetic navigation row rather than genuine user input.
+pub(crate) const CONTEXT_RECOVERY_PREFIX: &str = "[Context recovery:";
+
 /// D3 verbatim-keep head budget: the oldest user messages are kept while
 /// they fit this many estimated tokens (Kimi `COMPACT_USER_MESSAGE_HEAD_TOKENS`).
 pub(crate) const COMPACT_USER_HEAD_TOKENS: usize = 2_048;
@@ -79,6 +87,36 @@ pub(crate) fn is_compaction_summary(msg: &ChatMessage) -> bool {
 /// True when `msg` is a D3 elision note rather than a genuine transcript row.
 fn is_user_elision_note(msg: &ChatMessage) -> bool {
     msg.role == "user" && msg.content.starts_with(USER_MESSAGES_ELIDED_PREFIX)
+}
+
+/// True when `msg` is a D1 context-recovery footer rather than a genuine
+/// transcript row. The origin stamp is authoritative once present; the
+/// prefix + role check remains for rows persisted before origin marking
+/// existed. Deliberately separate from [`is_compaction_summary`]: the two
+/// markers have different lifecycles (the summary folds into later
+/// summaries; the footer is superseded and dropped when its span is
+/// compacted again), so counting or summarizing them under one predicate
+/// would corrupt both.
+pub(crate) fn is_context_recovery_footer(msg: &ChatMessage) -> bool {
+    msg.content.starts_with(CONTEXT_RECOVERY_PREFIX)
+        && (msg.origin == Some(zeroclaw_api::model_provider::MessageOrigin::Injection)
+            || msg.role == "user")
+}
+
+/// Inputs for the D1 context-recovery footer: where the exact text of the
+/// compacted span survives on disk and which markers locate it again.
+pub(crate) struct RecoveryFooterCtx<'a> {
+    /// Resolved runtime-trace journal path (the append-only JSONL event log).
+    /// `None` when log persistence is off or the writer was never
+    /// initialized; the footer then says recovery is unavailable instead of
+    /// pointing at a path that does not exist.
+    pub(crate) journal_path: Option<std::path::PathBuf>,
+    /// Turn identifier carried into the footer (and the compaction trace
+    /// record) so operators can grep the journal for the surrounding turn.
+    pub(crate) turn_id: Option<&'a str>,
+    /// Trim seam that triggered this compaction
+    /// ("pre_dispatch" | "reported_budget" | "overflow_recovery").
+    pub(crate) trigger: &'a str,
 }
 
 /// Which reduction ran for one trim event.
@@ -153,6 +191,60 @@ fn user_messages_elided_note(elided: usize) -> ChatMessage {
          see session journal]"
     ))
     .with_origin(zeroclaw_api::model_provider::MessageOrigin::Injection)
+}
+
+/// Build the D1 context-recovery footer (Kimi `renderContextRecoveryPointer`/
+/// `context-recovery-footer.md`): a permanent pointer from the compacted
+/// transcript to the append-only runtime-trace journal on disk, so the model
+/// (or a human reading the transcript) can recover exact wording, command
+/// output, and file contents instead of guessing from the narrative summary.
+///
+/// Unlike the Kimi original this cannot cite exact journal line ranges:
+/// zeroclaw keeps three separate states (the live history, the persisted
+/// session rows, the trace journal) and never records which journal lines
+/// back a given transcript message. The footer therefore anchors navigation
+/// on the markers that DO exist — `trigger=<seam>`, `turn_id=<id>`, and the
+/// compaction timestamp — and says so honestly.
+fn context_recovery_footer(span: &CompactionSpan, ctx: &RecoveryFooterCtx<'_>) -> ChatMessage {
+    let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let span_messages = span.range.len();
+    let span_tokens = span.span_tokens;
+    let trigger = ctx.trigger;
+    let turn_line = match ctx.turn_id {
+        Some(turn_id) => format!(
+            "Grep the journal for \"trigger={trigger}\" and \"trace_id={turn_id}\"; the \
+             matching trace record is this compaction and the turn's events surround it."
+        ),
+        None => format!(
+            "Grep the journal for \"trigger={trigger}\"; the matching trace record is \
+             this compaction and the turn's events surround it."
+        ),
+    };
+    let journal_block = match ctx.journal_path.as_ref() {
+        Some(path) => format!(
+            "Everything removed above is still on disk in the append-only \
+             runtime trace journal:\n  {}",
+            path.display()
+        ),
+        None => "Recovery from disk is unavailable: runtime trace persistence \
+                  is disabled, so the exact removed text was not kept."
+            .to_string(),
+    };
+    let text = format!(
+        "{CONTEXT_RECOVERY_PREFIX} {span_messages} message(s), ~{span_tokens} est. tokens \
+         condensed at {timestamp}; trigger={trigger}]\n\
+         {journal_block}\n\
+         To recover exact wording, command output, or file contents instead of \
+         guessing from the summary:\n\
+         - {turn_line} Records are one long JSON line each — read them one at \
+         a time, never as a range.\n\
+         - The condensed span: {span_messages} message(s), ~{span_tokens} est. \
+         tokens, at {timestamp} (trigger={trigger}).\n\
+         - Caveat: per-message line ranges are not tracked (live history, \
+         persisted session, and journal are separate states); navigate by \
+         turn id, timestamp, and the trace record, not line numbers."
+    );
+    ChatMessage::user(text).with_origin(zeroclaw_api::model_provider::MessageOrigin::Injection)
 }
 
 /// D3 head+tail selection over the span's verbatim-keepable user rows
@@ -230,6 +322,14 @@ pub(crate) fn select_compaction_span(
     let mut summary_input = Vec::new();
     let mut verbatim_users = Vec::new();
     for msg in &history[range.clone()] {
+        if is_context_recovery_footer(msg) {
+            // D1: a recovery footer from an earlier compaction is a
+            // navigation breadcrumb, not agent work: it must never feed the
+            // summarizer. It is also not kept verbatim — the fresh footer
+            // spliced after this compaction's summary supersedes it (both
+            // point at the same append-only journal).
+            continue;
+        }
         if is_verbatim_keepable_user(msg) {
             verbatim_users.push(msg.clone());
         } else {
@@ -319,6 +419,11 @@ pub(crate) struct CompactionOutcome {
     pub(crate) kept_users: Vec<ChatMessage>,
     /// The synthetic summary message now in the transcript.
     pub(crate) summary: Option<ChatMessage>,
+    /// The D1 context-recovery footer spliced right after `summary`
+    /// (`None` on breadcrumb fallback).
+    pub(crate) recovery_footer: Option<ChatMessage>,
+    /// Bytes of the serialized recovery footer (trace payload, FR9/D1).
+    pub(crate) recovery_footer_bytes: usize,
     /// Tokens of the accepted summary (reported, else estimated).
     pub(crate) summary_tokens: usize,
     /// `provider/model` label used for the summary call (event payload).
@@ -344,6 +449,8 @@ impl CompactionOutcome {
             elided_user_messages: 0,
             kept_users: Vec::new(),
             summary: None,
+            recovery_footer: None,
+            recovery_footer_bytes: 0,
             summary_tokens: 0,
             provider,
             fell_back: true,
@@ -372,29 +479,43 @@ pub(crate) fn event_info(
 
 /// Structured trace record for one compaction event (FR9). Emitted on every
 /// successful summary replacement; `trigger` names the trim seam
-/// ("pre_dispatch" | "reported_budget" | "overflow_recovery").
-pub(crate) fn record_compaction_trace(outcome: &CompactionOutcome, trigger: &str) {
+/// ("pre_dispatch" | "reported_budget" | "overflow_recovery"). The
+/// `turn_id` (when known) is recorded as `trace_id` so the D1 recovery
+/// footer's own grep instructions ("grep for trigger=… and trace_id=…")
+/// actually land on this record.
+pub(crate) fn record_compaction_trace(
+    outcome: &CompactionOutcome,
+    trigger: &str,
+    turn_id: Option<&str>,
+) {
     let mode = match outcome.mode {
         CompactionMode::Summary => "summary",
         CompactionMode::Breadcrumb => "breadcrumb",
     };
+    let mut attrs = ::serde_json::json!({
+        "trigger": trigger,
+        "mode": mode,
+        "span_messages": outcome.span_messages,
+        "span_tokens": outcome.span_tokens,
+        "summary_tokens": outcome.summary_tokens,
+        "kept_user_messages": outcome.kept_user_messages,
+        "elided_user_messages": outcome.elided_user_messages,
+        "recovery_footer_bytes": outcome.recovery_footer_bytes,
+        "provider": outcome.provider,
+        "fell_back": outcome.fell_back,
+        "cost_scope": COST_SCOPE,
+    });
+    if let Some(turn_id) = turn_id
+        && let Some(obj) = attrs.as_object_mut()
+    {
+        obj.insert("trace_id".to_string(), ::serde_json::json!(turn_id));
+    }
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
             .with_category(::zeroclaw_log::EventCategory::Agent)
             .with_outcome(::zeroclaw_log::EventOutcome::Success)
-            .with_attrs(::serde_json::json!({
-                "trigger": trigger,
-                "mode": mode,
-                "span_messages": outcome.span_messages,
-                "span_tokens": outcome.span_tokens,
-                "summary_tokens": outcome.summary_tokens,
-                "kept_user_messages": outcome.kept_user_messages,
-                "elided_user_messages": outcome.elided_user_messages,
-                "provider": outcome.provider,
-                "fell_back": outcome.fell_back,
-                "cost_scope": COST_SCOPE,
-            })),
+            .with_attrs(attrs),
         "Context compaction: history span replaced by narrative summary"
     );
 }
@@ -407,6 +528,15 @@ pub(crate) fn record_compaction_trace(outcome: &CompactionOutcome, trigger: &str
 /// is left untouched and `None` is returned so the caller runs its existing
 /// breadcrumb trim — the turn never fails because of compaction (I4).
 ///
+/// On success the splice is: summary, D1 context-recovery footer, then the
+/// verbatim-kept user rows. The footer is permanent for the life of this
+/// compaction round (a later compaction that covers it drops it as
+/// superseded, never summarizes it — see `is_context_recovery_footer`). The
+/// Breadcrumb mode carries no footer by design: that path is the
+/// byte-identical legacy trim for when the feature is off, skipped, or the
+/// summarizer failed, and it emits no compaction trace record for the
+/// footer's grep instructions to land on.
+///
 /// `span_len` must be the number of body rows the caller's own trim would
 /// drop, so compaction removes exactly what the breadcrumb would have removed.
 pub(crate) async fn compact_history(
@@ -417,6 +547,7 @@ pub(crate) async fn compact_history(
     summarizer: &dyn ModelProvider,
     summarizer_provider: &str,
     summarizer_model: &str,
+    recovery: &RecoveryFooterCtx<'_>,
 ) -> Option<CompactionOutcome> {
     if !cfg.enabled {
         return None;
@@ -495,11 +626,18 @@ pub(crate) async fn compact_history(
         span.summary_input.len()
     ))
     .with_origin(zeroclaw_api::model_provider::MessageOrigin::CompactionSummary);
+    // D1: permanent recovery pointer to the on-disk journal, spliced right
+    // after the summary so the model reads it as one unit with the
+    // condensation it explains.
+    let footer = context_recovery_footer(&span, recovery);
+    let recovery_footer_bytes = footer.content.len();
     let kept_user_messages = span.kept_users.len() - usize::from(span.elided_user_messages > 0);
     let kept_users = span.kept_users.clone();
     history.splice(
         span.range.clone(),
-        std::iter::once(summary.clone()).chain(span.kept_users),
+        std::iter::once(summary.clone())
+            .chain(std::iter::once(footer.clone()))
+            .chain(span.kept_users),
     );
     Some(CompactionOutcome {
         mode: CompactionMode::Summary,
@@ -509,6 +647,8 @@ pub(crate) async fn compact_history(
         elided_user_messages: span.elided_user_messages,
         kept_users,
         summary: Some(summary),
+        recovery_footer: Some(footer),
+        recovery_footer_bytes,
         summary_tokens,
         provider,
         fell_back: false,
@@ -634,6 +774,7 @@ impl CompactionPlanner {
     pub(crate) async fn maybe_compact(
         &self,
         trigger: &str,
+        turn_id: Option<&str>,
         history: &mut Vec<ChatMessage>,
         crumb_present: bool,
         span_len: usize,
@@ -672,6 +813,15 @@ impl CompactionPlanner {
                 model.as_deref().unwrap_or(turn_model),
             ),
         };
+        // D1: the recovery footer points at the runtime-trace journal — the
+        // live writer's resolved path (never a hardcoded home directory), or
+        // `None` when persistence is disabled, in which case the footer says
+        // recovery is unavailable.
+        let recovery = RecoveryFooterCtx {
+            journal_path: ::zeroclaw_log::runtime_trace_path(),
+            turn_id,
+            trigger,
+        };
         let outcome = compact_history(
             history,
             crumb_present,
@@ -680,10 +830,11 @@ impl CompactionPlanner {
             provider,
             provider_name,
             model,
+            &recovery,
         )
         .await;
         if let Some(done) = outcome.as_ref() {
-            record_compaction_trace(done, trigger);
+            record_compaction_trace(done, trigger, turn_id);
         }
         outcome
     }
@@ -736,6 +887,19 @@ mod tests {
             trigger_tokens: 0,
             summary_max_output_tokens: 500,
             ..ContextCompressionConfig::default()
+        }
+    }
+
+    /// D1 footer inputs for direct `compact_history` tests: an injected
+    /// journal path (never the process-global writer state) plus stable
+    /// turn/trigger markers the assertions can look for.
+    fn test_recovery_ctx() -> RecoveryFooterCtx<'static> {
+        RecoveryFooterCtx {
+            journal_path: Some(std::path::PathBuf::from(
+                "/tmp/zc-test/state/runtime-trace.jsonl",
+            )),
+            turn_id: Some("turn-test"),
+            trigger: "pre_dispatch",
         }
     }
 
@@ -922,6 +1086,7 @@ mod tests {
             &mock,
             "custom.default",
             "m-main",
+            &test_recovery_ctx(),
         )
         .await
         .expect("compaction succeeds");
@@ -934,8 +1099,9 @@ mod tests {
         assert_eq!(outcome.summary_tokens, 120);
         assert_eq!(outcome.provider, "custom.default/m-main");
 
-        // Span replaced by ONE summary message + the two kept user rows.
-        assert_eq!(history.len(), before_len - 6 + 1 + 2);
+        // Span replaced by ONE summary message + ONE recovery footer + the
+        // two kept user rows.
+        assert_eq!(history.len(), before_len - 6 + 1 + 1 + 2);
         let summary_pos = history
             .iter()
             .position(is_compaction_summary)
@@ -945,10 +1111,20 @@ mod tests {
             is_compaction_summary(summary),
             "summary is structurally marked: {summary:?}"
         );
+        // The D1 recovery footer sits immediately after the summary.
+        let footer = &history[summary_pos + 1];
+        assert!(
+            is_context_recovery_footer(footer),
+            "footer right after summary: {footer:?}"
+        );
+        assert_eq!(
+            footer.origin,
+            Some(zeroclaw_api::model_provider::MessageOrigin::Injection)
+        );
         // The exempt user messages survive verbatim, in original order, right
-        // after the summary.
-        assert_message_eq(&history[summary_pos + 1], &user("turn one request"));
-        assert_message_eq(&history[summary_pos + 2], &user("turn two request"));
+        // after the footer.
+        assert_message_eq(&history[summary_pos + 2], &user("turn one request"));
+        assert_message_eq(&history[summary_pos + 3], &user("turn two request"));
         // The retained newest turn is untouched.
         assert_message_eq(history.last().expect("nonempty"), &asst("current answer"));
         // The system prefix survived untouched (I1).
@@ -989,6 +1165,7 @@ mod tests {
             &mock,
             "custom.default",
             "m-main",
+            &test_recovery_ctx(),
         )
         .await;
         assert!(outcome.is_none(), "summarizer failure must fall back (I4)");
@@ -1017,6 +1194,7 @@ mod tests {
             &mock,
             "custom.default",
             "m-main",
+            &test_recovery_ctx(),
         )
         .await;
         assert!(
@@ -1039,6 +1217,7 @@ mod tests {
             &mock,
             "custom.default",
             "m-main",
+            &test_recovery_ctx(),
         )
         .await;
         assert!(outcome.is_none());
@@ -1063,6 +1242,7 @@ mod tests {
             &mock,
             "custom.default",
             "m-main",
+            &test_recovery_ctx(),
         )
         .await
         .expect("compaction succeeds");
@@ -1091,6 +1271,7 @@ mod tests {
             &mock,
             "custom.default",
             "m-main",
+            &test_recovery_ctx(),
         )
         .await
         .expect("first compaction succeeds");
@@ -1109,6 +1290,7 @@ mod tests {
             &mock2,
             "custom.default",
             "m-main",
+            &test_recovery_ctx(),
         )
         .await
         .expect("second compaction succeeds");
@@ -1116,6 +1298,180 @@ mod tests {
         assert_eq!(
             summaries, 1,
             "the old summary row must fold into the new one, not stack"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_history_splices_recovery_footer_with_journal_pointer() {
+        let mut history = long_history();
+        let mock =
+            MockSummarizer::text("I have scanned the repository and established the layout.");
+        let outcome = compact_history(
+            &mut history,
+            false,
+            6,
+            &enabled_config(),
+            &mock,
+            "custom.default",
+            "m-main",
+            &test_recovery_ctx(),
+        )
+        .await
+        .expect("compaction succeeds");
+
+        let footer = outcome
+            .recovery_footer
+            .as_ref()
+            .expect("outcome carries the footer");
+        assert_eq!(
+            footer.origin,
+            Some(zeroclaw_api::model_provider::MessageOrigin::Injection),
+            "footer is origin-marked injection, never genuine user input"
+        );
+        assert!(
+            footer.content.starts_with(CONTEXT_RECOVERY_PREFIX),
+            "footer carries the structural marker prefix: {footer:?}"
+        );
+        assert!(
+            footer
+                .content
+                .contains("/tmp/zc-test/state/runtime-trace.jsonl"),
+            "footer must cite the real journal path: {footer:?}"
+        );
+        assert!(
+            footer.content.contains("6 message(s)"),
+            "footer must state the condensed span size: {footer:?}"
+        );
+        assert!(
+            footer.content.contains("trigger=pre_dispatch"),
+            "footer must state the trigger seam: {footer:?}"
+        );
+        assert!(
+            footer.content.contains("trace_id=turn-test"),
+            "footer must carry the turn id for journal navigation: {footer:?}"
+        );
+        assert!(
+            footer.content.len() <= 1_000,
+            "footer must stay compact, got {} chars",
+            footer.content.len()
+        );
+        assert_eq!(
+            outcome.recovery_footer_bytes,
+            footer.content.len(),
+            "trace payload reports the footer size"
+        );
+
+        // Transcript layout: summary immediately followed by the footer.
+        let summary_pos = history
+            .iter()
+            .position(is_compaction_summary)
+            .expect("summary marker present");
+        assert!(
+            is_context_recovery_footer(&history[summary_pos + 1]),
+            "footer sits right after the summary: {:?}",
+            history[summary_pos + 1]
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_footer_never_reaches_later_summary_input() {
+        let mut history = long_history();
+        let mock = MockSummarizer::text("first summary");
+        compact_history(
+            &mut history,
+            false,
+            4,
+            &enabled_config(),
+            &mock,
+            "custom.default",
+            "m-main",
+            &test_recovery_ctx(),
+        )
+        .await
+        .expect("first compaction succeeds");
+        assert_eq!(
+            history
+                .iter()
+                .filter(|m| is_context_recovery_footer(m))
+                .count(),
+            1,
+            "first compaction leaves exactly one footer"
+        );
+
+        // Second trim covers the first summary AND its footer.
+        let span_len = history.len() - 2;
+        let mock2 = MockSummarizer::text("second summary");
+        let outcome2 = compact_history(
+            &mut history,
+            false,
+            span_len,
+            &enabled_config(),
+            &mock2,
+            "custom.default",
+            "m-main",
+            &test_recovery_ctx(),
+        )
+        .await
+        .expect("second compaction succeeds");
+
+        // D1 protection: the old footer is superseded, not summarized.
+        let seen = mock2.seen_messages();
+        assert!(
+            seen.iter()
+                .all(|m| !m.content.contains(CONTEXT_RECOVERY_PREFIX)),
+            "a recovery footer must never feed a later summarizer: {seen:?}"
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|m| is_context_recovery_footer(m))
+                .count(),
+            1,
+            "the superseded footer is replaced by the fresh one, not stacked"
+        );
+        let summary_pos = history
+            .iter()
+            .position(is_compaction_summary)
+            .expect("second summary present");
+        assert!(
+            is_context_recovery_footer(&history[summary_pos + 1]),
+            "fresh footer sits after the second summary: {:?}",
+            history[summary_pos + 1]
+        );
+        assert!(
+            outcome2.recovery_footer.is_some(),
+            "the second compaction splices its own footer"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_footer_without_journal_path_states_unavailability() {
+        let mut history = long_history();
+        let mock = MockSummarizer::text("I have done the earlier work.");
+        let ctx = RecoveryFooterCtx {
+            journal_path: None,
+            turn_id: None,
+            trigger: "reported_budget",
+        };
+        compact_history(
+            &mut history,
+            false,
+            6,
+            &enabled_config(),
+            &mock,
+            "custom.default",
+            "m-main",
+            &ctx,
+        )
+        .await
+        .expect("compaction succeeds");
+        let footer = history
+            .iter()
+            .find(|m| is_context_recovery_footer(m))
+            .expect("footer present");
+        assert!(
+            footer.content.contains("persistence is disabled"),
+            "footer must honestly state disk recovery is unavailable: {footer:?}"
         );
     }
 
@@ -1273,6 +1629,7 @@ mod tests {
             &mock,
             "custom.default",
             "m-main",
+            &test_recovery_ctx(),
         )
         .await
         .expect("compaction succeeds");
@@ -1290,15 +1647,16 @@ mod tests {
             "no user row may reach the summarizer: {seen:?}"
         );
 
-        // Transcript: system, summary, verbatim head, elision note, tail.
+        // Transcript: system, summary, recovery footer, verbatim head,
+        // elision note, tail.
         let summary_pos = history
             .iter()
             .position(is_compaction_summary)
             .expect("summary marker present");
         assert_eq!(
             history.len(),
-            before_len - 31 + 1 + outcome.kept_user_messages + 1,
-            "span replaced by summary + verbatim users + one elision note"
+            before_len - 31 + 1 + 1 + outcome.kept_user_messages + 1,
+            "span replaced by summary + recovery footer + verbatim users + one elision note"
         );
         let note_pos = history
             .iter()
@@ -1313,8 +1671,9 @@ mod tests {
             "elision note: {history:?}"
         );
         // Verbatim head: the OLDEST user rows survive right after the
-        // summary (D3 protects the original task statement)…
-        assert_message_eq(&history[summary_pos + 1], &user(&format!("user 00 {big}")));
+        // summary and its recovery footer (D3 protects the original task
+        // statement)…
+        assert_message_eq(&history[summary_pos + 2], &user(&format!("user 00 {big}")));
         // …and the NEWEST user row is the last kept row of the splice.
         assert_message_eq(
             history.last().expect("tail row survives"),
@@ -1433,6 +1792,7 @@ mod tests {
                 &mock,
                 "custom.default",
                 "m-main",
+                &test_recovery_ctx(),
             ))
             .expect("compaction succeeds");
         let info = event_info(&outcome);

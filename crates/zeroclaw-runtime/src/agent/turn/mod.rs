@@ -1137,6 +1137,7 @@ async fn surface_oversized_dispatch_if_needed(
     turn_provider: &dyn ModelProvider,
     turn_provider_name: &str,
     turn_model: &str,
+    turn_id: &str,
 ) -> PreDispatchTrimResult {
     let before = retention_layout(history, *crumb_present);
     let outcome;
@@ -1152,6 +1153,7 @@ async fn surface_oversized_dispatch_if_needed(
             compaction_outcome = compaction
                 .maybe_compact(
                     "pre_dispatch",
+                    Some(turn_id),
                     history,
                     *crumb_present,
                     span_len,
@@ -1168,6 +1170,9 @@ async fn surface_oversized_dispatch_if_needed(
             dropped_messages = span_len;
             if let Some(summary) = done.summary.clone() {
                 inserted_rows.push(summary);
+            }
+            if let Some(footer) = done.recovery_footer.clone() {
+                inserted_rows.push(footer);
             }
             inserted_rows.extend(done.kept_users.iter().cloned());
             outcome = PreDispatchOutcome::Trimmed;
@@ -1317,6 +1322,7 @@ async fn enforce_reported_budget(
         let outcome = compaction
             .maybe_compact(
                 "reported_budget",
+                Some(turn_id),
                 &mut taken,
                 taken_had_crumb,
                 probe.dropped_messages,
@@ -2510,6 +2516,7 @@ async fn run_tool_call_loop_impl<'a>(
             active_model_provider,
             active_model_provider_name,
             provider_request_model,
+            turn_id,
         )
         .await;
         *history_has_trim_breadcrumb = turn_state.crumb_present;
@@ -2653,6 +2660,7 @@ async fn run_tool_call_loop_impl<'a>(
                     active_model_provider,
                     active_model_provider_name,
                     provider_request_model,
+                    turn_id,
                 )
                 .await;
                 *history_has_trim_breadcrumb = turn_state.crumb_present;
@@ -6422,6 +6430,7 @@ mod trim_budget_tests {
             &DisabledRouteProvider,
             "test-provider",
             "test-model",
+            "turn-test",
         )
         .await;
         assert_eq!(result.outcome, PreDispatchOutcome::Trimmed);
@@ -6440,6 +6449,7 @@ mod trim_budget_tests {
             &DisabledRouteProvider,
             "test-provider",
             "test-model",
+            "turn-test",
         )
         .await;
         assert_eq!(floor.outcome, PreDispatchOutcome::Floor);
@@ -6572,6 +6582,7 @@ mod active_route_context_tests {
             &DisabledRouteProvider,
             "test-provider",
             "test-model",
+            "turn-test",
         )
         .await;
         assert!(

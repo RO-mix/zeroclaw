@@ -135,6 +135,7 @@ pub(crate) async fn try_recover_context_overflow(
             let outcome = compaction
                 .maybe_compact(
                     "overflow_recovery",
+                    Some(turn_id),
                     &mut owned,
                     *crumb_present,
                     probe.dropped_messages,

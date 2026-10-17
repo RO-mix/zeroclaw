@@ -262,6 +262,9 @@ pub(crate) async fn finish_after_max_iterations(
                     model_provider,
                     provider_name,
                     model,
+                    // Inert at this seam: the planner above is disabled, so
+                    // the id never reaches a footer or trace record.
+                    "max-iteration",
                 )
                 .await;
                 dropped_messages += trim.dropped_messages;
