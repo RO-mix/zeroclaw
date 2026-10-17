@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<export xmlns="http://eu.europa.eu/fscp"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        date="2026-10-15" generationDate="2026-10-15T08:30:00">
+  <sanctionEntity euReferenceNumber="EU-1" logicalId="1">
+    <nameAlias wholeName="IVAN PETROV" firstName="IVAN" lastName="PETROV"
+               phonetic="IVAN PETROV"/>
+    <nameAlias wholeName="VANYA PETROV" firstName="VANYA" lastName="PETROV"/>
+  </sanctionEntity>
+  <sanctionEntity euReferenceNumber="EU-2" logicalId="2">
+    <nameAlias wholeName="ZAO ZAKAT" firstName="" lastName="ZAKAT"
+               phonetic="ZAKAT"/>
+  </sanctionEntity>
+</export>

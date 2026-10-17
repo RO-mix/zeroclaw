@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <NdsResponse2 xmlns="http://ws.unisoft/" DT="2026-10-17T12:00:00.000+03:00">
+      <NDSRecords>
+        <NDSRecord>
+          <INN>7708004767</INN>
+          <KPP>770801001</KPP>
+          <Date>2026-10-17</Date>
+          <State>0</State>
+        </NDSRecord>
+        <NDSRecord>
+          <INN>7707001234</INN>
+          <KPP>770701001</KPP>
+          <Date>2026-10-17</Date>
+          <State>2</State>
+        </NDSRecord>
+        <NDSRecord>
+          <INN>7707009999</INN>
+          <KPP>770709999</KPP>
+          <Date>2026-10-17</Date>
+          <State>5</State>
+        </NDSRecord>
+      </NDSRecords>
+    </NdsResponse2>
+  </soap:Body>
+</soap:Envelope>

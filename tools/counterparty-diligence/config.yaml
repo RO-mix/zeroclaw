@@ -1,0 +1,36 @@
+# counterparty-diligence M1 configuration.
+# Weights, thresholds, throttling and TTLs live here, not in code (PRD FR5).
+
+scoring:
+  model_version: "v1"
+  red_weight: -25        # mass address/director, npchk != 0, sanctions match, ...
+  yellow_weight: -10
+  plus_weight: 5
+  plus_cap: 15           # positive contributions never exceed +15 total
+  thresholds:
+    green: 70            # score >= 70
+    yellow: 40           # 40..69 yellow, < 40 red
+
+throttling:
+  egrul_min_interval_seconds: 30
+  pb_min_interval_seconds: 5
+  npchk_min_interval_seconds: 5
+  sanctions_min_interval_seconds: 5
+  http_timeout_seconds: 30
+
+cache:
+  facts_ttl_hours: 24
+  db_path: "data/dd-cache.sqlite"
+
+sanctions_lists:
+  ofac_sdn:
+    url: "https://sanctionslistservice.ofac.treas.gov/api/download/sdn.xml"
+  eu_fsd:
+    url: "https://webgate.ec.europa.eu/fsd/fsf/public/files/xmlFullSanctionsList_1_1/content"
+  uk_oftsi:
+    # gov.uk republishes the list under a dated media path; keep it configurable.
+    url: "https://assets.publishing.service.gov.uk/media/66a2587fe354f5a5c35c6766/UK_Sanctions_List.xml"
+
+http:
+  # Respect or bypass ambient proxy env vars (PRD NFR "Сеть").
+  trust_env: false

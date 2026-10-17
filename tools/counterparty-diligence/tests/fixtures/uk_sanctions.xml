@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<UKSanctionsList xmlns="http://www.example.org/uk_sanctions_list"
+                 Version="2026-10-10" GeneratedAt="2026-10-10T00:00:00Z">
+  <Designations>
+    <Designation Id="UK-1">
+      <Names>
+        <Name Name="SERGEY SMIRNOV" NameType="Primary Name"/>
+        <Alias Name="S SMIRNOV" NameType="Alias"/>
+      </Names>
+    </Designation>
+  </Designations>
+</UKSanctionsList>
