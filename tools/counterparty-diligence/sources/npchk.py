@@ -105,7 +105,16 @@ class NpchkClient:
         interval = float(config.get("throttling", {}).get(
             "npchk_min_interval_seconds", 5))
         self._limiter = RateLimiter(interval)
-        self._session = session or make_session(config)
+        # TLS to npchk is fragile on intercepted/RU-CA hosts: bypass ambient
+        # proxy env by default and keep SSL verification configurable, but
+        # NEVER disabled silently (config defaults preserve both).
+        npchk_cfg = config.get("npchk", {})
+        self._verify_ssl = bool(npchk_cfg.get("verify_ssl", True))
+        if session is None:
+            session = make_session(config)
+            if npchk_cfg.get("direct_no_proxy", True):
+                session.trust_env = False
+        self._session = session
 
     def query(self, requests_: list[dict],
               request_date: Optional[str] = None) -> list[dict]:
@@ -119,6 +128,7 @@ class NpchkClient:
                 "SOAPAction": SOAP_ACTION,
             },
             timeout=http_timeout(self.config),
+            verify=self._verify_ssl,
         )
         resp.raise_for_status()
         return parse_response(resp.text)

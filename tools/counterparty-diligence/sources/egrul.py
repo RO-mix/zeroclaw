@@ -4,10 +4,20 @@ Flow: POST https://egrul.nalog.ru/ (form query=..., region=) -> {"t": token}
 -> GET https://egrul.nalog.ru/search-result/{token} -> JSON rows of requisites.
 Optional PDF extract: GET /vyp-download/{token} (kept out of M1 scope; the
 adapter only returns the URL).
+
+Row schema verified live on 2026-10-17 (INN 7736207543). The API serves
+cp1251 JSON without a charset header. Single-letter row keys:
+  i  = INN, p = KPP, o = OGRN (13 digits), r = registration date (DD.MM.YYYY)
+  n  = full name, c = short name (e.g. ООО "Яндекс")
+  s  = status code ("1" active, "2" liquidated; absent on some rows)
+  e  = address, g = GRN (when present in the result set)
+  rn = region, k = entity kind ("ul" = legal entity, "fl" = individual)
+  pg/cnt/tot = paging counters, t = per-row token (used by /vyp-download)
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any, Optional
 
 from .base import Fact, RateLimiter, http_timeout, make_session, utc_now_iso
@@ -15,21 +25,29 @@ from .base import Fact, RateLimiter, http_timeout, make_session, utc_now_iso
 BASE_URL = "https://egrul.nalog.ru"
 SOURCE_NAME = "egrul"
 
-# EGRUL search-result row keys are single-letter; map the stable ones.
 _ROW_KEY_MAP = {
-    "g": "ogrn",
     "i": "inn",
     "p": "kpp",
+    "o": "ogrn",
     "n": "name",
-    "c": "address",
-    "r": "management",      # e.g. "Генеральный директор ИВАНОВ И.И."
-    "e": "okved",
-    "k": "okpo",
-    "pg": "registration_date",
-    "cnt": "row_count",
-    "o": "entity_type",
-    "s": "status",          # present on some results; often absent
+    "c": "short_name",
+    "r": "registration_date",
+    "e": "address",
+    "g": "grn",
+    "s": "status",
+    "rn": "region",
+    "k": "entity_kind",
 }
+
+_STATUS_LABELS = {"1": "Действует", "2": "Ликвидировано"}
+
+
+def decode_body(resp: Any) -> str:
+    """FNS serves cp1251 without charset; try utf-8 first, fall back."""
+    try:
+        return resp.content.decode("utf-8")
+    except UnicodeDecodeError:
+        return resp.content.decode("cp1251")
 
 
 def parse_search_result(payload: dict) -> list[dict]:
@@ -37,11 +55,16 @@ def parse_search_result(payload: dict) -> list[dict]:
     rows = payload.get("rows") or []
     companies = []
     for row in rows:
-        company = {dst: row.get(src) for src, dst in _ROW_KEY_MAP.items() if src in row}
+        company = {dst: row.get(src) for src, dst in _ROW_KEY_MAP.items()
+                   if src in row}
+        company["token"] = row.get("t")
         company["raw"] = row
-        if company.get("registration_date"):
-            # EGRUL returns "YYYY-MM-DD HH:MM:SS"; keep the date part.
-            company["registration_date"] = str(company["registration_date"])[:10]
+        reg = company.get("registration_date")
+        if isinstance(reg, str) and " " in reg:
+            company["registration_date"] = reg.split(" ")[0]
+        status = company.get("status")
+        if status is not None:
+            company["status"] = _STATUS_LABELS.get(str(status), str(status))
         companies.append(company)
     return companies
 
@@ -51,8 +74,8 @@ def company_facts(company: dict, retrieved_at: Optional[str] = None) -> list[Fac
     retrieved_at = retrieved_at or utc_now_iso()
     url = f"{BASE_URL}/"
     facts = []
-    for field in ("ogrn", "inn", "kpp", "name", "address", "management",
-                  "okved", "registration_date", "status"):
+    for field in ("name", "short_name", "inn", "kpp", "ogrn", "address",
+                  "management", "okved", "registration_date", "status"):
         value = company.get(field)
         if value not in (None, ""):
             facts.append(Fact(field=field, value=value, source=SOURCE_NAME,
@@ -77,7 +100,7 @@ class EgrulClient:
             timeout=http_timeout(self.config),
         )
         resp.raise_for_status()
-        token = resp.json().get("t")
+        token = json.loads(decode_body(resp)).get("t")
         if not token:
             raise ValueError("egrul search returned no token")
         return token
@@ -92,7 +115,7 @@ class EgrulClient:
             )
             resp.raise_for_status()
             try:
-                payload = resp.json()
+                payload = json.loads(decode_body(resp))
             except ValueError:
                 payload = {}
             if payload:

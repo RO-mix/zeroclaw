@@ -34,3 +34,12 @@ sanctions_lists:
 http:
   # Respect or bypass ambient proxy env vars (PRD NFR "Сеть").
   trust_env: false
+
+npchk:
+  # npchk.nalog.ru TLS often fails behind intercepting proxies / on hosts
+  # without the Russian CA chain in the trust store (verified live
+  # 2026-10-17: CERTIFICATE_VERIFY_FAILED with and without a proxy).
+  # direct_no_proxy: bypass HTTP(S)_PROXY env for npchk (default true).
+  # verify_ssl: never set false silently — disables TLS verification!
+  direct_no_proxy: true
+  verify_ssl: true

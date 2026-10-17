@@ -53,7 +53,8 @@ def test_query_with_fake_session_posts_soap():
     xml = (FIXTURES / "npchk_response.xml").read_text("utf-8")
 
     class FakeSession:
-        def post(self, url, data=None, headers=None, timeout=None):
+        def post(self, url, data=None, headers=None, timeout=None,
+                 verify=None):
             assert "npchk.nalog.ru" in url
             assert headers["SOAPAction"] == "NdsRequest2"
             assert b"<INN>7708004767</INN>" in data
@@ -65,3 +66,31 @@ def test_query_with_fake_session_posts_soap():
     client = NpchkClient(_config(), session=FakeSession())
     records = client.query([{"inn": "7708004767", "kpp": "770801001"}])
     assert records[0]["state"] == "0"
+
+
+def test_direct_no_proxy_disables_trust_env():
+    config = _config()
+    config["npchk"] = {"direct_no_proxy": True, "verify_ssl": True}
+    client = NpchkClient(config)
+    assert client._session.trust_env is False
+
+
+def test_verify_ssl_defaults_true_and_is_passed_to_post():
+    config = _config()
+    config["npchk"] = {"direct_no_proxy": True, "verify_ssl": False}
+    seen = {}
+
+    class FakeSession:
+        trust_env = True
+
+        def post(self, url, data=None, headers=None, timeout=None, verify=None):
+            seen["verify"] = verify
+            empty_ok = ('<?xml version="1.0"?>'
+                        '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"/>')
+            return type("R", (), {"raise_for_status": lambda s: None,
+                                  "text": empty_ok})()
+
+    client = NpchkClient(config, session=FakeSession())
+    assert client._verify_ssl is False
+    client.query([{"inn": "1", "kpp": ""}])
+    assert seen["verify"] is False

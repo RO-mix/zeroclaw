@@ -6,10 +6,16 @@ Flow mirrors EGRUL: POST https://pb.nalog.ru/search-proc.json
 
 Flags extracted per company: mass address, mass director, unreliable
 passport, tax debt ("задолженность").
+
+Known limitation (verified live 2026-10-17): pb.nalog.ru answers
+HTTP 500 "Внутренняя ошибка сервера" on search-proc.json even with full
+browser mechanics (JSESSIONID, headers, page params). Stop-list flags then
+degrade to "not checked" in the pipeline (PRD FR9).
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any, Optional
 
 from .base import Fact, RateLimiter, http_timeout, make_session, utc_now_iso
@@ -69,26 +75,84 @@ def flag_facts(flags: list[str], inn: Optional[str],
                  confidence="confirmed") for flag in flags]
 
 
+class PbUnavailableError(RuntimeError):
+    """pb.nalog.ru failed (HTTP 5xx / no token) with the decoded reason."""
+
+
+def _decode_body(resp: Any) -> str:
+    try:
+        return resp.content.decode("utf-8")
+    except UnicodeDecodeError:
+        return resp.content.decode("cp1251")
+
+
 class PbClient:
+    """Browser-mechanics client: prime cookies with GET /, then AJAX POST.
+
+    Known limitation (verified live 2026-10-17): search-proc.json currently
+    answers HTTP 500 "Внутренняя ошибка сервера" (encrypted DETAILS token)
+    even with cookies/headers replicated; PbUnavailableError carries the
+    exact server message so the pipeline degrades honestly.
+    """
+
+    _HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/129.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": f"{BASE_URL}/",
+    }
+
     def __init__(self, config: dict, session: Optional[Any] = None):
         self.config = config
         interval = float(config.get("throttling", {}).get(
             "pb_min_interval_seconds", 5))
         self._limiter = RateLimiter(interval)
         self._session = session or make_session(config)
+        self._session.headers.update(self._HEADERS)
+        self._primed = False
+
+    def _prime(self) -> None:
+        """Fetch the front page once per session to obtain JSESSIONID."""
+        if self._primed:
+            return
+        self._limiter.wait()
+        resp = self._session.get(f"{BASE_URL}/", timeout=http_timeout(self.config))
+        resp.raise_for_status()
+        self._primed = True
+
+    @staticmethod
+    def _check(resp: Any) -> dict:
+        """Raise PbUnavailableError with the decoded server reason on 5xx."""
+        if resp.status_code >= 500:
+            reason = ""
+            try:
+                body = json.loads(_decode_body(resp))
+                reason = body.get("ERROR") or body.get("DETAILS") or str(body)
+            except (ValueError, UnicodeDecodeError):
+                reason = _decode_body(resp)[:200]
+            raise PbUnavailableError(
+                f"pb.nalog.ru HTTP {resp.status_code}: {reason}")
+        resp.raise_for_status()
+        try:
+            return json.loads(_decode_body(resp))
+        except ValueError:
+            return {}
 
     def search_token(self, query: str, region: str = "") -> str:
         """POST search-proc.json (country-wide when region is empty)."""
+        self._prime()
         self._limiter.wait()
         resp = self._session.post(
             f"{BASE_URL}/search-proc.json",
-            data={"query": query, "mode": "search", "region": region},
+            data={"query": query, "mode": "search", "region": region,
+                  "page": "1", "pageSize": "10"},
             timeout=http_timeout(self.config),
         )
-        resp.raise_for_status()
-        token = resp.json().get("token")
+        token = self._check(resp).get("token")
         if not token:
-            raise ValueError("pb search returned no token")
+            raise PbUnavailableError("pb search returned no token")
         return token
 
     def get_result(self, token: str) -> dict:
@@ -98,8 +162,7 @@ class PbClient:
             params={"token": token},
             timeout=http_timeout(self.config),
         )
-        resp.raise_for_status()
-        return resp.json() or {}
+        return self._check(resp) or {}
 
     def search(self, query: str, region: str = "") -> list[dict]:
         token = self.search_token(query, region=region)
@@ -107,14 +170,14 @@ class PbClient:
 
     def company_card(self, card_id: str, card_hash: str) -> dict:
         """Fetch the full company card (company-proc.json)."""
+        self._prime()
         self._limiter.wait()
         resp = self._session.post(
             f"{BASE_URL}/company-proc.json",
             data={"id": card_id, "hash": card_hash},
             timeout=http_timeout(self.config),
         )
-        resp.raise_for_status()
-        return resp.json() or {}
+        return self._check(resp)
 
     def stoplist_flags(self, query: str) -> list[str]:
         flags: list[str] = []
