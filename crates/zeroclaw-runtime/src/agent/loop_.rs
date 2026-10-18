@@ -23692,4 +23692,791 @@ Pin 13: LED
             other => panic!("expected Line, got {other:?}"),
         }
     }
+
+    // ── P0 acceptance: long synthetic session with forced overflow ──────
+    //
+    // PORTING.md §«P0-приёмка»: one turn over a seeded multi-turn session,
+    // forced over the context budget mid-turn, proving narrative compaction
+    // with the D3 verbatim user keep does not make the model "wake up".
+    // The provider is scripted (XML tool calls, then a final answer that
+    // must reference the acceptance marker from the FIRST user message),
+    // the echo tool counts real executions, and the trace journal is
+    // initialized to a temp workspace so the D1 recovery footer points at a
+    // real path.
+
+    const P0_TOOL_STEPS: usize = 17;
+    const P0_TASK_STATEMENT: &str = "Задача: собери сводку по проекту X. Критерий \
+         приёмки: финальный ответ обязан содержать слово ГОТОВО.";
+    const P0_FINAL_ANSWER: &str = "Сводка по проекту X собрана из 17 замеров. Критерий \
+         приёмки выполнен: ГОТОВО.";
+
+    /// Fixture config: agent `alpha` on runtime profile `fast` with
+    /// `[context_compression]`; `trigger_tokens = 0` so every removable span
+    /// qualifies for a summary round. `max_context_tokens` IS the effective
+    /// dispatch budget: the loop resolves it from the agent's profile (the
+    /// `context_limits` argument only supplies the model window), so the
+    /// caller passes the scenario's budget here.
+    fn p0_config(
+        compaction_enabled: bool,
+        max_context_tokens: usize,
+    ) -> zeroclaw_config::schema::Config {
+        let compression = if compaction_enabled {
+            "[runtime_profiles.fast.context_compression]\nenabled = true\ntrigger_tokens = 0\nsummary_max_output_tokens = 500\n\n"
+        } else {
+            "[runtime_profiles.fast.context_compression]\nenabled = false\n\n"
+        };
+        let toml = format!(
+            "\
+            [providers.models.custom.default]\n\
+            api_key = \"k\"\n\
+            model = \"m-main\"\n\
+            uri = \"https://example.com/v1\"\n\
+            wire_api = \"chat_completions\"\n\
+            \n\
+            [risk_profiles.default]\n\
+            level = \"supervised\"\n\
+            \n\
+            [runtime_profiles.fast]\n\
+            max_context_tokens = {max_context_tokens}\n\
+            \n\
+            {compression}\
+            [agents.alpha]\n\
+            enabled = true\n\
+            model_provider = \"custom.default\"\n\
+            risk_profile = \"default\"\n\
+            runtime_profile = \"fast\"\n\
+            "
+        );
+        toml::from_str(&toml).expect("P0 fixture config parses")
+    }
+
+    /// Seeded session: the FIRST user message is the task statement with the
+    /// acceptance marker; two LARGE intermediate user messages hold prior
+    /// partial summaries; the current turn asks to finish. `a1` is very fat:
+    /// the one compaction round the scenario expects must remove enough
+    /// tokens that the post-compaction estimate drops below the budget —
+    /// otherwise the pre-dispatch gate keeps "folding" the synthetic summary
+    /// head (each fold nets +1 row) and the history grows without bound.
+    fn p0_seed_history() -> Vec<ChatMessage> {
+        let big = "x".repeat(30_000);
+        let intermediate_1 = format!("Промежуточная вводная 1 (часть сводки): {big} КОНЕЦ-1");
+        let intermediate_2 = format!("Промежуточная вводная 2 (часть сводки): {big} КОНЕЦ-2");
+        vec![
+            ChatMessage::system("P0 acceptance system prompt."),
+            ChatMessage::user(P0_TASK_STATEMENT),
+            ChatMessage::assistant(
+                format!(
+                    "Принято: свожу, маркер ГОТОВО зафиксирован. {}",
+                    "y".repeat(20_000)
+                )
+                .as_str(),
+            ),
+            ChatMessage::user(intermediate_1.as_str()),
+            ChatMessage::assistant("Часть 1 собрана."),
+            ChatMessage::user(intermediate_2.as_str()),
+            ChatMessage::assistant("Часть 2 собрана."),
+            ChatMessage::user("Продолжи сбор сводки и заверши."),
+        ]
+    }
+
+    /// Scripted P0 provider. Turn dispatches pop scripted XML tool calls and
+    /// finally the marker answer; every request is recorded so the test can
+    /// prove the final dispatch still carried the task statement. Summary
+    /// requests are recognized by the compaction call shape (the D4
+    /// `SUMMARY_SYSTEM_PROMPT` + the budget instruction built in
+    /// `compaction.rs`) and answered from `summary_result` instead of the
+    /// queue, failing when it is `Err` to exercise the I4 fallback. Usage
+    /// reports mirror the runtime's own population estimate, so the reported
+    /// budget seam sees a faithful ratio.
+    struct P0ScriptedProvider {
+        turn_responses: Mutex<VecDeque<ChatResponse>>,
+        dispatched: Mutex<Vec<Vec<ChatMessage>>>,
+        summary_requests: Mutex<Vec<Vec<ChatMessage>>>,
+        summary_result: Result<String, String>,
+        summary_calls: AtomicUsize,
+    }
+
+    impl P0ScriptedProvider {
+        fn new(summary_result: Result<String, String>) -> Self {
+            let mut turn_responses: VecDeque<ChatResponse> = (1..=P0_TOOL_STEPS)
+                .map(|step| ChatResponse {
+                    text: Some(
+                        "<tool_call>\n\
+                         {\"name\":\"echo_tool\",\"arguments\":{\"value\":\"step-STEP\"}}\n\
+                         </tool_call>"
+                            .replace("STEP", &step.to_string()),
+                    ),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+                .collect();
+            turn_responses.push_back(ChatResponse {
+                text: Some(P0_FINAL_ANSWER.to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            });
+            Self {
+                turn_responses: Mutex::new(turn_responses),
+                dispatched: Mutex::new(Vec::new()),
+                summary_requests: Mutex::new(Vec::new()),
+                summary_result,
+                summary_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn is_summary_request(request: &zeroclaw_providers::ChatRequest<'_>) -> bool {
+            request.messages.len() == 2
+                && request.messages[0].role == "system"
+                && request.messages[0]
+                    .content
+                    .starts_with("You are compacting an agent's conversation")
+                && request.messages[1].role == "user"
+                && request.messages[1]
+                    .content
+                    .starts_with("Token budget for the summary:")
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for P0ScriptedProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in P0 scripted provider tests");
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            if Self::is_summary_request(&request) {
+                self.summary_calls.fetch_add(1, Ordering::SeqCst);
+                self.summary_requests
+                    .lock()
+                    .expect("summary requests lock")
+                    .push(request.messages.to_vec());
+                let usage = Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(1_000),
+                    output_tokens: Some(120),
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                });
+                return match &self.summary_result {
+                    Ok(text) => Ok(ChatResponse {
+                        text: Some(text.clone()),
+                        tool_calls: Vec::new(),
+                        usage,
+                        reasoning_content: None,
+                    }),
+                    Err(error) => Err(anyhow::Error::msg(error.clone())),
+                };
+            }
+            self.dispatched
+                .lock()
+                .expect("dispatched lock")
+                .push(request.messages.to_vec());
+            let mut response = self
+                .turn_responses
+                .lock()
+                .expect("turn responses lock")
+                .pop_front()
+                .ok_or_else(|| anyhow::Error::msg("P0 scripted responses exhausted"))?;
+            // Faithful usage: mirror exactly what the runtime estimated for
+            // this population, so the reported-budget seam calibrates at
+            // ratio 1.0 and only genuinely-over-budget histories trim.
+            let estimated = estimate_history_tokens(request.messages)
+                + request
+                    .tools
+                    .map_or(0, crate::agent::history::estimate_tool_schema_tokens);
+            response.usage = Some(zeroclaw_providers::traits::TokenUsage {
+                input_tokens: Some(estimated as u64),
+                output_tokens: Some(40),
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
+            });
+            Ok(response)
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for P0ScriptedProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "P0ScriptedProvider"
+        }
+    }
+
+    /// Run the long P0 turn: scripted provider + echo tool over the seeded
+    /// history, one event channel, the given config (drives the compaction
+    /// planner via `alpha`), and the given dispatch budget.
+    async fn p0_run_session(
+        provider: &P0ScriptedProvider,
+        config: Option<&zeroclaw_config::schema::Config>,
+        context_token_budget: usize,
+        history: &mut Vec<ChatMessage>,
+        event_tx: Option<tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
+        turn_id: &str,
+    ) -> anyhow::Result<String> {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("echo_tool", Arc::clone(&invocations)),
+            )]);
+        let observer = NoopObserver;
+        run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            served_route_sink: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                security: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config,
+                max_tool_iterations: P0_TOOL_STEPS + 5,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_limits: test_context_limits(context_token_budget),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history,
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: Some("alpha"),
+            turn_id,
+        })
+        .await
+    }
+
+    /// History predicates shared by the P0 asserts.
+    fn p0_history_texts(history: &[ChatMessage]) -> Vec<&str> {
+        history
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn p0_summary_compaction_keeps_task_statement_in_long_tool_session() {
+        use crate::agent::turn::compaction::{
+            COMPACTION_SUMMARY_PREFIX, CONTEXT_RECOVERY_PREFIX, USER_MESSAGES_ELIDED_PREFIX,
+        };
+
+        // Capture pipeline and writer are process-global; serialize against
+        // the other log tests and restore a disabled writer afterwards.
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let trace_tmp = tempfile::tempdir().expect("P0 trace workspace");
+        zeroclaw_log::init_from_config(
+            &zeroclaw_log::LogConfig {
+                log_persistence: "full".into(),
+                ..Default::default()
+            },
+            trace_tmp.path(),
+        );
+        let _reset_writer = scopeguard::guard((), |_| {
+            zeroclaw_log::init_from_config(
+                &zeroclaw_log::LogConfig {
+                    log_persistence: "none".into(),
+                    ..Default::default()
+                },
+                trace_tmp.path(),
+            );
+        });
+
+        let mut history = p0_seed_history();
+        // Budget just below the seed estimate: the pre-dispatch gate must
+        // fire exactly once at iteration 0. The single compaction round
+        // removes the fat first assistant row (~5k est. tokens) and splices
+        // back ~350 tokens of summary + footer + kept task statement, so the
+        // post-compaction estimate lands ~2k below the seed — comfortably
+        // under this budget, and the 17 tool rounds add only ~1k more. The
+        // reported-budget seam then never fires and the gate never re-folds
+        // (each re-fold would net +1 synthetic row and grow the history).
+        // The budget lives in the runtime profile's `max_context_tokens`:
+        // the loop resolves the effective dispatch budget from there.
+        let context_token_budget = estimate_history_tokens(&history).saturating_sub(2_000);
+        let cfg = p0_config(true, context_token_budget);
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let provider = P0ScriptedProvider::new(Ok(
+            "Я собрал сводку по проекту X: части 1 и 2 готовы, осталось повторить 17 \
+             замеров и ответить с маркером ГОТОВО."
+                .to_string(),
+        ));
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
+
+        let result = match p0_run_session(
+            &provider,
+            Some(&cfg),
+            context_token_budget,
+            &mut history,
+            Some(event_tx),
+            &turn_id,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                let mut events = Vec::new();
+                while let Ok(event) = event_rx.try_recv() {
+                    events.push(event);
+                }
+                eprintln!(
+                    "P0 seed_est={} budget={} summary_calls={}",
+                    estimate_history_tokens(&p0_seed_history()),
+                    context_token_budget,
+                    provider.summary_calls.load(Ordering::SeqCst)
+                );
+                eprintln!("P0 turn error: {error:#}");
+                eprintln!("P0 events: {events:#?}");
+                eprintln!(
+                    "P0 final history: est={} len={} roles={:?}",
+                    estimate_history_tokens(&history),
+                    history.len(),
+                    history
+                        .iter()
+                        .map(|message| message.role.as_str())
+                        .collect::<Vec<_>>()
+                );
+                panic!("P0 turn must complete without error");
+            }
+        };
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+
+        // 1. The turn finished and the final answer references the
+        //    acceptance marker from the task statement ("не проснулся").
+        assert!(
+            result.contains("ГОТОВО"),
+            "final answer must reference the acceptance marker, got: {result}"
+        );
+
+        // 2. Compaction ran: exactly one summary round (the gate fired once)
+        //    and exactly one summary marker with the D3 origin…
+        assert_eq!(
+            provider.summary_calls.load(Ordering::SeqCst),
+            1,
+            "exactly one compaction round was expected (pre-dispatch gate, \
+             iteration 0)"
+        );
+        let summaries: Vec<&ChatMessage> = history
+            .iter()
+            .filter(|message| {
+                message.origin
+                    == Some(zeroclaw_api::model_provider::MessageOrigin::CompactionSummary)
+            })
+            .collect();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "exactly one compaction summary must survive the folds, got: {history:?}"
+        );
+        assert!(summaries[0].content.starts_with(COMPACTION_SUMMARY_PREFIX));
+
+        // 3. …the FIRST user message (task statement) survived verbatim
+        //    (D3 head keep), and so did both intermediate user messages: the
+        //    per-round spans never held enough user tokens to exceed the
+        //    D3 keep budget, so NO elision note was expected — record that.
+        let texts = p0_history_texts(&history);
+        assert!(
+            texts.contains(&P0_TASK_STATEMENT),
+            "task statement must survive compaction verbatim, got: {history:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.contains("КОНЕЦ-1")),
+            "intermediate user 1 must survive verbatim, got: {history:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.contains("КОНЕЦ-2")),
+            "intermediate user 2 must survive verbatim, got: {history:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.starts_with(USER_MESSAGES_ELIDED_PREFIX)),
+            "no elision note expected: span users fit the D3 keep budget (observed \
+             verbatim arm), got: {history:?}"
+        );
+
+        // 4. The D1 recovery footer is present and points at the real journal.
+        let journal_path = zeroclaw_log::runtime_trace_path()
+            .expect("P0 trace writer initialized")
+            .display()
+            .to_string();
+        let footers: Vec<&ChatMessage> = history
+            .iter()
+            .filter(|message| message.content.starts_with(CONTEXT_RECOVERY_PREFIX))
+            .collect();
+        assert_eq!(
+            footers.len(),
+            1,
+            "exactly one recovery footer must survive the folds, got: {history:?}"
+        );
+        assert!(
+            footers[0].content.contains(&journal_path),
+            "footer must name the trace journal path ({journal_path}), got: {}",
+            footers[0].content
+        );
+        assert!(
+            footers[0].content.contains("trigger="),
+            "footer must carry a trigger marker: {}",
+            footers[0].content
+        );
+
+        // 5. The model saw the compacted context AND the task statement in
+        //    the FINAL dispatch — the "stayed on task" evidence.
+        let dispatched = provider.dispatched.lock().expect("dispatched lock");
+        let last_request = dispatched
+            .last()
+            .expect("at least one turn dispatch must have been recorded");
+        let last_texts = p0_history_texts(last_request);
+        assert!(
+            last_texts.iter().any(|text| text.contains("ГОТОВО")),
+            "the final provider request must still carry the task statement"
+        );
+        assert!(
+            last_texts
+                .iter()
+                .any(|text| text.starts_with(COMPACTION_SUMMARY_PREFIX)),
+            "the final provider request must show the compaction summary marker"
+        );
+        drop(dispatched);
+
+        // 6. I2: verbatim-keepable user rows never entered the summarizer.
+        let summary_requests = provider.summary_requests.lock().expect("summary lock");
+        assert!(
+            summary_requests.iter().all(|request| {
+                !request[1].content.contains("Промежуточная вводная")
+                    && !request[1].content.contains(P0_TASK_STATEMENT)
+            }),
+            "user rows must stay out of the summary input (I2)"
+        );
+        drop(summary_requests);
+
+        // 7. Turn events: at least one HistoryTrimmed carries the summary
+        //    payload (mode=summary, the turn's own provider route).
+        let summary_events: Vec<&zeroclaw_api::agent::TurnEvent> = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                        compaction: Some(info),
+                        ..
+                    } if info.mode == "summary" && !info.fell_back
+                )
+            })
+            .collect();
+        assert!(
+            !summary_events.is_empty(),
+            "at least one HistoryTrimmed must carry mode=summary, got: {events:?}"
+        );
+        assert!(
+            summary_events.iter().all(|event| {
+                matches!(
+                    event,
+                    zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                        compaction: Some(info),
+                        ..
+                    } if info.provider == "mock-provider/mock-model"
+                )
+            }),
+            "summary events must name the turn's provider route"
+        );
+
+        // 8. The persisted trace carries the compaction record for this
+        //    turn. Scoped by this turn's trace id: the writer is
+        //    process-global, and compaction unit tests running in parallel
+        //    (turn-test / turn-compact fixtures) legitimately emit their own
+        //    summary records into the same file.
+        zeroclaw_log::flush_for_test().expect("flush P0 runtime trace");
+        let persisted = std::fs::read_to_string(
+            zeroclaw_log::runtime_trace_path().expect("P0 runtime trace path"),
+        )
+        .expect("read P0 runtime trace");
+        let summary_records: Vec<serde_json::Value> = persisted
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid trace JSON"))
+            .filter(|record: &serde_json::Value| {
+                record["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("narrative summary"))
+                    && record["attributes"]["mode"].as_str() == Some("summary")
+                    && record["trace_id"].as_str() == Some(turn_id.as_str())
+            })
+            .collect();
+        assert!(
+            !summary_records.is_empty(),
+            "trace must contain this turn's summary compaction record"
+        );
+    }
+
+    #[tokio::test]
+    async fn p0_summary_compaction_falls_back_to_breadcrumb_when_summarizer_fails() {
+        use crate::agent::turn::compaction::{
+            COMPACTION_SUMMARY_PREFIX, CONTEXT_RECOVERY_PREFIX, USER_MESSAGES_ELIDED_PREFIX,
+        };
+
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let trace_tmp = tempfile::tempdir().expect("P0 trace workspace");
+        zeroclaw_log::init_from_config(
+            &zeroclaw_log::LogConfig {
+                log_persistence: "full".into(),
+                ..Default::default()
+            },
+            trace_tmp.path(),
+        );
+        let _reset_writer = scopeguard::guard((), |_| {
+            zeroclaw_log::init_from_config(
+                &zeroclaw_log::LogConfig {
+                    log_persistence: "none".into(),
+                    ..Default::default()
+                },
+                trace_tmp.path(),
+            );
+        });
+
+        let cfg = p0_config(true, 15_000);
+        let mut history = p0_seed_history();
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        // The summarizer route fails: compaction must decline (I4) and the
+        // existing breadcrumb trim must run instead, without failing the turn.
+        let provider = P0ScriptedProvider::new(Err("summarizer unavailable".to_string()));
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
+
+        let result = p0_run_session(
+            &provider,
+            Some(&cfg),
+            15_000,
+            &mut history,
+            Some(event_tx),
+            &turn_id,
+        )
+        .await
+        .expect("P0 fallback turn must complete without error");
+
+        assert!(
+            result.contains("ГОТОВО"),
+            "fallback turn must still finish with the marker answer, got: {result}"
+        );
+        assert!(
+            provider.summary_calls.load(Ordering::SeqCst) >= 1,
+            "the failing summarizer must actually have been attempted"
+        );
+
+        let texts = p0_history_texts(&history);
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.starts_with(COMPACTION_SUMMARY_PREFIX)),
+            "a failed compaction must not leave a summary marker, got: {history:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.starts_with(CONTEXT_RECOVERY_PREFIX)),
+            "the breadcrumb fallback must not leave a recovery footer, got: {history:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.starts_with(USER_MESSAGES_ELIDED_PREFIX)),
+            "the breadcrumb fallback must not leave an elision note, got: {history:?}"
+        );
+        let breadcrumb = crate::agent::history_trim::breadcrumb();
+        assert!(
+            texts
+                .iter()
+                .any(|text| *text == breadcrumb.content.as_str()),
+            "fallback must leave the model-visible breadcrumb, got: {history:?}"
+        );
+
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                        compaction: Some(info),
+                        ..
+                    } if info.mode == "breadcrumb" && info.fell_back
+                )
+            }),
+            "at least one HistoryTrimmed must report the breadcrumb fallback, got: {events:?}"
+        );
+
+        zeroclaw_log::flush_for_test().expect("flush P0 fallback trace");
+        let persisted = std::fs::read_to_string(
+            zeroclaw_log::runtime_trace_path().expect("P0 runtime trace path"),
+        )
+        .expect("read P0 fallback trace");
+        let records: Vec<serde_json::Value> = persisted
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid trace JSON"))
+            .collect();
+        assert!(
+            records.iter().all(|record| {
+                // Scoped to THIS turn: the writer is process-global, so a
+                // parallel test's success records must not fail this assert.
+                record["trace_id"].as_str() != Some(turn_id.as_str())
+                    || record["message"]
+                        .as_str()
+                        .map_or(true, |message| !message.contains("narrative summary"))
+            }),
+            "no successful-summary record for this turn may be persisted on the \
+             fallback path"
+        );
+        assert!(
+            records.iter().any(|record| {
+                record["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("falling back to breadcrumb trim"))
+            }),
+            "the trace must record the summarizer failure and its breadcrumb fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn p0_compaction_disabled_matches_legacy_breadcrumb_trim() {
+        use crate::agent::turn::compaction::{
+            COMPACTION_SUMMARY_PREFIX, CONTEXT_RECOVERY_PREFIX, USER_MESSAGES_ELIDED_PREFIX,
+        };
+
+        let cfg = p0_config(false, 15_000);
+        let mut history = p0_seed_history();
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        // Planner inert (I3): the summarizer must never be called and every
+        // trim is the legacy whole-turn drop + breadcrumb.
+        let provider = P0ScriptedProvider::new(Ok("unused".to_string()));
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
+
+        let result = p0_run_session(
+            &provider,
+            Some(&cfg),
+            15_000,
+            &mut history,
+            Some(event_tx),
+            &turn_id,
+        )
+        .await
+        .expect("P0 parity turn must complete without error");
+
+        assert!(
+            result.contains("ГОТОВО"),
+            "parity turn must finish with the marker answer, got: {result}"
+        );
+        assert_eq!(
+            provider.summary_calls.load(Ordering::SeqCst),
+            0,
+            "a disabled planner must never invoke the summarizer (I3)"
+        );
+
+        let texts = p0_history_texts(&history);
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.starts_with(COMPACTION_SUMMARY_PREFIX)),
+            "disabled compaction must not leave a summary marker, got: {history:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.starts_with(CONTEXT_RECOVERY_PREFIX)),
+            "disabled compaction must not leave a recovery footer, got: {history:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.starts_with(USER_MESSAGES_ELIDED_PREFIX)),
+            "disabled compaction must not leave an elision note, got: {history:?}"
+        );
+        let breadcrumb = crate::agent::history_trim::breadcrumb();
+        assert!(
+            texts
+                .iter()
+                .any(|text| *text == breadcrumb.content.as_str()),
+            "the legacy trim must leave the model-visible breadcrumb, got: {history:?}"
+        );
+
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        let trimmed_events: Vec<&zeroclaw_api::agent::TurnEvent> = events
+            .iter()
+            .filter(|event| matches!(event, zeroclaw_api::agent::TurnEvent::HistoryTrimmed { .. }))
+            .collect();
+        assert!(
+            !trimmed_events.is_empty(),
+            "the over-budget parity run must still emit HistoryTrimmed events"
+        );
+        assert!(
+            trimmed_events.iter().all(|event| {
+                matches!(
+                    event,
+                    zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                        compaction: None,
+                        ..
+                    }
+                )
+            }),
+            "disabled compaction must emit trims without a compaction payload, got: {events:?}"
+        );
+    }
 }
