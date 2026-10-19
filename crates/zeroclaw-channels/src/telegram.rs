@@ -1245,6 +1245,13 @@ pub(crate) enum UpdateDisposition {
     // enum is constructed on every incoming update regardless of outcome.
     Parsed(Box<ChannelMessage>),
     SkipPermanent,
+    /// A permanent skip whose sender was already notified in-line (a voice
+    /// drop notice). Unlike `SkipPermanent`, the dispatcher must NOT fall
+    /// back to another parser for the same update: the announced reason
+    /// (e.g. a terminal transcription rejection) already decided its fate,
+    /// and re-parsing would silently contradict the notice, e.g. by
+    /// delivering the rejected recording as a document attachment.
+    SkipAnnounced,
     RetryTransient,
 }
 
@@ -6016,9 +6023,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
     /// Attempt to parse a Telegram update as a voice message and transcribe it.
     /// Returns `SkipPermanent` if the message is not a voice message, transcription is
-    /// disabled, the message exceeds duration limits, or the transcription endpoint
-    /// terminally rejected this recording; `RetryTransient` if download or
-    /// transcription I/O fails recoverably.
+    /// disabled, or the sender is not allowed; `SkipAnnounced` if the sender was
+    /// allowed but the recording was dropped with a notice (over the duration
+    /// limit, terminally rejected by the transcription endpoint, or an empty
+    /// transcript); `RetryTransient` if download or transcription I/O fails
+    /// recoverably.
     ///
     /// Every permanent drop that reaches an allowed sender is announced to them
     /// (see [`VoiceDropReason`]): silence is indistinguishable from a bot that
@@ -6096,7 +6105,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 },
             )
             .await;
-            return UpdateDisposition::SkipPermanent;
+            return UpdateDisposition::SkipAnnounced;
         }
 
         // Download and transcribe
@@ -6207,7 +6216,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                             VoiceDropReason::TranscriptionRejected,
                         )
                         .await;
-                        UpdateDisposition::SkipPermanent
+                        UpdateDisposition::SkipAnnounced
                     }
                     super::transcription::TranscriptionFailure::Transient => {
                         UpdateDisposition::RetryTransient
@@ -6228,7 +6237,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 VoiceDropReason::EmptyTranscript,
             )
             .await;
-            return UpdateDisposition::SkipPermanent;
+            return UpdateDisposition::SkipAnnounced;
         }
 
         // Enter voice-chat mode so outgoing replies get a TTS voice note
@@ -8429,6 +8438,15 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 }
                 return UpdateOutcome::Advanced;
             }
+            UpdateDisposition::SkipAnnounced => {
+                // The voice parser already told the sender why the recording
+                // was dropped; re-parsing it as an attachment would silently
+                // contradict that notice. Acknowledge without another send.
+                if uid.is_some() {
+                    *transient_retry = None;
+                }
+                return UpdateOutcome::Advanced;
+            }
             UpdateDisposition::RetryTransient => {
                 return self.pause_for_transient_update(uid, transient_retry).await;
             }
@@ -8637,6 +8655,11 @@ impl TelegramChannel {
                 if let Some(anchor_update) = batch.updates.first() {
                     Box::pin(self.handle_unauthorized_message(anchor_update)).await;
                 }
+                MediaGroupDispatchOutcome::Delivered(batch.key)
+            }
+            UpdateDisposition::SkipAnnounced => {
+                // Announced drops are terminal for the batch; the sender was
+                // already notified, so consume it without further sends.
                 MediaGroupDispatchOutcome::Delivered(batch.key)
             }
             UpdateDisposition::RetryTransient => MediaGroupDispatchOutcome::Retry(batch),
@@ -10248,6 +10271,7 @@ impl UpdateDisposition {
         match self {
             UpdateDisposition::Parsed(msg) => *msg,
             UpdateDisposition::SkipPermanent => panic!("{context}: got SkipPermanent"),
+            UpdateDisposition::SkipAnnounced => panic!("{context}: got SkipAnnounced"),
             UpdateDisposition::RetryTransient => panic!("{context}: got RetryTransient"),
         }
     }
@@ -11347,6 +11371,7 @@ mod tests {
         match disposition {
             UpdateDisposition::Parsed(message) => *message,
             UpdateDisposition::SkipPermanent => panic!("{context}: permanently skipped"),
+            UpdateDisposition::SkipAnnounced => panic!("{context}: announced skip"),
             UpdateDisposition::RetryTransient => panic!("{context}: transient retry"),
         }
     }
@@ -20843,7 +20868,7 @@ mod tests {
         });
 
         let parsed = ch.try_parse_voice_message(&update).await;
-        assert!(matches!(parsed, UpdateDisposition::SkipPermanent));
+        assert!(matches!(parsed, UpdateDisposition::SkipAnnounced));
 
         let sent = mock_server.received_requests().await.unwrap();
         assert_eq!(sent.len(), 1, "the sender is told exactly once");
@@ -20897,7 +20922,7 @@ mod tests {
 
         assert!(matches!(
             ch.try_parse_voice_message(&update).await,
-            UpdateDisposition::SkipPermanent
+            UpdateDisposition::SkipAnnounced
         ));
 
         let sent = mock_server.received_requests().await.unwrap();
@@ -22890,7 +22915,7 @@ mod tests {
         });
 
         let parsed = ch.try_parse_voice_message(&update).await;
-        assert!(matches!(parsed, UpdateDisposition::SkipPermanent));
+        assert!(matches!(parsed, UpdateDisposition::SkipAnnounced));
 
         let sent = mock_server.received_requests().await.unwrap();
         let notice = sent
