@@ -11544,6 +11544,11 @@ mod tests {
             TELEGRAM_PENDING_MEDIA_GROUP_POLL_TIMEOUT_SECS
         );
 
+        // The local voice patch makes voice/audio materializable document
+        // attachments (`parse_attachment_metadata`), so an audio album member
+        // defers like a photo or document - unlike upstream, where audio was
+        // an unsupported type and this assertion expected no deferral. A type
+        // the parser still does not handle (e.g. video) stays non-deferring.
         let grouped_audio = serde_json::json!({
             "update_id": 3,
             "message": {
@@ -11555,8 +11560,8 @@ mod tests {
             }
         });
         assert!(
-            !TelegramChannel::should_defer_media_group_update(&unsupported_only, &grouped_audio),
-            "an unsupported-only group must keep its existing parser behavior"
+            TelegramChannel::should_defer_media_group_update(&unsupported_only, &grouped_audio),
+            "audio is a supported attachment under the voice patch"
         );
     }
 
