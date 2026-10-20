@@ -79,11 +79,6 @@ impl std::fmt::Display for SendChunksError {
     }
 }
 
-/// Longest `retry_after` the send path waits out inline before retrying the
-/// same request. A longer penalty fails the send instead of blocking the reply
-/// task for many minutes; either way no request is fired into an active limit.
-const TELEGRAM_MAX_INLINE_RETRY_AFTER: Duration = Duration::from_secs(60);
-
 /// How many times one `sendMessage` request is retried after HTTP 429.
 const TELEGRAM_RATE_LIMIT_RETRIES: u32 = 2;
 
@@ -6338,19 +6333,28 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     }
 
     /// Posts one `sendMessage` request. On HTTP 429 it waits the server's
-    /// `retry_after` (up to [`TELEGRAM_MAX_INLINE_RETRY_AFTER`]) and resends the
-    /// same body, at most [`TELEGRAM_RATE_LIMIT_RETRIES`] times, so a flood
-    /// limit is never answered with immediate extra requests.
+    /// `retry_after` (up to the configured wait budget) and resends the same
+    /// body, at most [`TELEGRAM_RATE_LIMIT_RETRIES`] times, so a flood limit
+    /// is never answered with immediate extra requests.
+    ///
+    /// The wait ceiling is
+    /// `[channels.telegram.<alias>].rate_limit_max_wait_secs`, resolved live
+    /// at send time - the same canonical source the shared per-token gate
+    /// draws its Deliver budget from, so final answers honor the operator's
+    /// setting just like draft creation and approval prompts.
     ///
     /// The call is also coordinated through the shared per-token flood gate
     /// (see [`crate::telegram_rate_limit`]): a window already noted by any
-    /// other call on this token is waited out (up to the same inline ceiling)
-    /// before posting, and every observed 429 feeds the shared window so
-    /// droppable traffic and other chats on the token go quiet too.
+    /// other call on this token is waited out (up to the same budget) before
+    /// posting, and every observed 429 feeds the shared window so droppable
+    /// traffic and other chats on the token go quiet too. A penalty beyond
+    /// the budget fails the send instead of blocking the reply task; either
+    /// way no request is fired into an active limit.
     async fn send_message_honoring_rate_limit(
         &self,
         body: &serde_json::Value,
     ) -> Result<SendMessageAttempt, reqwest::Error> {
+        let max_wait = Duration::from_secs(self.resolve_rate_limit_max_wait_secs());
         let mut retries = 0;
         loop {
             // Pre-send gate: never fire into a window a concurrent call
@@ -6358,7 +6362,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             if let crate::telegram_rate_limit::RateLimitGate::Blocked(remaining) =
                 self.rate_limiter.check()
             {
-                if remaining > TELEGRAM_MAX_INLINE_RETRY_AFTER {
+                if remaining > max_wait {
                     return Ok(SendMessageAttempt::RateLimited {
                         status: reqwest::StatusCode::TOO_MANY_REQUESTS,
                         body: format!(
@@ -6388,7 +6392,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             // draft edits) and deliver calls for other chats skip the penalty
             // instead of piling their own 429s onto it.
             self.rate_limiter.note_rate_limited(wait.as_secs());
-            if retries >= TELEGRAM_RATE_LIMIT_RETRIES || wait > TELEGRAM_MAX_INLINE_RETRY_AFTER {
+            if retries >= TELEGRAM_RATE_LIMIT_RETRIES || wait > max_wait {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -12250,7 +12254,6 @@ mod tests {
             "finalize remains the terminal lifecycle event: no orphaned draft state"
         );
     }
-
 
     /// when the outbound hook cancels a narration turn, `discard_draft_turn`
     /// consumes exactly that turn (nothing is sent, and it is never resurrected),
@@ -25589,6 +25592,48 @@ mod tests {
         );
     }
 
+    /// The final-reply send path draws its inline wait ceiling from the live
+    /// `rate_limit_max_wait_secs` config, not from a hardcoded constant: with
+    /// a 1s budget a 2s penalty is reported as rate-limited without an inline
+    /// wait, where the old fixed 60s ceiling would have slept and resent.
+    #[tokio::test]
+    async fn send_text_chunks_honors_configured_wait_budget() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(flood_limit_response(2))
+            .expect(1)
+            .named("a penalty past the configured budget is not retried")
+            .mount(&mock_server)
+            .await;
+
+        let ch = rate_limit_test_channel(mock_server.uri())
+            .with_persistence_authority(telegram_rate_limit_authority("telegram_test_alias", 1, 4));
+
+        let started = Instant::now();
+        let err = ch
+            .send_text_chunks("hello", "123", None, 0)
+            .await
+            .unwrap_err();
+        assert!(
+            err.rate_limited,
+            "expected a rate-limited chunk error: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a penalty past the configured 1s budget must not be waited inline: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            mock_server.received_requests().await.unwrap().len(),
+            1,
+            "no resend into a penalty beyond the configured budget"
+        );
+    }
+
     /// Repeated short 429s stop after the retry cap: the original request plus
     /// `TELEGRAM_RATE_LIMIT_RETRIES` resends, all with the same body.
     #[tokio::test]
@@ -25947,7 +25992,10 @@ mod tests {
             .send_text_chunks("final answer", "100", None, 0)
             .await
             .expect_err("a penalty past the inline ceiling must fail the chunk");
-        assert!(err.rate_limited, "expected a rate-limited chunk error: {err}");
+        assert!(
+            err.rate_limited,
+            "expected a rate-limited chunk error: {err}"
+        );
 
         // A draft edit for a *different* chat on the same channel instance is
         // inside that window and must be skipped without a network call.
