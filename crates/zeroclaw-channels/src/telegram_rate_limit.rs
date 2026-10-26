@@ -25,7 +25,7 @@ use parking_lot::Mutex;
 /// Fallback window when a 429 body carries no parseable `retry_after`.
 /// Telegram's Bot API contract always sends one, so this only covers
 /// proxy-generated or truncated answers.
-const FALLBACK_RETRY_AFTER_SECS: u64 = 5;
+pub(crate) const FALLBACK_RETRY_AFTER_SECS: u64 = 5;
 
 /// Delivery class of a Bot API call: whether the caller must get the request
 /// through (waiting out a flood-control window, bounded by
@@ -200,7 +200,11 @@ pub(crate) fn parse_retry_after(body: &str) -> Option<u64> {
 /// bounds how long *this caller* waits, never the server deadline: when it is
 /// spent and the window is still active, the wait ends with
 /// [`TelegramGateError::BudgetExhausted`] instead of an early send.
-async fn wait_out_window(
+///
+/// Also used by the final-reply `sendMessage` path, which keeps its own
+/// attempt accounting: it shares this loop (and so the same rechecking
+/// semantics) instead of duplicating the wait.
+pub(crate) async fn wait_out_window(
     limiter: &TelegramRateLimiter,
     budget: &mut Duration,
 ) -> Result<(), TelegramGateError> {
