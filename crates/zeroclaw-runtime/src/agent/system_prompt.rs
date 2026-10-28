@@ -748,9 +748,15 @@ fn clear_bootstrap_truncation(path: &std::path::Path, limit: usize) {
     last_reported.remove(&(path.to_path_buf(), limit));
 }
 
-/// Prefix of a deferred bootstrap section directive. The full line is
-/// `<!-- defer: <workspace-relative path> | <one-line trigger> -->`.
-const DEFER_DIRECTIVE_PREFIX: &str = "<!-- defer:";
+/// Prefix of a deferred bootstrap section directive in the legacy HTML-comment
+/// form: `<!-- defer: <workspace-relative path> | <one-line trigger> -->`.
+/// Kept for backward compatibility with directives operators already wrote.
+const LEGACY_DEFER_DIRECTIVE_PREFIX: &str = "<!-- defer:";
+
+/// Prefix of a deferred bootstrap section directive in the list-item form:
+/// `- defer: <workspace-relative path> | <one-line trigger>`. Recommended for
+/// hand-written directives because it needs no comment syntax.
+const DEFER_DIRECTIVE_PREFIX: &str = "- defer:";
 
 /// One parsed deferred-section directive: the target path (resolved against
 /// the workspace) and the model-facing trigger line.
@@ -762,18 +768,27 @@ struct DeferredSection<'a> {
 /// Parse one line as a deferred-section directive. Returns `Ok(None)` for
 /// lines that are not directives at all, `Ok(Some(..))` for a valid
 /// directive, and `Err(())` for a directive-shaped line that does not parse
-/// (unterminated, missing the `|`, or an empty path). The trigger may be
-/// empty; the path may not.
+/// (legacy form unterminated, missing the `|`, or an empty path). The
+/// trigger may be empty; the path may not. Both the list-item form
+/// (`- defer: <path> | <trigger>`, recommended for hand-written directives)
+/// and the legacy HTML-comment form (`<!-- defer: <path> | <trigger> -->`)
+/// are accepted.
 fn parse_defer_directive(line: &str) -> Result<Option<DeferredSection<'_>>, ()> {
     let trimmed = line.trim();
-    if !trimmed.starts_with(DEFER_DIRECTIVE_PREFIX) {
+    let inner = if let Some(rest) = trimmed.strip_prefix(DEFER_DIRECTIVE_PREFIX) {
+        // List-item form: no `-->` suffix required, but strip a stray one if
+        // the operator appended it out of habit.
+        rest.strip_suffix("-->").unwrap_or(rest)
+    } else if trimmed.starts_with(LEGACY_DEFER_DIRECTIVE_PREFIX) {
+        let Some(inner) = trimmed
+            .strip_prefix(LEGACY_DEFER_DIRECTIVE_PREFIX)
+            .and_then(|rest| rest.strip_suffix("-->"))
+        else {
+            return Err(());
+        };
+        inner
+    } else {
         return Ok(None);
-    }
-    let Some(inner) = trimmed
-        .strip_prefix(DEFER_DIRECTIVE_PREFIX)
-        .and_then(|rest| rest.strip_suffix("-->"))
-    else {
-        return Err(());
     };
     let Some((path, trigger)) = inner.split_once('|') else {
         return Err(());
@@ -786,6 +801,12 @@ fn parse_defer_directive(line: &str) -> Result<Option<DeferredSection<'_>>, ()> 
         path,
         trigger: trigger.trim(),
     }))
+}
+
+/// Whether `content` may contain a defer directive in either accepted form,
+/// so files without directives pass through without line-by-line parsing.
+fn content_has_defer_directive(content: &str) -> bool {
+    content.contains(DEFER_DIRECTIVE_PREFIX) || content.contains(LEGACY_DEFER_DIRECTIVE_PREFIX)
 }
 
 /// Malformed `defer` directives already reported, keyed by (file, line), so
@@ -823,7 +844,7 @@ fn note_malformed_defer_directive(file_path: &std::path::Path, line: &str) {
                 "line": line.trim(),
             })),
         &format!(
-            "{filename}: malformed defer directive kept verbatim (expected `<!-- defer: <path> | <trigger> -->`): {}",
+            "{filename}: malformed defer directive kept verbatim (expected `- defer: <path> | <trigger>` or `<!-- defer: <path> | <trigger> -->`): {}",
             line.trim()
         )
     );
@@ -837,7 +858,7 @@ fn note_malformed_defer_directive(file_path: &std::path::Path, line: &str) {
 fn apply_defer_directives(content: &str, file_path: &std::path::Path) -> String {
     use std::fmt::Write;
 
-    if !content.contains(DEFER_DIRECTIVE_PREFIX) {
+    if !content_has_defer_directive(content) {
         return content.to_string();
     }
     let mut rewritten = String::with_capacity(content.len());
@@ -1740,6 +1761,123 @@ mod tests {
             target.display()
         );
         assert_eq!(parsed.trigger, "when a BRIDGE/inbox request appears");
+    }
+
+    #[test]
+    fn list_style_defer_directive_parses_and_rewrites_like_legacy() {
+        let content =
+            "Header\n- defer: tools/bridge.md | when a BRIDGE/inbox request appears\nFooter\n";
+        let file = std::path::Path::new("workspace").join("TOOLS.md");
+        let rewritten = apply_defer_directives(content, &file);
+        assert!(
+            rewritten
+                .contains("- bridge.md → tools/bridge.md — when a BRIDGE/inbox request appears"),
+            "list-style directive rewrites to the same index entry as legacy, got: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("Header\n"),
+            "surrounding text is preserved"
+        );
+        assert!(
+            rewritten.contains("\nFooter"),
+            "surrounding text is preserved"
+        );
+
+        // A stray legacy `-->` suffix is tolerated but not required.
+        let with_suffix = apply_defer_directives("- defer: tools/bridge.md | trigger -->\n", &file);
+        assert!(
+            with_suffix.contains("- bridge.md → tools/bridge.md — trigger"),
+            "stray `-->` suffix is stripped, got: {with_suffix}"
+        );
+    }
+
+    #[test]
+    fn mixed_legacy_and_list_style_directives_in_one_file() {
+        let content = "Intro\n\
+                       <!-- defer: tools/legacy.md | legacy trigger -->\n\
+                       Middle\n\
+                       - defer: tools/new.md | new trigger\n\
+                       Outro\n";
+        let file = std::path::Path::new("workspace").join("TOOLS.md");
+        let rewritten = apply_defer_directives(content, &file);
+        assert!(
+            rewritten.contains("- legacy.md → tools/legacy.md — legacy trigger"),
+            "legacy HTML-comment form still parses, got: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("- new.md → tools/new.md — new trigger"),
+            "list-item form parses, got: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("Intro\n")
+                && rewritten.contains("Middle\n")
+                && rewritten.contains("Outro\n"),
+            "surrounding text is preserved"
+        );
+    }
+
+    #[test]
+    fn malformed_list_style_directive_kept_verbatim() {
+        let file = std::path::Path::new("workspace").join("TOOLS.md");
+
+        // Missing path: `- defer: | trigger`.
+        let no_path = "Header\n- defer: | only a trigger\nFooter\n";
+        assert_eq!(
+            apply_defer_directives(no_path, &file),
+            no_path,
+            "a list-style directive with an empty path is kept verbatim"
+        );
+
+        // Missing `|`: `- defer: tools/bridge.md`.
+        let no_pipe = "Header\n- defer: tools/bridge.md\nFooter\n";
+        assert_eq!(
+            apply_defer_directives(no_pipe, &file),
+            no_pipe,
+            "a list-style directive without `|` is kept verbatim"
+        );
+
+        // Warn-once: the second call for the same line does not report again.
+        // (The dedup set is process-global; unique tempdir keys avoid cross-test
+        // collisions.)
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        let mixed_path = workspace.path().join("TOOLS.md");
+        let malformed_line = "- defer: | warn once probe";
+        let mixed = format!("{malformed_line}\n- defer: tools/ok.md | ok trigger\n");
+        let rewritten = apply_defer_directives(&mixed, &mixed_path);
+        assert!(
+            rewritten.contains(malformed_line),
+            "malformed line stays verbatim, got: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("- ok.md → tools/ok.md — ok trigger"),
+            "the sibling valid directive still rewrites, got: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn line_containing_defer_word_but_not_marker_is_not_a_directive() {
+        let content = "See the defer: notes in the manual\n\
+                       * defer: not our marker (different bullet)\n\
+                       word - defer: embedded mid-line\n";
+        let file = std::path::Path::new("workspace").join("TOOLS.md");
+        assert_eq!(
+            apply_defer_directives(content, &file),
+            content,
+            "lines that do not start with the exact list marker or the legacy \
+             comment prefix pass through unchanged"
+        );
+
+        for line in [
+            "See the defer: notes in the manual",
+            "* defer: not our marker (different bullet)",
+            "word - defer: embedded mid-line",
+            "defer: loose word on its own line",
+        ] {
+            assert!(
+                matches!(parse_defer_directive(line), Ok(None)),
+                "line is not a directive: {line}"
+            );
+        }
     }
 
     #[test]
