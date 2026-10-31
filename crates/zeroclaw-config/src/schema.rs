@@ -16751,6 +16751,14 @@ fn default_telegram_approval_timeout_secs() -> u64 {
     120
 }
 
+fn default_telegram_rate_limit_max_wait_secs() -> u64 {
+    60
+}
+
+fn default_telegram_typing_refresh_interval_secs() -> u64 {
+    4
+}
+
 pub const TELEGRAM_OFFICIAL_API_BASE_URL: &str = "https://api.telegram.org";
 
 fn default_telegram_api_base_url() -> String {
@@ -16816,6 +16824,23 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default = "default_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
+    /// Maximum seconds a deliver-class Bot API call (final answers, approval
+    /// prompts) waits out a Telegram flood-control window (`retry_after`)
+    /// before giving up without sending - a window that outlives this budget
+    /// is never sent into. Droppable calls (draft edits, typing indicators)
+    /// are skipped instead of waiting. `0` restores the default (this is not
+    /// a disable switch); configured values are clamped to at most 300s.
+    /// Default: 60.
+    #[tab(Behavior)]
+    #[serde(default = "default_telegram_rate_limit_max_wait_secs")]
+    pub rate_limit_max_wait_secs: u64,
+    /// Seconds between `sendChatAction` typing refreshes while a reply is in
+    /// flight. Telegram expires the typing indicator after ~5 seconds.
+    /// `0` restores the default (this is not a disable switch); configured
+    /// values above 5 are clamped to 5. Default: 4.
+    #[tab(Behavior)]
+    #[serde(default = "default_telegram_typing_refresh_interval_secs")]
+    pub typing_refresh_interval_secs: u64,
     /// Minimum delay (ms) between successive multi_message narration messages
     /// (and before the approval prompt) for one recipient. Does not apply to the
     /// fixed pacing between physical fragments of a single over-4096-character
@@ -16839,6 +16864,15 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
+    /// Notice sent to a sender this channel has not authorized. `{identity}`
+    /// expands to the sender's Telegram user ID (or username when no ID is
+    /// available) and `{bind_command}` to the `zeroclaw channel bind-telegram`
+    /// invocation for this alias, so a deployment that authorizes from
+    /// configuration can drop the operator-terminal instruction the built-in
+    /// notice carries. Unset or blank keeps the built-in notice.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub unauthorized_message: Option<String>,
     /// When `true` (default), group-chat sessions key on the sender, so
     /// distinct members of the same group (or forum topic) each get an
     /// isolated conversation context (matches the existing behavior). When
@@ -16919,9 +16953,12 @@ impl Default for TelegramConfig {
             api_base_url: default_telegram_api_base_url(),
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: default_draft_update_interval_ms(),
+            rate_limit_max_wait_secs: default_telegram_rate_limit_max_wait_secs(),
+            typing_refresh_interval_secs: default_telegram_typing_refresh_interval_secs(),
             multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: false,
             mention_only: false,
+            unauthorized_message: None,
             per_user_session: true,
             passive_group_context: false,
             ack_reactions: None,
@@ -21309,6 +21346,44 @@ pub(crate) fn install_data_dir(config_dir: &Path) -> PathBuf {
     config_dir.join("data")
 }
 
+/// Create a directory owner-only (mode `0o700` on Unix) unless it already
+/// exists. Group and other access stay closed whatever the process umask.
+/// ACL entries inherited on macOS or NFSv4 are outside the mode bits.
+///
+/// `Config::load_or_init` and `ConfigOwnershipGuard` create the install data
+/// directory through here, and the guard also creates its `.lifecycle`
+/// subdirectory, so a umask such as `0002` no longer leaves either `0775`.
+/// Missing parents keep the default mode, and an existing directory is left
+/// as it is: this helper does not change the permissions of a directory it
+/// did not just create.
+///
+/// `Ok` does not mean the path is an owner-only real directory: it also
+/// covers an existing directory of any owner or mode, and a symlink to a
+/// directory. Callers that rely on that must lstat the path, as
+/// `ConfigOwnershipGuard` does.
+pub fn create_owner_only_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        // mkdir(2) masks the requested mode with the umask, which can only
+        // clear bits, so group and other bits stay clear for any umask.
+        match std::fs::DirBuilder::new().mode(0o700).create(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {
+                Ok(())
+            }
+            result => result,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
+}
+
 fn default_config_dir() -> Result<PathBuf> {
     if let Ok(custom) = std::env::var("ZEROCLAW_CONFIG_DIR") {
         let custom = custom.trim();
@@ -22960,7 +23035,7 @@ impl Config {
         // and markdown (MEMORY.md, IDENTITY.md, SOUL.md) lives at
         // `Config::agent_workspace_dir(alias)` instead.
         let data_dir = install_data_dir(&zeroclaw_dir);
-        fs::create_dir_all(&data_dir).await.with_context(|| {
+        create_owner_only_dir(&data_dir).with_context(|| {
             format!(
                 "Failed to create data directory: {}",
                 data_dir.display().to_string()
@@ -33742,10 +33817,14 @@ auto_save = true
                         api_base_url: default_telegram_api_base_url(),
                         stream_mode: StreamMode::default(),
                         draft_update_interval_ms: default_draft_update_interval_ms(),
+                        rate_limit_max_wait_secs: default_telegram_rate_limit_max_wait_secs(),
+                        typing_refresh_interval_secs: default_telegram_typing_refresh_interval_secs(
+                        ),
                         multi_message_delay_ms: default_multi_message_delay_ms(),
                         debounce_ms: None,
                         interrupt_on_new_message: false,
                         mention_only: false,
+                        unauthorized_message: None,
                         per_user_session: true,
                         passive_group_context: false,
                         ack_reactions: None,
@@ -35782,9 +35861,12 @@ default_temperature = 0.7
             api_base_url: default_telegram_api_base_url(),
             stream_mode: StreamMode::Partial,
             draft_update_interval_ms: 500,
+            rate_limit_max_wait_secs: 45,
+            typing_refresh_interval_secs: 3,
             multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: true,
             mention_only: false,
+            unauthorized_message: None,
             per_user_session: true,
             passive_group_context: false,
             ack_reactions: None,
@@ -35800,6 +35882,8 @@ default_temperature = 0.7
         assert_eq!(parsed.bot_token, "123:XYZ");
         assert_eq!(parsed.stream_mode, StreamMode::Partial);
         assert_eq!(parsed.draft_update_interval_ms, 500);
+        assert_eq!(parsed.rate_limit_max_wait_secs, 45);
+        assert_eq!(parsed.typing_refresh_interval_secs, 3);
         assert!(parsed.interrupt_on_new_message);
     }
 
@@ -35809,6 +35893,8 @@ default_temperature = 0.7
         let parsed: TelegramConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.stream_mode, StreamMode::Off);
         assert_eq!(parsed.draft_update_interval_ms, 1000);
+        assert_eq!(parsed.rate_limit_max_wait_secs, 60);
+        assert_eq!(parsed.typing_refresh_interval_secs, 4);
         assert!(!parsed.interrupt_on_new_message);
         assert_eq!(parsed.api_base_url, "https://api.telegram.org");
     }
@@ -38060,8 +38146,8 @@ wire_api = "ws"
         );
     }
 
-    /// Startup creates and locks `config-lifecycle.lock` in the resolved data
-    /// directory before it loads the config. A V2-to-V3 filesystem migration
+    /// Startup creates and locks `.lifecycle/config-lifecycle.lock` in the
+    /// resolved data directory before it loads the config. A V2-to-V3 filesystem migration
     /// interrupted after moving an identity file, with the device database
     /// still in the legacy workspace, must still resume on that load: the
     /// database ends up readable in the loaded `data_dir`, and the legacy
@@ -38111,13 +38197,13 @@ wire_api = "ws"
             // The pre-load lock step: create the lifecycle lock where the
             // daemon would, and hold an advisory lock on it across the load.
             let (_, locked_data) = resolve_runtime_dirs().await.unwrap();
-            std::fs::create_dir_all(&locked_data).unwrap();
+            std::fs::create_dir_all(locked_data.join(".lifecycle")).unwrap();
             let lock = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
                 .truncate(false)
-                .open(locked_data.join("config-lifecycle.lock"))
+                .open(locked_data.join(".lifecycle/config-lifecycle.lock"))
                 .unwrap();
             lock.try_lock().unwrap();
 
@@ -38309,6 +38395,74 @@ scope = "zeroclaw"
         );
 
         set_runtime_proxy_config(ProxyConfig::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    async fn load_or_init_creates_an_owner_only_data_dir_under_umask_0002() {
+        const CHILD_ENV: &str = "ZEROCLAW_DATA_DIR_UMASK_TEST_CHILD";
+        const TEST_NAME: &str =
+            "schema::tests::load_or_init_creates_an_owner_only_data_dir_under_umask_0002";
+
+        // The umask and the config-dir variables are process-global. Run the
+        // behavioral part in a dedicated test subprocess so unrelated tests in
+        // the parent harness cannot observe them.
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let _env_guard = env_override_lock().await;
+            let temp = TempDir::new().unwrap();
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("test executable must be available"),
+            )
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .env("HOME", temp.path().join("home"))
+            .env("ZEROCLAW_CONFIG_DIR", temp.path().join("install"))
+            .env_remove("ZEROCLAW_DATA_DIR")
+            .env_remove("ZEROCLAW_WORKSPACE")
+            .output()
+            .expect("spawn umask test subprocess");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "umask test subprocess failed with status {}:\n{stdout}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        // SAFETY: umask has no memory-safety preconditions, and this
+        // subprocess runs only the current test.
+        unsafe { libc::umask(0o002) };
+        let install = PathBuf::from(std::env::var_os("ZEROCLAW_CONFIG_DIR").unwrap());
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+
+        let config = Box::pin(Config::load_or_init()).await.unwrap();
+
+        assert_eq!(config.data_dir, install.join("data"));
+        assert_eq!(mode(&config.data_dir), 0o700);
+        assert_eq!(mode(&install), 0o775, "parents keep the default mode");
+        assert!(
+            !config.data_dir.join(".lifecycle").exists(),
+            "only the ownership guard creates .lifecycle"
+        );
+    }
+
+    #[cfg(unix)]
+    #[::core::prelude::v1::test]
+    fn create_owner_only_dir_leaves_an_existing_directory_unchanged() {
+        let temp = TempDir::new().unwrap();
+        let shared = temp.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o775)).unwrap();
+
+        create_owner_only_dir(&shared).unwrap();
+
+        let mode = std::fs::metadata(&shared).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o775);
+        let file = temp.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert!(create_owner_only_dir(&file).is_err());
     }
 
     #[test]
@@ -42478,9 +42632,12 @@ high_entropy_tokens = false
                 api_base_url: default_telegram_api_base_url(),
                 stream_mode: StreamMode::default(),
                 draft_update_interval_ms: default_draft_update_interval_ms(),
+                rate_limit_max_wait_secs: default_telegram_rate_limit_max_wait_secs(),
+                typing_refresh_interval_secs: default_telegram_typing_refresh_interval_secs(),
                 multi_message_delay_ms: default_multi_message_delay_ms(),
                 interrupt_on_new_message: false,
                 mention_only: false,
+                unauthorized_message: None,
                 per_user_session: true,
                 passive_group_context: false,
                 ack_reactions: None,
