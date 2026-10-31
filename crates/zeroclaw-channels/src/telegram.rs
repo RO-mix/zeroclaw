@@ -969,6 +969,17 @@ const TELEGRAM_DRAFT_UPDATE_INTERVAL_MS: u64 = 1000;
 /// Telegram flood-control window (`retry_after`) before giving up.
 const TELEGRAM_RATE_LIMIT_MAX_WAIT_SECS: u64 = 60;
 
+/// Upper bound applied to a configured `rate_limit_max_wait_secs`: a wait
+/// budget of hours would stall the reply pipeline far past any realistic
+/// Telegram penalty.
+const TELEGRAM_RATE_LIMIT_MAX_WAIT_CEILING_SECS: u64 = 300;
+
+/// Upper bound applied to a configured `typing_refresh_interval_secs`:
+/// Telegram expires the typing indicator after ~5s, so a slower refresh just
+/// lets it lapse. (`0` restores the default before this bound is consulted,
+/// which is why there is no lower clamp.)
+const TELEGRAM_TYPING_REFRESH_MAX_SECS: u64 = 5;
+
 /// Default typing-indicator refresh cadence. Telegram expires the indicator
 /// after ~5s, so the loop refreshes just under that.
 const TELEGRAM_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
@@ -2797,8 +2808,9 @@ impl TelegramChannel {
     /// and `.typing_refresh_interval_secs`, read from the live config handle
     /// in one guard acquisition. Shared by the channel methods and the
     /// detached typing loop, which has no `&self`. A zero value restores the
-    /// channel default (it is not a disable switch), and a channel without a
-    /// persistence authority runs on the defaults.
+    /// channel default (it is not a disable switch), and out-of-range values
+    /// are clamped into the supported bounds with a warning. A channel
+    /// without a persistence authority runs on the defaults.
     fn resolve_rate_limit_tuning(
         persist: &Option<zeroclaw_runtime::LiveConfigAuthority>,
         alias: &str,
@@ -2816,10 +2828,36 @@ impl TelegramChannel {
             .map(|(max_wait, _)| max_wait)
             .filter(|max_wait| *max_wait > 0)
             .unwrap_or(TELEGRAM_RATE_LIMIT_MAX_WAIT_SECS);
+        if max_wait > TELEGRAM_RATE_LIMIT_MAX_WAIT_CEILING_SECS {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "configured_secs": max_wait,
+                        "clamped_secs": TELEGRAM_RATE_LIMIT_MAX_WAIT_CEILING_SECS,
+                    })),
+                "Telegram rate_limit_max_wait_secs exceeds the supported ceiling; clamping"
+            );
+        }
+        let max_wait = max_wait.min(TELEGRAM_RATE_LIMIT_MAX_WAIT_CEILING_SECS);
         let refresh = configured
             .map(|(_, refresh)| refresh)
             .filter(|refresh| *refresh > 0)
             .unwrap_or(TELEGRAM_TYPING_REFRESH_INTERVAL_SECS);
+        if refresh > TELEGRAM_TYPING_REFRESH_MAX_SECS {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "configured_secs": refresh,
+                        "clamped_secs": TELEGRAM_TYPING_REFRESH_MAX_SECS,
+                    })),
+                "Telegram typing_refresh_interval_secs exceeds the supported maximum; clamping"
+            );
+        }
+        let refresh = refresh.min(TELEGRAM_TYPING_REFRESH_MAX_SECS);
         (max_wait, refresh)
     }
 
@@ -6354,7 +6392,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// as long as allowance remains. Every observed 429 also feeds the shared
     /// window so droppable traffic and other chats on the token go quiet too.
     /// A penalty beyond the remaining allowance fails the send instead of
-    /// firing into the window; either way no request is posted too early.
+    /// firing into the window; one that merely equals the allowance is
+    /// waited out and sent - the gate's deadline only carries the jitter
+    /// tail past the server penalty. Either way no request is posted too
+    /// early.
     async fn send_message_honoring_rate_limit(
         &self,
         body: &serde_json::Value,
@@ -6366,13 +6407,17 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let mut retries = 0;
         loop {
             // Pre-send gate: never fire into a window a concurrent call
-            // already noted for this token. A window already outliving the
-            // remaining allowance fails fast; a reachable one is waited out
-            // through the shared loop, which re-checks after each sleep, so
-            // a window extended mid-wait is honored, never sent into.
+            // already noted for this token. The gate's remaining wait carries
+            // the note's jitter on top of the server penalty, so the fail-fast
+            // decision compares the penalty itself against the allowance: a
+            // penalty that merely equals the allowance is waited out and sent
+            // (like it was before the jittered deadline), only one that
+            // outlives the allowance fails fast. A reachable window is waited
+            // out through the shared loop, which re-checks after each sleep,
+            // so a window extended mid-wait is honored, never sent into.
             if let crate::telegram_rate_limit::RateLimitGate::Blocked(remaining) =
                 self.rate_limiter.check()
-                && remaining > allowance
+                && self.rate_limiter.penalty_remaining() > allowance
             {
                 return Ok(SendMessageAttempt::RateLimited {
                     status: reqwest::StatusCode::TOO_MANY_REQUESTS,
@@ -6446,6 +6491,18 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }) = crate::telegram_rate_limit::wait_out_window(&self.rate_limiter, &mut allowance)
                 .await
             {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "retry_after_secs": wait.as_secs(),
+                            "remaining_secs": remaining.as_secs(),
+                            "attempt": retries,
+                        })),
+                    "Telegram sendMessage wait budget exhausted while waiting to resend; \
+                     not retrying inside the penalty window"
+                );
                 return Ok(SendMessageAttempt::RateLimited {
                     status: reqwest::StatusCode::TOO_MANY_REQUESTS,
                     body: format!(
@@ -25040,6 +25097,154 @@ mod tests {
         assert!(ch.pending_approvals.lock().await.is_empty());
     }
 
+    /// An approval prompt is Deliver-class: inside a flood window that fits
+    /// the configured budget the prompt is waited out and delivered, and the
+    /// approval flow continues to the operator's tap.
+    #[tokio::test]
+    async fn approval_prompt_waits_out_flood_window_within_budget_and_continues() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 66 }
+            })))
+            .expect(1)
+            .named("the approval prompt lands after the flood wait")
+            .mount(&mock_server)
+            .await;
+
+        let ch = Arc::new(
+            rate_limit_test_channel(mock_server.uri()).with_persistence_authority(
+                telegram_rate_limit_authority("telegram_test_alias", 2, 4),
+            ),
+        );
+        ch.rate_limiter.note_rate_limited(1);
+
+        let request = zeroclaw_api::channel::ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls -la".to_string(),
+            raw_arguments: None,
+            position: None,
+        };
+        let waiter = {
+            let ch = Arc::clone(&ch);
+            zeroclaw_spawn::spawn!(async move {
+                ch.request_approval_attributed_with_timeout(
+                    "12345",
+                    &request,
+                    Duration::from_secs(30),
+                )
+                .await
+            })
+        };
+
+        // The pending entry is registered before the send; the prompt itself
+        // is held by the 1s window and must arrive within the 2s budget.
+        let approval_id = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(id) = ch.pending_approvals.lock().await.keys().next().cloned() {
+                    break id;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("approval entry must be registered");
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if !mock_server.received_requests().await.unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the prompt must be delivered after the flood window");
+
+        let pending = ch
+            .pending_approvals
+            .lock()
+            .await
+            .remove(&approval_id)
+            .expect("the delivered prompt must still be pending");
+        pending
+            .sender
+            .send(zeroclaw_api::channel::ChannelApprovalResponse::Approve)
+            .expect("the prompt receiver must remain live");
+
+        let attributed = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the approval must resolve before the test deadline")
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            attributed.response,
+            zeroclaw_api::channel::ChannelApprovalResponse::Approve
+        );
+        assert_eq!(
+            attributed.source,
+            zeroclaw_api::channel::ApprovalSource::Operator
+        );
+        assert!(ch.pending_approvals.lock().await.is_empty());
+    }
+
+    /// A flood window past the configured budget fails the approval prompt
+    /// with the gate error, without firing into the window and without
+    /// leaving a stale pending entry behind.
+    #[tokio::test]
+    async fn approval_prompt_past_flood_budget_fails_without_stale_pending_entry() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 66 }
+            })))
+            .expect(0)
+            .named("no prompt may fire into a window past the budget")
+            .mount(&mock_server)
+            .await;
+
+        let ch = rate_limit_test_channel(mock_server.uri())
+            .with_persistence_authority(telegram_rate_limit_authority("telegram_test_alias", 1, 4));
+        ch.rate_limiter.note_rate_limited(30);
+
+        let request = zeroclaw_api::channel::ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "ls -la".to_string(),
+            raw_arguments: None,
+            position: None,
+        };
+        let err = ch
+            .request_approval("12345", &request)
+            .await
+            .expect_err("a prompt past the flood budget must fail");
+        assert!(
+            matches!(
+                err.downcast_ref::<crate::telegram_rate_limit::TelegramGateError>(),
+                Some(crate::telegram_rate_limit::TelegramGateError::BudgetExhausted { .. })
+            ),
+            "expected a flood gate error, got: {err}"
+        );
+        assert!(
+            ch.pending_approvals.lock().await.is_empty(),
+            "a failed prompt must not leave a stale pending entry"
+        );
+        assert!(
+            mock_server.received_requests().await.unwrap().is_empty(),
+            "no prompt request may reach the network inside the window"
+        );
+    }
+
     #[tokio::test]
     async fn routed_approval_honors_predeadline_callback_claim_after_route_deadline() {
         use wiremock::matchers::{method, path_regex};
@@ -25678,6 +25883,57 @@ mod tests {
             mock_server.received_requests().await.unwrap().len(),
             1,
             "no resend into a penalty beyond the configured budget"
+        );
+    }
+
+    /// A penalty exactly equal to the configured wait budget is waited out
+    /// and resent, not reported as rate-limited: the gate's deadline only
+    /// carries the jitter tail past the server penalty, so a budget-length
+    /// penalty still fits.
+    #[tokio::test]
+    async fn send_text_chunks_waits_out_penalty_equal_to_configured_budget() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(flood_limit_response(2))
+            .up_to_n_times(1)
+            .expect(1)
+            .named("sendMessage flood-limited once with a penalty equal to the budget")
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 7 }
+            })))
+            .expect(1)
+            .named("sendMessage succeeds after the budget-length wait")
+            .mount(&mock_server)
+            .await;
+
+        let ch = rate_limit_test_channel(mock_server.uri())
+            .with_persistence_authority(telegram_rate_limit_authority("telegram_test_alias", 2, 4));
+
+        let started = Instant::now();
+        let sent = ch
+            .send_text_chunks("hello", "123", None, 0)
+            .await
+            .unwrap_or_else(|err| {
+                panic!("a penalty equal to the budget must be waited out and sent, got: {err}")
+            });
+        assert_eq!(sent, 1);
+        assert!(
+            started.elapsed() >= Duration::from_secs(2),
+            "the resend must wait for the full penalty"
+        );
+        assert_eq!(
+            mock_server.received_requests().await.unwrap().len(),
+            2,
+            "the budget-length penalty is waited out and then sent"
         );
     }
 
@@ -26422,7 +26678,7 @@ mod tests {
             TelegramConfig {
                 bot_token: "fake-token".into(),
                 rate_limit_max_wait_secs: 7,
-                typing_refresh_interval_secs: 9,
+                typing_refresh_interval_secs: 3,
                 ..TelegramConfig::default()
             },
         );
@@ -26431,7 +26687,7 @@ mod tests {
         assert_eq!(ch.resolve_rate_limit_max_wait_secs(), 7);
         assert_eq!(
             TelegramChannel::resolve_rate_limit_tuning(&ch.persist, &ch.alias),
-            (7, 9)
+            (7, 3)
         );
 
         // Zero restores the channel default; it is not a disable switch.
@@ -26452,6 +26708,28 @@ mod tests {
                 TELEGRAM_RATE_LIMIT_MAX_WAIT_SECS,
                 TELEGRAM_TYPING_REFRESH_INTERVAL_SECS
             )
+        );
+    }
+
+    #[test]
+    fn rate_limit_tuning_clamps_out_of_range_config_to_supported_bounds() {
+        let authority = telegram_rate_limit_authority("telegram_test_alias", 600, 9);
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_persistence_authority(authority);
+
+        assert_eq!(
+            TelegramChannel::resolve_rate_limit_tuning(&ch.persist, &ch.alias),
+            (
+                TELEGRAM_RATE_LIMIT_MAX_WAIT_CEILING_SECS,
+                TELEGRAM_TYPING_REFRESH_MAX_SECS
+            ),
+            "an absurd wait budget and a too-slow typing refresh are clamped, \
+             not honored literally"
         );
     }
 

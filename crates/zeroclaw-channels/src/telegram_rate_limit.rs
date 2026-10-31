@@ -13,9 +13,10 @@
 //! and the model picker's markup edits still post directly; they are not
 //! covered by this gate.
 //!
-//! State-source justification (AGENTS.md): `blocked_until` is newly created
-//! runtime state - the only local mirror of Telegram's own server-side
-//! limiter. It duplicates no config key and no other runtime field.
+//! State-source justification (AGENTS.md): `blocked_until` (with its
+//! `window_jitter` component) is newly created runtime state - the only
+//! local mirror of Telegram's own server-side limiter. It duplicates no
+//! config key and no other runtime field.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -26,6 +27,13 @@ use parking_lot::Mutex;
 /// Telegram's Bot API contract always sends one, so this only covers
 /// proxy-generated or truncated answers.
 pub(crate) const FALLBACK_RETRY_AFTER_SECS: u64 = 5;
+
+/// Upper bound of the jitter `note_rate_limited` adds on top of the server
+/// penalty. The jittered deadline can therefore outlive the penalty itself by
+/// at most this much, which lets waiters with a fully spent budget tell "the
+/// penalty equaled the budget and only the jitter tail remains" apart from "the
+/// penalty genuinely outlasts the budget".
+pub(crate) const MAX_WINDOW_JITTER: Duration = Duration::from_secs(2);
 
 /// Delivery class of a Bot API call: whether the caller must get the request
 /// through (waiting out a flood-control window, bounded by
@@ -63,10 +71,10 @@ pub(crate) enum TelegramGateError {
     /// marks the single permitted retry also answering 429 (its own, possibly
     /// longer, delay is the one recorded).
     FloodLimited { retry_after_secs: u64 },
-    /// A Deliver call spent its whole caller-side wait budget and the shared
-    /// window was still active when it re-checked - the server penalty
-    /// outlasts the budget, or a concurrent 429 extended the window while
-    /// this caller slept. No (re)send happened.
+    /// A Deliver call spent its whole caller-side wait budget and the server
+    /// penalty was still running when it re-checked - the penalty outlasts
+    /// the budget, or a concurrent 429 extended the window while this caller
+    /// slept. No (re)send happened.
     BudgetExhausted { remaining: Duration },
 }
 
@@ -100,6 +108,12 @@ impl std::error::Error for TelegramGateError {}
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TelegramRateLimiter {
     blocked_until: Arc<Mutex<Option<Instant>>>,
+    /// Jitter component of the active window's deadline. The deadline is the
+    /// server penalty plus this jitter, so subtracting it from the gate's
+    /// remaining wait yields the penalty remaining (see
+    /// [`Self::penalty_remaining`]). Zero when no window is active or the
+    /// window carries no jitter.
+    window_jitter: Arc<Mutex<Duration>>,
 }
 
 impl TelegramRateLimiter {
@@ -107,10 +121,11 @@ impl TelegramRateLimiter {
         Self::default()
     }
 
-    /// Block the token until `retry_after_secs` (plus up to 2s of jitter, so
-    /// several chats blocked by the same 429 do not all resume on the same
-    /// tick) from now. Jitter derives from the wall clock's sub-second nanos;
-    /// no `rand` dependency is warranted for a 3-way pick.
+    /// Block the token until `retry_after_secs` (plus up to
+    /// [`MAX_WINDOW_JITTER`] of jitter, so several chats blocked by the same
+    /// 429 do not all resume on the same tick) from now. Jitter derives from
+    /// the wall clock's sub-second nanos; no `rand` dependency is warranted
+    /// for a 3-way pick.
     ///
     /// Concurrent 429 responses can arrive in either order, so the new
     /// deadline only replaces the active one when it is *later*: a 1s answer
@@ -121,7 +136,7 @@ impl TelegramRateLimiter {
     pub(crate) fn note_rate_limited(&self, retry_after_secs: u64) {
         let jitter_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| u64::from(d.subsec_nanos()) % 3)
+            .map(|d| u64::from(d.subsec_nanos()) % (MAX_WINDOW_JITTER.as_secs() + 1))
             .unwrap_or(0);
         let new_deadline = retry_after_secs
             .checked_add(jitter_secs)
@@ -142,6 +157,7 @@ impl TelegramRateLimiter {
             return;
         }
         *guard = Some(new_deadline);
+        *self.window_jitter.lock() = Duration::from_secs(jitter_secs);
     }
 
     /// Inspect the window, clearing it when it has expired.
@@ -154,10 +170,33 @@ impl TelegramRateLimiter {
                     RateLimitGate::Blocked(until.duration_since(now))
                 } else {
                     *guard = None;
+                    *self.window_jitter.lock() = Duration::ZERO;
                     RateLimitGate::Clear
                 }
             }
             None => RateLimitGate::Clear,
+        }
+    }
+
+    /// Remaining server-side penalty of the active window: the gate's
+    /// remaining wait minus the jitter the deadline carries. Zero once the
+    /// penalty itself has passed, even while the jittered deadline still
+    /// holds the token back. This is the value a caller's wait budget must be
+    /// compared against, so a penalty that merely equals the budget is
+    /// admitted while one that outlives it is refused.
+    pub(crate) fn penalty_remaining(&self) -> Duration {
+        match *self.blocked_until.lock() {
+            Some(until) => {
+                let now = Instant::now();
+                if until > now {
+                    until
+                        .duration_since(now)
+                        .saturating_sub(*self.window_jitter.lock())
+                } else {
+                    Duration::ZERO
+                }
+            }
+            None => Duration::ZERO,
         }
     }
 }
@@ -198,8 +237,16 @@ pub(crate) fn parse_retry_after(body: &str) -> Option<u64> {
 /// budget runs out: a window extended by a concurrent 429 while this caller
 /// sleeps is honored (never sent into) as long as budget remains. The budget
 /// bounds how long *this caller* waits, never the server deadline: when it is
-/// spent and the window is still active, the wait ends with
+/// spent and the penalty is still running, the wait ends with
 /// [`TelegramGateError::BudgetExhausted`] instead of an early send.
+///
+/// Boundary case: the gate's deadline carries the jitter
+/// [`TelegramRateLimiter::note_rate_limited`] added on top of the server
+/// penalty, so a spent budget can leave up to that jitter on the clock even
+/// though the penalty itself already ended. The exhaustion decision therefore
+/// compares the *penalty* remaining against the budget, not the jittered
+/// remaining wait: a penalty that merely equals the budget is waited out and
+/// the call proceeds; a penalty that outlives the budget still fails.
 ///
 /// Also used by the final-reply `sendMessage` path, which keeps its own
 /// attempt accounting: it shares this loop (and so the same rechecking
@@ -213,6 +260,12 @@ pub(crate) async fn wait_out_window(
             RateLimitGate::Clear => return Ok(()),
             RateLimitGate::Blocked(remaining) => {
                 if budget.is_zero() {
+                    // The deadline outruns the server penalty by the jitter
+                    // the note added; a spent budget with the penalty itself
+                    // already over means the penalty fit the budget exactly.
+                    if limiter.penalty_remaining().is_zero() {
+                        return Ok(());
+                    }
                     return Err(TelegramGateError::BudgetExhausted { remaining });
                 }
                 let wait = remaining.min(*budget);

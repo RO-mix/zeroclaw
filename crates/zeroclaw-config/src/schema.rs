@@ -16829,13 +16829,15 @@ pub struct TelegramConfig {
     /// before giving up without sending - a window that outlives this budget
     /// is never sent into. Droppable calls (draft edits, typing indicators)
     /// are skipped instead of waiting. `0` restores the default (this is not
-    /// a disable switch). Default: 60.
+    /// a disable switch); configured values are clamped to at most 300s.
+    /// Default: 60.
     #[tab(Behavior)]
     #[serde(default = "default_telegram_rate_limit_max_wait_secs")]
     pub rate_limit_max_wait_secs: u64,
     /// Seconds between `sendChatAction` typing refreshes while a reply is in
     /// flight. Telegram expires the typing indicator after ~5 seconds.
-    /// Default: 4.
+    /// `0` restores the default (this is not a disable switch); configured
+    /// values above 5 are clamped to 5. Default: 4.
     #[tab(Behavior)]
     #[serde(default = "default_telegram_typing_refresh_interval_secs")]
     pub typing_refresh_interval_secs: u64,

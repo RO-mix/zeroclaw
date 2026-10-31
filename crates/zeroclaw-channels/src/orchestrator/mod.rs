@@ -25812,6 +25812,10 @@ api_key = "anthropic-key"
         supports_multi_message_streaming: bool,
         finalize_should_fail: bool,
         fallback_send_should_fail: bool,
+        /// When true, `finalize_draft` fails with a Telegram flood-gate error
+        /// (budget exhausted), modeling the real Telegram adapter's terminal
+        /// flood stop so the orchestrator's no-resend branch can be exercised.
+        finalize_flood_limited: bool,
         final_send_calls: AtomicUsize,
         sent_messages: tokio::sync::Mutex<Vec<String>>,
         draft_messages: tokio::sync::Mutex<Vec<String>>,
@@ -25867,6 +25871,7 @@ api_key = "anthropic-key"
                 supports_multi_message_streaming: false,
                 finalize_should_fail,
                 fallback_send_should_fail,
+                finalize_flood_limited: false,
                 final_send_calls: AtomicUsize::new(0),
                 sent_messages: tokio::sync::Mutex::new(Vec::new()),
                 draft_messages: tokio::sync::Mutex::new(Vec::new()),
@@ -26471,6 +26476,14 @@ api_key = "anthropic-key"
             text: &str,
             _suppress_voice: bool,
         ) -> anyhow::Result<()> {
+            if self.finalize_flood_limited {
+                return Err(
+                    crate::telegram_rate_limit::TelegramGateError::BudgetExhausted {
+                        remaining: Duration::from_secs(30),
+                    }
+                    .into(),
+                );
+            }
             if self.finalize_should_fail {
                 anyhow::bail!("finalize boom")
             }
@@ -28050,6 +28063,55 @@ api_key = "anthropic-key"
         assert!(channel_impl.finalized_messages.lock().await.is_empty());
         assert!(channel_impl.sent_messages.lock().await.is_empty());
         assert!(hook_events.lock().await.is_empty());
+    }
+
+    /// A terminal Telegram flood-gate error from `finalize_draft` must stop
+    /// the delivery outright: no fresh-send fallback, no message-sent hook,
+    /// and the reply is not reported as delivered.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    async fn process_channel_message_stops_on_flood_gate_error_without_fallback_send_or_hook() {
+        let channel_impl = Arc::new(DraftRecordingChannel {
+            finalize_flood_limited: true,
+            ..DraftRecordingChannel::new(false, false)
+        });
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (hook_events, hook_runner) = recording_message_sent_runner();
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            Some(hook_runner),
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            message_sent_hook_test_message(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            channel_impl.draft_messages.lock().await.as_slice(),
+            ["chat-42:..."]
+        );
+        assert!(channel_impl.finalized_messages.lock().await.is_empty());
+        assert!(
+            channel_impl.sent_messages.lock().await.is_empty(),
+            "a flood gate error must not fall back to a fresh send"
+        );
+        assert_eq!(
+            channel_impl.final_send_calls.load(Ordering::SeqCst),
+            0,
+            "a flood gate error is terminal: no fallback send_final"
+        );
+        assert!(
+            hook_events.lock().await.is_empty(),
+            "nothing was delivered, so the message-sent hook must not fire"
+        );
     }
 
     struct SlowModelProvider {
