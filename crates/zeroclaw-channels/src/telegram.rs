@@ -1026,6 +1026,10 @@ pub struct TelegramChannel {
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
     transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
+    /// Cache of local file paths for voice/audio messages that were downloaded
+    /// on-demand so reply context can reference them even when the original
+    /// message was dropped by the mention-only gate.
+    voice_file_paths: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
     ack_reactions: bool,
     tts_manager: Option<Arc<super::tts::TtsManager>>,
@@ -2661,6 +2665,7 @@ impl TelegramChannel {
             transcription: None,
             transcription_manager: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
+            voice_file_paths: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
             ack_reactions: true,
             tts_manager: None,
@@ -5080,6 +5085,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// Extract attachment metadata from an incoming Telegram message (document or photo).
     /// Returns `None` for text-only, voice, and other unsupported message types.
     fn parse_attachment_metadata(message: &serde_json::Value) -> Option<IncomingAttachment> {
+        let caption = message
+            .get("caption")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from);
+
         // Try document first
         if let Some(doc) = message.get("document") {
             let file_id = doc.get("file_id")?.as_str()?.to_string();
@@ -5092,10 +5102,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .get("mime_type")
                 .and_then(serde_json::Value::as_str)
                 .map(String::from);
-            let caption = message
-                .get("caption")
-                .and_then(serde_json::Value::as_str)
-                .map(String::from);
             return Some(IncomingAttachment {
                 file_id,
                 file_name,
@@ -5106,15 +5112,45 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             });
         }
 
+        // Voice notes: treat as document attachments so the agent can
+        // transcribe them (see `prepopulate_voice_reply_context` and the
+        // `transcriber__transcribe_audio` tool).
+        if let Some(voice) = message.get("voice") {
+            let file_id = voice.get("file_id")?.as_str()?.to_string();
+            let file_size = voice.get("file_size").and_then(serde_json::Value::as_u64);
+            return Some(IncomingAttachment {
+                file_id,
+                file_name: None,
+                file_size,
+                caption,
+                mime_type: None,
+                kind: IncomingAttachmentKind::Document,
+            });
+        }
+
+        // Audio files
+        if let Some(audio) = message.get("audio") {
+            let file_id = audio.get("file_id")?.as_str()?.to_string();
+            let file_name = audio
+                .get("file_name")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from);
+            let file_size = audio.get("file_size").and_then(serde_json::Value::as_u64);
+            return Some(IncomingAttachment {
+                file_id,
+                file_name,
+                file_size,
+                caption,
+                mime_type: None,
+                kind: IncomingAttachmentKind::Document,
+            });
+        }
+
         // Try photo (array of PhotoSize, take last = highest resolution)
         if let Some(photos) = message.get("photo").and_then(serde_json::Value::as_array) {
             let best = photos.last()?;
             let file_id = best.get("file_id")?.as_str()?.to_string();
             let file_size = best.get("file_size").and_then(serde_json::Value::as_u64);
-            let caption = message
-                .get("caption")
-                .and_then(serde_json::Value::as_str)
-                .map(String::from);
             return Some(IncomingAttachment {
                 file_id,
                 file_name: None,
@@ -5235,9 +5271,16 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 (local_filename, display_filename)
             }
             None => {
-                // For photos, derive extension from Telegram file path
-                let ext = tg_file_path.rsplit('.').next().unwrap_or("jpg");
-                let filename = format!("photo_{chat_id}_{message_id}.{ext}");
+                // Voice notes are documents without a file name; photos keep
+                // their own prefix. Derive the extension from the Telegram
+                // file path.
+                let filename = if attachment.kind == IncomingAttachmentKind::Document {
+                    let ext = tg_file_path.rsplit('.').next().unwrap_or("ogg");
+                    format!("voice_{chat_id}_{message_id}.{ext}")
+                } else {
+                    let ext = tg_file_path.rsplit('.').next().unwrap_or("jpg");
+                    format!("photo_{chat_id}_{message_id}.{ext}")
+                };
                 (filename.clone(), filename)
             }
         };
@@ -5615,13 +5658,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return UpdateDisposition::SkipPermanent;
         }
 
-        let voice_caption = message.get("caption").and_then(serde_json::Value::as_str);
-        if self
-            .check_media_mention_gate(message, voice_caption)
-            .is_none()
-        {
-            return UpdateDisposition::SkipPermanent;
-        }
+        // Voice notes are processed automatically for allowed users, even in
+        // `mention_only = true` groups: they usually carry no caption, so
+        // waiting for an explicit mention would mean never transcribing
+        // them. The agent receives the transcript and decides how to reply.
 
         let Some(chat_id) = message
             .get("chat")
@@ -5716,7 +5756,36 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         };
 
-        let text = match manager.transcribe(&audio_data, &file_name).await {
+        // Use the agent's configured provider if set; otherwise fall back to
+        // the only available provider. This lets `[transcription]` work for
+        // voice messages without requiring every agent to declare a
+        // `transcription_provider` alias.
+        let provider_alias = {
+            let alias = manager.agent_transcription_provider();
+            if alias.is_empty() {
+                manager
+                    .available_providers()
+                    .first()
+                    .map(|s| (*s).to_string())
+                    .unwrap_or_default()
+            } else {
+                alias.to_string()
+            }
+        };
+        if provider_alias.is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "No transcription provider available for voice message"
+            );
+            return UpdateDisposition::SkipPermanent;
+        }
+
+        let text = match manager
+            .transcribe_with_provider(&audio_data, &file_name, &provider_alias)
+            .await
+        {
             Ok(t) => t,
             Err(e) => {
                 let failure = super::transcription::failure_kind(&e);
@@ -5968,6 +6037,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             })
             .unwrap_or("unknown");
 
+        let caption = reply
+            .get("caption")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         let reply_text = if let Some(text) = reply.get("text").and_then(serde_json::Value::as_str) {
             text.to_string()
         } else if reply.get("voice").is_some() || reply.get("audio").is_some() {
@@ -5976,21 +6051,45 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .get("chat")
                 .and_then(|c| c.get("id"))
                 .and_then(serde_json::Value::as_i64);
-            if let (Some(mid), Some(cid)) = (reply_mid, chat_id) {
-                self.voice_transcriptions
-                    .lock()
-                    .get(&format!("{cid}:{mid}"))
-                    .map(|t| format!("[Voice] {t}"))
-                    .unwrap_or_else(|| "[Voice message]".to_string())
+            let body = if let (Some(mid), Some(cid)) = (reply_mid, chat_id) {
+                let key = format!("{cid}:{mid}");
+                if let Some(text) = self.voice_transcriptions.lock().get(&key) {
+                    format!("[Voice] {text}")
+                } else if let Some(path) = self.voice_file_paths.lock().get(&key) {
+                    let file_name = std::path::Path::new(path)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("audio.ogg");
+                    format!("[Document: {file_name}] {path}")
+                } else {
+                    "[Voice message]".to_string()
+                }
             } else {
                 "[Voice message]".to_string()
+            };
+            if let Some(caption) = caption {
+                format!("{body}\n\n{caption}")
+            } else {
+                body
             }
         } else if reply.get("photo").is_some() {
-            "[Photo]".to_string()
+            if let Some(caption) = caption {
+                format!("[Photo] {caption}")
+            } else {
+                "[Photo]".to_string()
+            }
         } else if reply.get("document").is_some() {
-            "[Document]".to_string()
+            if let Some(caption) = caption {
+                format!("[Document] {caption}")
+            } else {
+                "[Document]".to_string()
+            }
         } else if reply.get("video").is_some() {
-            "[Video]".to_string()
+            if let Some(caption) = caption {
+                format!("[Video] {caption}")
+            } else {
+                "[Video]".to_string()
+            }
         } else if reply.get("sticker").is_some() {
             "[Sticker]".to_string()
         } else {
@@ -6005,6 +6104,122 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .join("\n");
 
         Some(format!("> @{reply_sender}:\n{quoted_lines}"))
+    }
+
+    /// Pre-download a replied-to voice/audio message so `extract_reply_context`
+    /// can reference it even when the original message was dropped by the
+    /// mention-only gate. If built-in transcription is enabled, the audio is
+    /// also transcribed and cached; otherwise only the local file path is kept
+    /// so the agent can call `transcriber__transcribe_audio` itself.
+    async fn prepopulate_voice_reply_context(&self, update: &serde_json::Value) {
+        let Some(message) = update.get("message") else {
+            return;
+        };
+        let Some(reply) = message.get("reply_to_message") else {
+            return;
+        };
+        if reply.get("voice").is_none() && reply.get("audio").is_none() {
+            return;
+        }
+
+        let (username, sender_id, _) = Self::extract_sender_info(message);
+        let mut identities = vec![username.as_str()];
+        if let Some(id) = sender_id.as_deref() {
+            identities.push(id);
+        }
+        if !self.is_any_user_allowed(identities.iter().copied()) {
+            return;
+        }
+
+        let reply_mid = match reply.get("message_id").and_then(serde_json::Value::as_i64) {
+            Some(m) => m,
+            None => return,
+        };
+        let chat_id = match message
+            .get("chat")
+            .and_then(|c| c.get("id"))
+            .and_then(serde_json::Value::as_i64)
+        {
+            Some(c) => c,
+            None => return,
+        };
+        let key = format!("{chat_id}:{reply_mid}");
+        {
+            let paths = self.voice_file_paths.lock();
+            let texts = self.voice_transcriptions.lock();
+            if paths.contains_key(&key) || texts.contains_key(&key) {
+                return;
+            }
+        }
+
+        let workspace = match self.workspace_dir.as_ref() {
+            Some(w) => w,
+            None => return,
+        };
+        let save_dir = workspace.join("telegram_files");
+        if tokio::fs::create_dir_all(&save_dir).await.is_err() {
+            return;
+        }
+
+        let (file_id, duration) = match Self::parse_voice_metadata(reply) {
+            Some(v) => v,
+            None => return,
+        };
+
+        let tg_file_path = match self.get_file_path(&file_id).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let audio_data = match self.download_file(&tg_file_path).await {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        let local_filename = if reply.get("voice").is_some() {
+            let ext = tg_file_path.rsplit('.').next().unwrap_or("ogg");
+            format!("voice_{chat_id}_{reply_mid}.{ext}")
+        } else {
+            let ext = tg_file_path.rsplit('.').next().unwrap_or("mp3");
+            format!("audio_{chat_id}_{reply_mid}.{ext}")
+        };
+        let local_path = save_dir.join(&local_filename);
+        if tokio::fs::write(&local_path, &audio_data).await.is_err() {
+            return;
+        }
+        let path_str = local_path.to_string_lossy().into_owned();
+
+        // Prefer built-in transcription when configured.
+        if let (Some(config), Some(manager)) = (
+            self.transcription.as_ref(),
+            self.transcription_manager.as_deref(),
+        ) && duration <= config.max_duration_secs
+        {
+            let file_name = tg_file_path
+                .rsplit('/')
+                .next()
+                .unwrap_or("voice.ogg")
+                .to_string();
+            if let Ok(text) = manager.transcribe(&audio_data, &file_name).await
+                && !text.trim().is_empty()
+            {
+                let mut cache = self.voice_transcriptions.lock();
+                if cache.len() >= 100 {
+                    cache.clear();
+                }
+                cache.insert(key, text);
+                return;
+            }
+        }
+
+        // Fall back to caching the local path so the agent can transcribe itself.
+        {
+            let mut cache = self.voice_file_paths.lock();
+            if cache.len() >= 100 {
+                cache.clear();
+            }
+            cache.insert(key, path_str);
+        }
     }
 
     /// Forum-topic thread id for history keying and reply routing, if this
@@ -7619,6 +7834,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             *transient_retry = None;
             return UpdateOutcome::Advanced;
         }
+
+        // Download and cache the replied-to voice/audio file before
+        // parsing, so reply context can reference it even when the
+        // original message was dropped by the mention-only gate.
+        self.prepopulate_voice_reply_context(update).await;
 
         let disposition = if let Some(m) = self.parse_update_message(update) {
             UpdateDisposition::Parsed(Box::new(m))
@@ -21815,14 +22035,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_attachment_metadata_returns_none_for_voice() {
+    fn parse_attachment_metadata_returns_document_for_voice() {
         let message = serde_json::json!({
             "voice": {
                 "file_id": "voice_id",
                 "duration": 5
             }
         });
-        assert!(TelegramChannel::parse_attachment_metadata(&message).is_none());
+        let att = TelegramChannel::parse_attachment_metadata(&message).unwrap();
+        assert_eq!(att.file_id, "voice_id");
+        assert!(att.file_name.is_none());
+        assert!(matches!(att.kind, IncomingAttachmentKind::Document));
     }
 
     #[test]

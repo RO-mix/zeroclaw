@@ -14,7 +14,9 @@ use zeroclaw_config::schema::{Config, TranscriptionConfig};
 const MAX_AUDIO_BYTES: usize = 25 * 1024 * 1024;
 
 /// Request timeout for transcription API calls (seconds).
-const TRANSCRIPTION_TIMEOUT_SECS: u64 = 120;
+/// Local ASR models on CPU can take several minutes for the first request
+/// after startup, so keep a generous ceiling.
+const TRANSCRIPTION_TIMEOUT_SECS: u64 = 600;
 
 const GOOGLE_STT_ENDPOINT: &str = "https://speech.googleapis.com/v1/speech:recognize";
 const GOOGLE_API_KEY_HEADER: &str = "x-goog-api-key";
@@ -1350,6 +1352,12 @@ impl TranscriptionManager {
     pub fn with_agent_transcription_provider(mut self, alias: impl Into<String>) -> Self {
         self.agent_transcription_provider = alias.into();
         self
+    }
+
+    /// Return the resolved agent `transcription_provider` alias, if any.
+    #[must_use]
+    pub fn agent_transcription_provider(&self) -> &str {
+        self.agent_transcription_provider.as_str()
     }
 
     /// Transcribe audio using the runtime-active agent's resolved
