@@ -127,3 +127,20 @@ target/openapi.json
 /v[0-9]*.toml
 .worktrees/
 .zero-to-5/
+
+# Local project contours (NotaBene research workspace) — must never reach upstream
+_notabene-researcher/
+
+# Local-only working dirs and artifacts — must never reach upstream
+_bmad/
+_bmad-output/
+_maintenance/
+peers/
+deploy/
+grafeo/
+zapret-win-bundle-master/
+.agents/
+HANDOFF-*.md
+RustDesk*.toml
+RustDesk_ab
+peers.toml
