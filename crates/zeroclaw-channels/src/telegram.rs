@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use zeroclaw_api::channel::{
     Channel, ChannelMessage, ChannelModelPickerRequest, ListenerHealth, ProgressEvent, SendMessage,
@@ -39,6 +40,13 @@ const POLL_HEALTH_STALE_AFTER: Duration = Duration::from_secs(90);
 /// cannot cancel the wait. The drop is permanent either way, so on timeout the
 /// notice is abandoned, not retried.
 const VOICE_DROP_NOTICE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Ceiling on one `remove_reaction` clear. The clear runs while the
+/// orchestrator still holds the conversation permit, and
+/// `build_channel_proxy_client` sets no request timeout, so this bounds both
+/// the wait for an in-flight acknowledgement and the clear request itself
+/// (including its error-body read). A stalled Telegram must not pin the turn.
+const REACTION_CLEAR_TIMEOUT: Duration = Duration::from_secs(5);
 
 static ORPHAN_THINK_TAG_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(r"</?(?:redacted_)?think(?:ing)?>").expect("ORPHAN_THINK_TAG_RE must compile")
@@ -721,6 +729,129 @@ fn build_telegram_ack_reaction_request(
     })
 }
 
+/// Build the `setMessageReaction` body that withdraws the bot's reaction.
+///
+/// Telegram gives a bot a single reaction slot per message, so an empty
+/// `reaction` list clears whatever emoji the bot set there, whichever one it was.
+fn build_telegram_clear_reaction_request(chat_id: &str, message_id: i64) -> serde_json::Value {
+    serde_json::json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "reaction": []
+    })
+}
+
+/// Scrub Telegram credentials from a clear-path error before it reaches a log
+/// or a tool result. The shared leak detector redacts the `/bot<token>/` URL
+/// form; the literal token is also removed because a failed response body may
+/// echo it without the surrounding URL.
+fn scrub_clear_error(text: &str, bot_token: &str) -> String {
+    let scrubbed = zeroclaw_runtime::security::scrub(text);
+    if bot_token.is_empty() {
+        return scrubbed;
+    }
+    scrubbed.replace(bot_token, "[REDACTED_BOT_TOKEN]")
+}
+
+/// Send the `setMessageReaction` clear that withdraws the bot's reaction.
+///
+/// Bounded by `timeout` because the caller awaits it while holding the
+/// conversation permit and `build_channel_proxy_client` sets no request timeout.
+/// Returns an error on a non-success response or when the bound elapses: an
+/// unconfirmed clear must not be reported as a withdrawn reaction.
+async fn clear_telegram_reaction(
+    client: &reqwest::Client,
+    url: &str,
+    bot_token: &str,
+    chat_id: &str,
+    message_id: i64,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let body = build_telegram_clear_reaction_request(chat_id, message_id);
+    let request = async {
+        // `api_url` embeds the bot token, and reqwest puts the URL in transport
+        // errors. Neither those errors nor a reflected error body may reach a
+        // log or a tool result unscrubbed: the token grants control of the bot.
+        let response = client.post(url).json(&body).send().await.map_err(|err| {
+            anyhow::Error::msg(format!(
+                "Telegram setMessageReaction (clear) failed: {}",
+                scrub_clear_error(&err.without_url().to_string(), bot_token)
+            ))
+        })?;
+        let status = response.status();
+        let body = response.text().await.map_err(|err| {
+            anyhow::Error::msg(format!(
+                "Telegram setMessageReaction (clear) response read failed: {}",
+                scrub_clear_error(&err.without_url().to_string(), bot_token)
+            ))
+        })?;
+        if !status.is_success() {
+            anyhow::bail!(
+                "Telegram setMessageReaction (clear) failed ({status}): {}",
+                scrub_clear_error(&body, bot_token)
+            );
+        }
+        let result: serde_json::Value = serde_json::from_str(&body).map_err(|err| {
+            anyhow::Error::msg(format!(
+                "Telegram setMessageReaction (clear) returned invalid JSON: {err}"
+            ))
+        })?;
+        if !result["ok"].as_bool().unwrap_or(false) {
+            anyhow::bail!(
+                "Telegram setMessageReaction (clear) rejected: {}",
+                scrub_clear_error(&body, bot_token)
+            );
+        }
+        Ok(())
+    };
+    match tokio::time::timeout(timeout, request).await {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!(
+            "Telegram setMessageReaction (clear) timed out after {timeout:?} \
+             (chat_id={chat_id}, message_id={message_id})"
+        ),
+    }
+}
+
+/// Shared state for one in-flight acknowledgement reaction.
+///
+/// `try_add_ack_reaction_nonblocking` fires the add request in a detached task;
+/// `remove_reaction` needs the clear to land *after* that request. A request
+/// already on the wire cannot be recalled by aborting the task, so ordering is
+/// kept by handing the clear to the ack task instead of racing it: the task
+/// sends the clear itself, right after the add response, once it observes
+/// `clear_requested`.
+#[derive(Default)]
+struct AckReactionState {
+    /// Set by `remove_reaction` when the reaction should be withdrawn. The ack
+    /// task checks it once its add request has settled.
+    clear_requested: AtomicBool,
+    /// Set by the ack task only once it has *confirmed* the clear, so
+    /// `remove_reaction` skips its own clear only when the withdraw actually
+    /// landed. A failed deferred clear leaves this false, and `remove_reaction`
+    /// retries it (and reports the failure) instead of claiming success.
+    cleared: AtomicBool,
+}
+
+/// In-flight acknowledgements keyed by `(chat_id, message_id)`: the shared
+/// state and the detached task that `remove_reaction` settles before clearing.
+type InFlightAckReactions =
+    Mutex<HashMap<(String, i64), (Arc<AckReactionState>, tokio::task::JoinHandle<()>)>>;
+
+/// The numeric message id inside a `telegram_{chat_id}_{message_id}` channel id.
+///
+/// Returns `None` for ids that are not in that shape, so a caller can skip the
+/// API call instead of reacting against a guessed message. The chat id may be
+/// negative, which is why the split is on the last `_`.
+fn parse_telegram_message_id(message_id: &str) -> Option<i64> {
+    message_id
+        .strip_prefix("telegram_")?
+        .rsplit_once('_')?
+        .1
+        .parse()
+        .ok()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TelegramAttachmentKind {
     Image,
@@ -1009,6 +1140,9 @@ pub struct TelegramChannel {
     /// per sender. See `with_per_user_session`.
     per_user_session: bool,
     passive_group_context: bool,
+    /// Whether `edited_message` updates are processed as inbound messages
+    /// (opt-in, wired from `channels.telegram.<alias>.edited_messages`).
+    edited_messages: bool,
     bot_username: Mutex<Option<String>>,
     bot_id: Mutex<Option<i64>>,
     /// Outcome of the most recent `getUpdates` exchange and when it completed,
@@ -1064,6 +1198,20 @@ pub struct TelegramChannel {
     /// shrink it so a retry-budget regression does not wait out the real
     /// backoff.
     transient_retry_delay: Duration,
+    /// Bound on one `remove_reaction` clear. Always [`REACTION_CLEAR_TIMEOUT`]
+    /// in production; tests shrink it so a stalled-clear regression does not
+    /// have to wait out the real ceiling.
+    reaction_clear_timeout: Duration,
+    /// In-flight acknowledgement reactions keyed by `(chat_id, message_id)`.
+    ///
+    /// `try_add_ack_reaction_nonblocking` sends the real `setMessageReaction`
+    /// request in a detached task, so the orchestrator's `early_ack_task` -
+    /// which calls the no-op `add_reaction` - does not wait for it.
+    /// `remove_reaction` settles the entry for the message before clearing, so
+    /// the clear cannot overtake the ack and strand the emoji. When the ack
+    /// outlives the settle bound the task keeps the clear, ordered after the
+    /// add response - see [`AckReactionState`].
+    ack_reactions_in_flight: InFlightAckReactions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2658,6 +2806,7 @@ impl TelegramChannel {
             mention_only,
             per_user_session: true,
             passive_group_context: false,
+            edited_messages: false,
             bot_username: Mutex::new(None),
             bot_id: Mutex::new(None),
             poll_health: Mutex::new(None),
@@ -2681,6 +2830,8 @@ impl TelegramChannel {
             approval_timeout_secs: 120,
             voice_drop_notice_timeout: VOICE_DROP_NOTICE_TIMEOUT,
             transient_retry_delay: Duration::from_secs(Self::TRANSIENT_RETRY_DELAY_SECS),
+            reaction_clear_timeout: REACTION_CLEAR_TIMEOUT,
+            ack_reactions_in_flight: Mutex::new(HashMap::new()),
         }
     }
 
@@ -2702,6 +2853,15 @@ impl TelegramChannel {
         self
     }
 
+    /// Shrink the `remove_reaction` clear bound so a stalled-clear test does
+    /// not wait out the production ceiling. Test-only: the ceiling protects
+    /// the turn, it is not operator-tunable.
+    #[cfg(test)]
+    fn with_reaction_clear_timeout(mut self, timeout: Duration) -> Self {
+        self.reaction_clear_timeout = timeout;
+        self
+    }
+
     /// Set the resolver used to resolve voice-chat peers live (no cached state).
     pub fn with_voice_peer_resolver(
         mut self,
@@ -2720,6 +2880,12 @@ impl TelegramChannel {
     /// Record unaddressed group messages as passive context instead of dropping them.
     pub fn with_passive_group_context(mut self, enabled: bool) -> Self {
         self.passive_group_context = enabled;
+        self
+    }
+
+    /// Process Telegram `edited_message` updates as inbound messages.
+    pub fn with_edited_messages(mut self, enabled: bool) -> Self {
+        self.edited_messages = enabled;
         self
     }
 
@@ -3376,8 +3542,19 @@ impl TelegramChannel {
         }
     }
 
+    /// The message payload of an update, whether it arrived as a new
+    /// `message` or as an `edited_message` (Telegram delivers the full
+    /// post-edit message under the latter key). Callers run the identical
+    /// pipeline for both; the edit itself is flagged on the parsed
+    /// `ChannelMessage` by `process_update`.
+    fn update_message(update: &serde_json::Value) -> Option<&serde_json::Value> {
+        update
+            .get("message")
+            .or_else(|| update.get("edited_message"))
+    }
+
     fn extract_update_message_target(update: &serde_json::Value) -> Option<(String, i64)> {
-        let message = update.get("message")?;
+        let message = Self::update_message(update)?;
         let chat_id = message
             .get("chat")
             .and_then(|chat| chat.get("id"))
@@ -3723,24 +3900,67 @@ impl TelegramChannel {
     fn try_add_ack_reaction_nonblocking(&self, chat_id: String, message_id: i64) {
         let client = self.http_client();
         let url = self.api_url("setMessageReaction");
+        let bot_token = self.bot_token.clone();
         let emoji = random_telegram_ack_reaction().to_string();
         let body = build_telegram_ack_reaction_request(&chat_id, message_id, &emoji);
+        let clear_timeout = self.reaction_clear_timeout;
+        let key = (chat_id.clone(), message_id);
+        let state = Arc::new(AckReactionState::default());
+        let task_state = Arc::clone(&state);
 
-        zeroclaw_spawn::spawn!(async move {
-            let response = match client.post(&url).json(&body).send().await {
-                Ok(resp) => resp,
+        let handle = zeroclaw_spawn::spawn!(async move {
+            match client.post(&url).json(&body).send().await {
+                Ok(response) => {
+                    if !response.status().is_success() {
+                        let status = response.status();
+                        let err_body = response.text().await.unwrap_or_default();
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"chat_id": chat_id, "message_id": message_id, "status": status.to_string(), "err_body": err_body})), "add ACK reaction failed for chat_id=, message_id=: status=, body=");
+                    }
+                }
                 Err(err) => {
                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"chat_id": chat_id, "message_id": message_id, "err": err.to_string()})), "failed to add ACK reaction to chat_id=, message_id=");
-                    return;
                 }
-            };
+            }
 
-            if !response.status().is_success() {
-                let status = response.status();
-                let err_body = response.text().await.unwrap_or_default();
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"chat_id": chat_id, "message_id": message_id, "status": status.to_string(), "err_body": err_body})), "add ACK reaction failed for chat_id=, message_id=: status=, body=");
+            // The add request has settled - success, error response, or
+            // transport failure. Only now is it safe to withdraw: the clear runs
+            // after the add response, so it cannot be overtaken by an add that
+            // is still on the wire. `remove_reaction` sets `clear_requested`
+            // when it cannot wait the add out, and returns without clearing;
+            // the clear it requested is run here instead.
+            if task_state.clear_requested.load(Ordering::Acquire) {
+                match clear_telegram_reaction(
+                    &client,
+                    &url,
+                    &bot_token,
+                    &chat_id,
+                    message_id,
+                    clear_timeout,
+                )
+                .await
+                {
+                    Ok(()) => task_state.cleared.store(true, Ordering::Release),
+                    Err(err) => {
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"chat_id": chat_id, "message_id": message_id, "err": err.to_string()})), "deferred ACK reaction clear failed for chat_id=, message_id=");
+                    }
+                }
             }
         });
+        self.track_ack_reaction(key, state, handle);
+    }
+
+    /// Remember a freshly spawned acknowledgement so `remove_reaction` can
+    /// settle it before clearing. Finished entries are dropped here, so the map
+    /// stays bounded by the acknowledgements still in flight.
+    fn track_ack_reaction(
+        &self,
+        key: (String, i64),
+        state: Arc<AckReactionState>,
+        handle: tokio::task::JoinHandle<()>,
+    ) {
+        let mut inflight = self.ack_reactions_in_flight.lock();
+        inflight.retain(|_, (_, task)| !task.is_finished());
+        inflight.insert(key, (state, handle));
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -4732,7 +4952,7 @@ impl TelegramChannel {
     }
 
     async fn handle_unauthorized_message(&self, update: &serde_json::Value) {
-        let Some(message) = update.get("message") else {
+        let Some(message) = Self::update_message(update) else {
             return;
         };
 
@@ -5393,7 +5613,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         &self,
         update: &serde_json::Value,
     ) -> UpdateDisposition {
-        let Some(message) = update.get("message") else {
+        let Some(message) = Self::update_message(update) else {
             return UpdateDisposition::SkipPermanent;
         };
         let Some(attachment) = Self::parse_attachment_metadata(message) else {
@@ -5637,7 +5857,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let Some(manager) = self.transcription_manager.as_deref() else {
             return UpdateDisposition::SkipPermanent;
         };
-        let Some(message) = update.get("message") else {
+        let Some(message) = Self::update_message(update) else {
             return UpdateDisposition::SkipPermanent;
         };
 
@@ -6243,7 +6463,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     }
 
     fn parse_update_message(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
-        let message = update.get("message")?;
+        let message = Self::update_message(update)?;
 
         let text = message.get("text").and_then(serde_json::Value::as_str)?;
 
@@ -7737,6 +7957,21 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     ) -> UpdateOutcome {
         let uid = update.get("update_id").and_then(serde_json::Value::as_i64);
 
+        // Telegram delivers an edited message as the full post-edit payload
+        // under `edited_message`. Processing is opt-in
+        // (`channels.telegram.<alias>.edited_messages`); when enabled, the
+        // edit flows through the exact pipeline of an ordinary message
+        // (authorization, mention gate, reply-to-bot bypass, attachments)
+        // and the parsed message is marked so the orchestrator can apply
+        // the edit policy (freshness gate, latest-wins coalescing).
+        let edited = update.get("edited_message").is_some();
+        if edited && !self.edited_messages {
+            if uid.is_some() {
+                *transient_retry = None;
+            }
+            return UpdateOutcome::Advanced;
+        }
+
         // ── Handle callback_query (inline keyboard taps) ──
         if let Some(cb) = update.get("callback_query") {
             let cb_data = cb
@@ -7849,7 +8084,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         };
 
-        let msg = match disposition {
+        let mut msg = match disposition {
             UpdateDisposition::Parsed(m) => m,
             UpdateDisposition::SkipPermanent => {
                 Box::pin(self.handle_unauthorized_message(update)).await;
@@ -7862,6 +8097,20 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 return self.pause_for_transient_update(uid, transient_retry).await;
             }
         };
+
+        if edited {
+            msg.edited = true;
+            // The freshness policy keys on the ORIGINAL send time (`date`),
+            // not the edit time (`edit_date`): editing an old message
+            // clarifies history, it is not a live prompt.
+            if let Some(original_date) = update
+                .get("edited_message")
+                .and_then(|message| message.get("date"))
+                .and_then(serde_json::Value::as_u64)
+            {
+                msg.timestamp = original_date;
+            }
+        }
 
         if self.dispatch_incoming_message(tx, update, *msg).await {
             if uid.is_some() {
@@ -9327,6 +9576,78 @@ Ensure only one `zeroclaw` process is using this bot token."
         Ok(())
     }
 
+    /// Withdraw the bot's acknowledgement reaction once the reply is done.
+    ///
+    /// Telegram gives a bot a single reaction slot per message, so the clear is
+    /// an empty reaction list and `_emoji` is ignored: the slot holds whichever
+    /// `TELEGRAM_ACK_REACTIONS` entry the ack path picked. A message id that is
+    /// not in the `telegram_{chat_id}_{message_id}` form is a no-op.
+    ///
+    /// The real acknowledgement is sent by `try_add_ack_reaction_nonblocking`
+    /// in a detached task, so this settles that task before clearing: otherwise
+    /// the ack can land after the clear and restore the reaction with nothing
+    /// left to remove it. The settle wait is bounded by `REACTION_CLEAR_TIMEOUT`
+    /// because the orchestrator awaits this while holding the conversation
+    /// permit. A request already on the wire cannot be recalled, so an ack that
+    /// outlives the bound keeps the clear: the ack task runs it after the add
+    /// response, and this returns an error because the withdraw is not yet
+    /// confirmed.
+    async fn remove_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        _emoji: &str,
+    ) -> anyhow::Result<()> {
+        let Some(numeric_message_id) = parse_telegram_message_id(message_id) else {
+            return Ok(());
+        };
+        let (chat_id, _) = Self::parse_reply_target(channel_id);
+
+        // Settle the in-flight ack first. Aborting the task would not un-send a
+        // request already on the wire, so on timeout the clear is handed to the
+        // task instead of racing it here.
+        let inflight = self
+            .ack_reactions_in_flight
+            .lock()
+            .remove(&(chat_id.clone(), numeric_message_id));
+        if let Some((state, mut handle)) = inflight {
+            state.clear_requested.store(true, Ordering::Release);
+            if tokio::time::timeout(self.reaction_clear_timeout, &mut handle)
+                .await
+                .is_err()
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "chat_id": chat_id,
+                            "message_id": numeric_message_id,
+                        })),
+                    "Telegram acknowledgement still in flight; the clear is deferred to it"
+                );
+                anyhow::bail!(
+                    "Telegram acknowledgement for chat_id={chat_id} message_id={numeric_message_id} \
+                     is still in flight; the clear is deferred to that task"
+                );
+            }
+            // The ack settled and may already have confirmed the clear it was
+            // asked for; only clear here if it did not.
+            if state.cleared.load(Ordering::Acquire) {
+                return Ok(());
+            }
+        }
+
+        clear_telegram_reaction(
+            &self.http_client(),
+            &self.api_url("setMessageReaction"),
+            &self.bot_token,
+            &chat_id,
+            numeric_message_id,
+            self.reaction_clear_timeout,
+        )
+        .await
+    }
+
     /// Delegates to [`Self::request_approval_attributed`] and drops the
     /// provenance, so the prompt/timeout logic lives in exactly one place.
     async fn request_approval(
@@ -10223,6 +10544,434 @@ mod tests {
         assert_eq!(body["message_id"], 42);
         assert_eq!(body["reaction"][0]["type"], "emoji");
         assert_eq!(body["reaction"][0]["emoji"], "⚡️");
+    }
+
+    #[test]
+    fn telegram_clear_reaction_request_shape() {
+        let body = build_telegram_clear_reaction_request("-100200300", 42);
+        assert_eq!(body["chat_id"], "-100200300");
+        assert_eq!(body["message_id"], 42);
+        assert_eq!(body["reaction"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn parse_telegram_message_id_reads_the_numeric_suffix() {
+        assert_eq!(
+            parse_telegram_message_id("telegram_-100200300_42"),
+            Some(42)
+        );
+        assert_eq!(parse_telegram_message_id("telegram_1234_7"), Some(7));
+    }
+
+    #[test]
+    fn parse_telegram_message_id_rejects_unrecognised_ids() {
+        assert_eq!(parse_telegram_message_id("telegram_1234"), None);
+        assert_eq!(parse_telegram_message_id("slack_1234_42"), None);
+        assert_eq!(parse_telegram_message_id("telegram_1234_abc"), None);
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_skips_unparseable_message_id() {
+        // No fixture HTTP client is installed, so any network call would fail
+        // the test rather than pass silently.
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(Vec::<String>::new),
+            false,
+        );
+        channel
+            .remove_reaction("-100200300", "not-a-telegram-id", "\u{1F440}")
+            .await
+            .expect("an unparseable message id is a no-op");
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_settles_the_inflight_ack_before_clearing() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // Only the clear reaches the server; the ack is the gated task below.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMessageReaction$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri());
+
+        // Stand in for the detached ack request: a task we hold open so the
+        // clear has something in flight to settle.
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let ack = zeroclaw_spawn::spawn!(async move {
+            let _ = release_rx.await;
+        });
+        channel.ack_reactions_in_flight.lock().insert(
+            ("-100200300".to_string(), 42),
+            (Arc::new(AckReactionState::default()), ack),
+        );
+
+        let clear = channel.remove_reaction("-100200300", "telegram_-100200300_42", "\u{1F440}");
+        // The clear must not be sent while the ack is still in flight; release
+        // the ack and the clear then proceeds.
+        let probe = async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let sent = mock_server.received_requests().await.unwrap().len();
+            let _ = release_tx.send(());
+            sent
+        };
+        let (result, sent_while_ack_pending) = tokio::join!(clear, probe);
+        result.expect("the clear succeeds once the ack settles");
+        assert_eq!(
+            sent_while_ack_pending, 0,
+            "remove_reaction must not clear before the in-flight ack settles"
+        );
+        assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_bounds_a_stalled_clear() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // Accepts the connection but never answers, so only the timeout can
+        // release the turn.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMessageReaction$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(120))
+                    .set_body_json(serde_json::json!({"ok": true, "result": true})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_reaction_clear_timeout(std::time::Duration::from_millis(100))
+        .with_mock_api_base(mock_server.uri());
+
+        let started = std::time::Instant::now();
+        let result = channel
+            .remove_reaction("-100200300", "telegram_-100200300_42", "\u{1F440}")
+            .await;
+        // A clear that never lands is not a removed reaction: the tool must not
+        // be told the withdraw succeeded. The turn is still released by the
+        // bound, so the orchestrator's best-effort cleanup is unaffected.
+        assert!(
+            result.is_err(),
+            "a stalled clear must surface as an error, got {result:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "the clear must be bounded, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_defers_the_clear_after_an_inflight_ack() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // Every setMessageReaction is held open long enough that the ack add
+        // outlives the settle bound; a clear must therefore never be sent from
+        // remove_reaction itself, only from the ack task once the add settles.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMessageReaction$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(1000))
+                    .set_body_json(serde_json::json!({"ok": true, "result": true})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_reaction_clear_timeout(std::time::Duration::from_millis(50))
+        .with_mock_api_base(mock_server.uri());
+
+        // The real ack path fires the add request in a detached task.
+        channel.try_add_ack_reaction_nonblocking("-100200300".to_string(), 42);
+
+        // The ack outlives the settle bound, so the clear cannot be confirmed:
+        // remove_reaction reports that and hands the clear to the ack task
+        // instead of racing an add that is still on the wire.
+        let result = channel
+            .remove_reaction("-100200300", "telegram_-100200300_42", "\u{1F440}")
+            .await;
+        assert!(
+            result.is_err(),
+            "an ack that outlives the settle bound is not a confirmed clear"
+        );
+
+        // While the add is still in flight, only the add may have reached the
+        // server; a clear sent here would be the exact overtake the fix forbids.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let pending = mock_server.received_requests().await.unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "the clear must not overtake the in-flight ack: {pending:?}"
+        );
+
+        // Once the add settles the ack task runs the deferred clear, after it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while mock_server.received_requests().await.unwrap().len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the deferred clear never landed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let sent = mock_server.received_requests().await.unwrap();
+        assert_eq!(sent.len(), 2);
+        let add: serde_json::Value = serde_json::from_slice(&sent[0].body).unwrap();
+        let clear: serde_json::Value = serde_json::from_slice(&sent[1].body).unwrap();
+        assert!(
+            add["reaction"]
+                .as_array()
+                .is_some_and(|reaction| !reaction.is_empty()),
+            "the first request must be the ack add, got {add}"
+        );
+        assert_eq!(
+            clear["reaction"],
+            serde_json::json!([]),
+            "the second request must be the clear, got {clear}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_reports_a_failed_deferred_clear() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // The clear (an empty reaction list) is answered with an error, so the
+        // withdraw never lands. The add is answered late, so it is still in
+        // flight when remove_reaction runs and the clear is handed to the ack
+        // task rather than sent by remove_reaction itself.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMessageReaction$"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body).unwrap_or(serde_json::Value::Null);
+                let is_clear = body
+                    .get("reaction")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|reaction| reaction.is_empty());
+                if is_clear {
+                    ResponseTemplate::new(500).set_body_string("boom")
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_delay(std::time::Duration::from_millis(200))
+                        .set_body_json(serde_json::json!({"ok": true, "result": true}))
+                }
+            })
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_reaction_clear_timeout(std::time::Duration::from_secs(2))
+        .with_mock_api_base(mock_server.uri());
+
+        channel.try_add_ack_reaction_nonblocking("-100200300".to_string(), 42);
+
+        // The add settles inside the settle bound, so the ack task runs the
+        // deferred clear - and that clear fails. remove_reaction must report the
+        // failure instead of returning the ack task's swallowed error as
+        // success: the reaction tool would otherwise say "Reaction removed" for
+        // a withdraw that never reached Telegram.
+        let result = channel
+            .remove_reaction("-100200300", "telegram_-100200300_42", "\u{1F440}")
+            .await;
+        assert!(
+            result.is_err(),
+            "a deferred clear that never landed must not be reported as removed, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_scrubs_bot_token_from_a_transport_error() {
+        const TOKEN: &str = "123456:TEST-TOKEN";
+
+        // Bind and immediately drop a listener to reserve a port nothing is
+        // listening on, so the request fails before any response is read.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api_base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+
+        let channel = TelegramChannel::new(
+            TOKEN.into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_reaction_clear_timeout(std::time::Duration::from_secs(2))
+        .with_mock_api_base(api_base);
+
+        let err = channel
+            .remove_reaction("-100200300", "telegram_-100200300_42", "\u{1F440}")
+            .await
+            .expect_err("a connection failure must surface")
+            .to_string();
+        assert!(!err.contains(TOKEN), "error leaked the bot token: {err}");
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_scrubs_bot_token_reflected_in_an_error_body() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const TOKEN: &str = "123456:TEST-TOKEN";
+        let mock_server = MockServer::start().await;
+        // A proxy or gateway can reflect the request URL - and with it the bot
+        // token - in its error body. Echo the bare token as well, which the
+        // URL-shaped leak pattern alone would not catch.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMessageReaction$"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(format!(
+                "upstream failed for https://api.telegram.org/bot{TOKEN}/setMessageReaction (token {TOKEN})"
+            )))
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            TOKEN.into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri());
+
+        let err = channel
+            .remove_reaction("-100200300", "telegram_-100200300_42", "\u{1F440}")
+            .await
+            .expect_err("an error response must surface")
+            .to_string();
+        assert!(!err.contains(TOKEN), "error leaked the bot token: {err}");
+        assert!(
+            err.contains("[REDACTED_BOT_TOKEN]"),
+            "expected the redaction marker: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_rejects_telegram_api_error_in_successful_http_response() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMessageReaction$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "Bad Request: reaction can't be removed"
+            })))
+            .mount(&mock_server)
+            .await;
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri());
+
+        let err = channel
+            .remove_reaction("-100200300", "telegram_-100200300_42", "\u{1F440}")
+            .await
+            .expect_err("Telegram rejecting the clear must not report success")
+            .to_string();
+        assert!(err.contains("reaction can't be removed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_accepts_telegram_ok_response() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMessageReaction$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&mock_server)
+            .await;
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri());
+
+        channel
+            .remove_reaction("-100200300", "telegram_-100200300_42", "\u{1F440}")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn clear_helper_error_is_scrubbed_for_the_deferred_log() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const TOKEN: &str = "123456:TEST-TOKEN";
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/setMessageReaction$"))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_string(format!("reflected token {TOKEN}")),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/bot{TOKEN}/setMessageReaction", mock_server.uri());
+        // This is the exact error the deferred ack task formats into its log
+        // record, so a scrubbed helper keeps the log clean too.
+        let err = clear_telegram_reaction(
+            &client,
+            &url,
+            TOKEN,
+            "-100200300",
+            42,
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .expect_err("an error response must surface")
+        .to_string();
+        assert!(!err.contains(TOKEN), "error leaked the bot token: {err}");
     }
 
     #[test]
@@ -18121,6 +18870,10 @@ mod tests {
     fn telegram_contains_bot_mention_finds_mention() {
         assert!(TelegramChannel::contains_bot_mention(
             "Hello @mybot",
+            "@mybot"
+        ));
+        assert!(TelegramChannel::contains_bot_mention(
+            "Hello @mybot",
             "mybot"
         ));
         assert!(TelegramChannel::contains_bot_mention(
@@ -18133,6 +18886,10 @@ mod tests {
         ));
         assert!(TelegramChannel::contains_bot_mention(
             "Hello @MyBot, can you help?",
+            "mybot"
+        ));
+        assert!(TelegramChannel::contains_bot_mention(
+            "你好 @mybot，请处理",
             "mybot"
         ));
     }
@@ -18296,6 +19053,143 @@ mod tests {
         // extract_reply_context prepends the quote; the gate returns the body,
         // and the quote is re-added by the normal reply-handling path.
         assert_eq!(parsed.content, "> @mybot:\n> original\n\ndo this");
+    }
+
+    #[test]
+    fn parse_update_edited_message_mention_only_group_requires_mention() {
+        let mention_only = true;
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+
+        // An edit that leaves the message unaddressed must not trigger.
+        let update = serde_json::json!({
+            "update_id": 60,
+            "edited_message": {
+                "message_id": 61,
+                "text": "just chatting",
+                "date": 1_700_000_000,
+                "edit_date": 1_700_000_100,
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "group" }
+            }
+        });
+
+        assert!(ch.parse_update_message(&update).is_none());
+    }
+
+    #[test]
+    fn parse_update_edited_message_mention_passes_gate() {
+        let mention_only = true;
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+
+        // The edit adds the mention: the edited message is now addressed.
+        let update = serde_json::json!({
+            "update_id": 62,
+            "edited_message": {
+                "message_id": 63,
+                "text": "@mybot status please",
+                "date": 1_700_000_000,
+                "edit_date": 1_700_000_100,
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "group" }
+            }
+        });
+
+        let parsed = ch
+            .parse_update_message(&update)
+            .expect("an edit that adds a mention must pass the gate");
+        assert_eq!(parsed.content, "@mybot status please");
+    }
+
+    #[test]
+    fn parse_update_edited_message_reply_to_bot_bypasses_mention_only_gate() {
+        let mention_only = true;
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        {
+            let mut cache = ch.bot_id.lock();
+            *cache = Some(42);
+        }
+
+        let update = serde_json::json!({
+            "update_id": 64,
+            "edited_message": {
+                "message_id": 65,
+                "text": "do this instead",
+                "date": 1_700_000_000,
+                "edit_date": 1_700_000_100,
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "group" },
+                "reply_to_message": {
+                    "message_id": 50,
+                    "from": { "id": 42, "username": "mybot", "is_bot": true },
+                    "text": "original"
+                }
+            }
+        });
+
+        let parsed = ch
+            .parse_update_message(&update)
+            .expect("reply-to-bot edit should bypass mention_only gate");
+        assert_eq!(parsed.content, "> @mybot:\n> original\n\ndo this instead");
+    }
+
+    #[test]
+    fn parse_update_edited_message_unaddressed_becomes_passive_context() {
+        let mention_only = true;
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_passive_group_context(true);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+
+        let update = serde_json::json!({
+            "update_id": 66,
+            "edited_message": {
+                "message_id": 67,
+                "text": "just chatting",
+                "date": 1_700_000_000,
+                "edit_date": 1_700_000_100,
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "group" }
+            }
+        });
+
+        let parsed = ch
+            .parse_update_message(&update)
+            .expect("unaddressed edit must be recorded as passive context");
+        assert!(parsed.passive_context);
     }
 
     #[test]
@@ -25892,6 +26786,94 @@ mod tests {
         assert!(
             side_effects.is_empty(),
             "passive observation must stay silent, but the bot called: {side_effects:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_update_marks_edited_message_and_anchors_original_date() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(
+                r"/bot[^/]+/(sendChatAction|setMessageReaction)$",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_edited_messages(true)
+        .with_api_base(mock_server.uri());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(4);
+        let mut transient_retry = None;
+        let update = serde_json::json!({
+            "update_id": 70,
+            "edited_message": {
+                "message_id": 71,
+                "chat": { "id": 12345, "type": "private" },
+                "from": { "username": "alice", "id": 99 },
+                "text": "edited question",
+                "date": 1_700_000_000,
+                "edit_date": 1_700_000_100
+            }
+        });
+
+        let outcome = ch.process_update(&update, &tx, &mut transient_retry).await;
+        assert!(matches!(outcome, UpdateOutcome::Advanced));
+
+        let delivered = rx
+            .try_recv()
+            .expect("enabled edited_message must be delivered downstream");
+        assert!(
+            delivered.edited,
+            "edit must be flagged for the orchestrator"
+        );
+        assert_eq!(
+            delivered.timestamp, 1_700_000_000,
+            "freshness keys on the original message date, not the edit date"
+        );
+        assert_eq!(delivered.content, "edited question");
+    }
+
+    #[tokio::test]
+    async fn process_update_ignores_edited_message_when_disabled() {
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(4);
+        let mut transient_retry = None;
+        let update = serde_json::json!({
+            "update_id": 72,
+            "edited_message": {
+                "message_id": 73,
+                "chat": { "id": 12345, "type": "private" },
+                "from": { "username": "alice", "id": 99 },
+                "text": "edited question",
+                "date": 1_700_000_000,
+                "edit_date": 1_700_000_100
+            }
+        });
+
+        let outcome = ch.process_update(&update, &tx, &mut transient_retry).await;
+        assert!(matches!(outcome, UpdateOutcome::Advanced));
+        assert!(
+            rx.try_recv().is_err(),
+            "edited_message must be dropped while edited_messages is disabled"
         );
     }
 
