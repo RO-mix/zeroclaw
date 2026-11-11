@@ -11613,6 +11613,11 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     }
                 }
             }
+            // Drain the trace writer before the process exits: the disk
+            // worker holds accepted-but-unsynced events in its queue, and a
+            // service stop that kills the process would drop them (issue
+            // #12391). Must run before the restart/respawn exits below.
+            zeroclaw_log::shutdown();
             if let Some(handle) = degraded_nag.take() {
                 handle.abort();
             }

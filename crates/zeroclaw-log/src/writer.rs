@@ -532,6 +532,29 @@ pub fn flush_for_test() -> Result<()> {
     flush()
 }
 
+/// Drain and stop the installed writer at process exit.
+///
+/// [`flush`] only syncs what the worker has already pulled from the queue;
+/// a service stop that kills the process right after would still drop up to
+/// `QUEUE_CAPACITY` accepted-but-unsynced events (issue #12391). This replays
+/// any reload handoff buffer that never found its replacement writer (a
+/// process dying mid-reload would otherwise lose it with the process), then
+/// runs the same ordered drain-and-exit used by re-init, so every accepted
+/// event is on disk before the process exits. Not on the hot path: handoff
+/// replay uses blocking sends because the worker keeps draining while we
+/// send. A no-op when no writer is installed.
+pub fn shutdown() {
+    let buffered = handoff_buffer().lock().take().unwrap_or_default();
+    if !buffered.is_empty()
+        && let Some(state) = current_state()
+    {
+        for value in buffered {
+            let _ = state.tx.send(WriterJob::Write(value));
+        }
+    }
+    shutdown_current_writer(SHUTDOWN_WARN_AFTER);
+}
+
 /// Resolved LLM-request-payload capture policy + the truncate cap, for the
 /// turn engine's `announce_llm_request`. `None` when no writer is installed
 /// (the policy defaults to `off`, so callers treat "no writer" as "off").
@@ -1275,6 +1298,53 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "log writer worker disconnected before reporting flush result"
+        );
+    }
+
+    /// Process-exit drain: an event accepted but not yet pulled from the
+    /// queue must land on disk when `shutdown()` runs, with no explicit
+    /// flush — a service stop must not drop accepted events (issue #12391).
+    #[test]
+    fn shutdown_drains_pending_writes_without_explicit_flush() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_writer(tmp.path(), 100);
+        let path = runtime_trace_path().unwrap();
+
+        let mut ev = LogEvent::new(Severity::Info, "test", EventCategory::Agent);
+        ev.message = Some("pending-at-exit".to_string());
+        record_event(ev);
+
+        shutdown();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.contains("pending-at-exit"),
+            "shutdown must drain the queue before the worker exits: {contents}"
+        );
+    }
+
+    /// A handoff buffer that never found its replacement writer (process
+    /// dying mid-reload) must be replayed to disk by `shutdown()` instead of
+    /// vanishing with the process (issue #12391).
+    #[test]
+    fn shutdown_replays_an_unflushed_handoff_buffer() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_writer(tmp.path(), 100);
+        let path = runtime_trace_path().unwrap();
+
+        *handoff_buffer().lock() = Some(Vec::new());
+        let mut ev = LogEvent::new(Severity::Info, "test", EventCategory::Agent);
+        ev.message = Some("handoff-at-exit".to_string());
+        record_event(ev);
+
+        shutdown();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.contains("handoff-at-exit"),
+            "shutdown must replay the handoff buffer before the worker exits: {contents}"
         );
     }
 
