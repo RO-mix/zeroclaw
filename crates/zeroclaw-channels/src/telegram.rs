@@ -5305,9 +5305,68 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 &bind_command,
                 &self.alias,
             );
-            let _ = self
-                .send_unauthorized_notice(&owner_notice, &owner_chat)
-                .await;
+            let delivery = Self::deliver_owner_notice(
+                self.http_client(),
+                self.api_url("sendMessage"),
+                self.rate_limiter.clone(),
+                Duration::from_secs(self.resolve_rate_limit_max_wait_secs()),
+                self.alias.clone(),
+                owner_notice,
+                owner_chat,
+            );
+            #[cfg(test)]
+            {
+                // Tests drive the handler directly and assert against the
+                // mock server; completing inline keeps that deterministic.
+                delivery.await;
+            }
+            #[cfg(not(test))]
+            tokio::spawn(delivery);
+        }
+    }
+
+    /// Deliver the owner heads-up off the serial inbound loop.
+    ///
+    /// Telegram answers a flood-limit `sendMessage` with a `retry_after` of
+    /// up to [`TELEGRAM_MAX_INLINE_RETRY_AFTER`] per retry, and honoring that
+    /// inline would freeze every later update — including authorized messages
+    /// from unrelated chats. The future owns its state (client, URL, copies)
+    /// so the caller can hand it to a bounded background task; the flood-limit
+    /// waits then happen off the inbound loop. Delivery failure is logged as
+    /// a failure event — never silently dropped — and never re-fires the
+    /// public stub, which already reached the sender.
+    async fn deliver_owner_notice(
+        http: reqwest::Client,
+        send_url: String,
+        rate_limiter: crate::telegram_rate_limit::TelegramRateLimiter,
+        max_wait: Duration,
+        alias: String,
+        notice: String,
+        owner_chat: String,
+    ) {
+        if let Err(err) = Self::post_text_chunks(
+            &http,
+            &send_url,
+            &rate_limiter,
+            max_wait,
+            &notice,
+            &owner_chat,
+            None,
+            0,
+        )
+        .await
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "alias": alias,
+                        "owner_chat": owner_chat,
+                        "error": err.to_string(),
+                    })),
+                "Telegram owner notice delivery failed; owner was not notified"
+            );
         }
     }
 
@@ -6849,6 +6908,36 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         thread_id: Option<&str>,
         skip_chunks: usize,
     ) -> Result<usize, SendChunksError> {
+        Self::post_text_chunks(
+            &self.http_client(),
+            &self.api_url("sendMessage"),
+            &self.rate_limiter,
+            Duration::from_secs(self.resolve_rate_limit_max_wait_secs()),
+            message,
+            chat_id,
+            thread_id,
+            skip_chunks,
+        )
+        .await
+    }
+
+    /// Chunked `sendMessage` posting against an explicit client and URL.
+    ///
+    /// Extracted from [`Self::send_text_chunks`] so a caller that cannot
+    /// borrow the channel across an `await` — the background owner-notice
+    /// delivery — can own its state and still reuse the exact chunking,
+    /// formatting, and flood-limit honoring of every other text send.
+    #[allow(clippy::too_many_arguments)]
+    async fn post_text_chunks(
+        http: &reqwest::Client,
+        send_url: &str,
+        rate_limiter: &crate::telegram_rate_limit::TelegramRateLimiter,
+        max_wait: Duration,
+        message: &str,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        skip_chunks: usize,
+    ) -> Result<usize, SendChunksError> {
         let chunks = split_message_for_telegram(message);
 
         for (index, chunk) in chunks.iter().enumerate() {
@@ -6869,14 +6958,19 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 markdown_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
             }
 
-            let (markdown_status, markdown_err) = match self
-                .send_message_honoring_rate_limit(&markdown_body)
-                .await
-                .map_err(|e| SendChunksError {
-                    delivered: index,
-                    rate_limited: false,
-                    source: e.into(),
-                })? {
+            let (markdown_status, markdown_err) = match Self::post_message_honoring_rate_limit(
+                http,
+                send_url,
+                rate_limiter,
+                max_wait,
+                &markdown_body,
+            )
+            .await
+            .map_err(|e| SendChunksError {
+                delivered: index,
+                rate_limited: false,
+                source: e.into(),
+            })? {
                 SendMessageAttempt::Sent => {
                     if index < chunks.len() - 1 {
                         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -6911,14 +7005,19 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             if let Some(tid) = thread_id {
                 plain_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
             }
-            match self
-                .send_message_honoring_rate_limit(&plain_body)
-                .await
-                .map_err(|e| SendChunksError {
-                    delivered: index,
-                    rate_limited: false,
-                    source: e.into(),
-                })? {
+            match Self::post_message_honoring_rate_limit(
+                http,
+                send_url,
+                rate_limiter,
+                max_wait,
+                &plain_body,
+            )
+            .await
+            .map_err(|e| SendChunksError {
+                delivered: index,
+                rate_limited: false,
+                source: e.into(),
+            })? {
                 SendMessageAttempt::Sent => {}
                 SendMessageAttempt::RateLimited {
                     status: plain_status,
@@ -6978,11 +7077,20 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// waited out and sent - the gate's deadline only carries the jitter
     /// tail past the server penalty. Either way no request is posted too
     /// early.
-    async fn send_message_honoring_rate_limit(
-        &self,
+    ///
+    /// The caller passes the shared gate and the resolved wait ceiling
+    /// explicitly rather than letting the method borrow the channel, so the
+    /// owner-notice delivery can move the whole send onto a background task;
+    /// both draw from the same per-token gate, so a flood window noted by
+    /// the notice is honored by every later send on this token.
+    #[allow(clippy::too_many_arguments)]
+    async fn post_message_honoring_rate_limit(
+        http: &reqwest::Client,
+        send_url: &str,
+        rate_limiter: &crate::telegram_rate_limit::TelegramRateLimiter,
+        max_wait: Duration,
         body: &serde_json::Value,
     ) -> Result<SendMessageAttempt, reqwest::Error> {
-        let max_wait = Duration::from_secs(self.resolve_rate_limit_max_wait_secs());
         // One caller-side allowance covers the whole send: the pre-send wait
         // and every post-429 wait draw it down together.
         let mut allowance = max_wait;
@@ -6998,8 +7106,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             // out through the shared loop, which re-checks after each sleep,
             // so a window extended mid-wait is honored, never sent into.
             if let crate::telegram_rate_limit::RateLimitGate::Blocked(remaining) =
-                self.rate_limiter.check()
-                && self.rate_limiter.penalty_remaining() > allowance
+                rate_limiter.check()
+                && rate_limiter.penalty_remaining() > allowance
             {
                 return Ok(SendMessageAttempt::RateLimited {
                     status: reqwest::StatusCode::TOO_MANY_REQUESTS,
@@ -7011,8 +7119,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
             if let Err(crate::telegram_rate_limit::TelegramGateError::BudgetExhausted {
                 remaining,
-            }) = crate::telegram_rate_limit::wait_out_window(&self.rate_limiter, &mut allowance)
-                .await
+            }) = crate::telegram_rate_limit::wait_out_window(rate_limiter, &mut allowance).await
             {
                 return Ok(SendMessageAttempt::RateLimited {
                     status: reqwest::StatusCode::TOO_MANY_REQUESTS,
@@ -7023,12 +7130,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 });
             }
 
-            let resp = self
-                .http_client()
-                .post(self.api_url("sendMessage"))
-                .json(body)
-                .send()
-                .await?;
+            let resp = http.post(send_url).json(body).send().await?;
             let status = resp.status();
             if status.is_success() {
                 return Ok(SendMessageAttempt::Sent);
@@ -7040,7 +7142,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             // Feed the shared per-token window so droppable calls (typing,
             // draft edits) and deliver calls for other chats skip the penalty
             // instead of piling their own 429s onto it.
-            self.rate_limiter.note_rate_limited(wait.as_secs());
+            rate_limiter.note_rate_limited(wait.as_secs());
             if retries >= TELEGRAM_RATE_LIMIT_RETRIES || wait > allowance {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -7070,8 +7172,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             // mid-wait and is honored while allowance remains.
             if let Err(crate::telegram_rate_limit::TelegramGateError::BudgetExhausted {
                 remaining,
-            }) = crate::telegram_rate_limit::wait_out_window(&self.rate_limiter, &mut allowance)
-                .await
+            }) = crate::telegram_rate_limit::wait_out_window(rate_limiter, &mut allowance).await
             {
                 ::zeroclaw_log::record!(
                     WARN,
