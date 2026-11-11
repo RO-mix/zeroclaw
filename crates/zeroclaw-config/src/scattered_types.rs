@@ -157,12 +157,6 @@ impl ThinkingConfig {
 fn default_max_tokens() -> usize {
     8192
 }
-fn default_keep_recent() -> usize {
-    4
-}
-fn default_collapse() -> bool {
-    true
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -172,10 +166,6 @@ pub struct HistoryPrunerConfig {
     pub enabled: bool,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
-    #[serde(default = "default_keep_recent")]
-    pub keep_recent: usize,
-    #[serde(default = "default_collapse")]
-    pub collapse_tool_results: bool,
 }
 
 impl Default for HistoryPrunerConfig {
@@ -183,8 +173,6 @@ impl Default for HistoryPrunerConfig {
         Self {
             enabled: false,
             max_tokens: 8192,
-            keep_recent: 4,
-            collapse_tool_results: true,
         }
     }
 }
