@@ -5452,6 +5452,30 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         Some((file_id, duration))
     }
 
+    /// Reduce a Telegram document file name to a safe local name: path
+    /// separators, control characters, and anything outside
+    /// `[A-Za-z0-9._-]` become `_`, leading dots are stripped so the result
+    /// can never be hidden or escape the save directory, and the whole is
+    /// capped at 80 chars. An empty outcome falls back to `file` at the
+    /// caller.
+    fn sanitize_attachment_filename(name: &str) -> String {
+        let mut out: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .take(80)
+            .collect();
+        while out.starts_with('.') {
+            out.remove(0);
+        }
+        out
+    }
+
     /// Extract attachment metadata from an incoming Telegram message (document or photo).
     /// Returns `None` for text-only, voice, and other unsupported message types.
     fn parse_attachment_metadata(message: &serde_json::Value) -> Option<IncomingAttachment> {
@@ -5483,7 +5507,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         // Voice notes: treat as document attachments so the agent can
-        // transcribe them (see `prepopulate_voice_reply_context` and the
+        // transcribe them (see `prepopulate_reply_attachment_context` and the
         // `transcriber__transcribe_audio` tool).
         if let Some(voice) = message.get("voice") {
             let file_id = voice.get("file_id")?.as_str()?.to_string();
@@ -6449,10 +6473,29 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 "[Photo]".to_string()
             }
         } else if reply.get("document").is_some() {
-            if let Some(caption) = caption {
-                format!("[Document] {caption}")
+            let reply_mid = reply.get("message_id").and_then(serde_json::Value::as_i64);
+            let chat_id = message
+                .get("chat")
+                .and_then(|c| c.get("id"))
+                .and_then(serde_json::Value::as_i64);
+            let body = if let (Some(mid), Some(cid)) = (reply_mid, chat_id) {
+                let key = format!("{cid}:{mid}");
+                if let Some(path) = self.voice_file_paths.lock().get(&key) {
+                    let file_name = std::path::Path::new(path)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("document");
+                    format!("[Document: {file_name}] {path}")
+                } else {
+                    "[Document]".to_string()
+                }
             } else {
                 "[Document]".to_string()
+            };
+            if let Some(caption) = caption {
+                format!("{body}\n\n{caption}")
+            } else {
+                body
             }
         } else if reply.get("video").is_some() {
             if let Some(caption) = caption {
@@ -6476,19 +6519,23 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         Some(format!("> @{reply_sender}:\n{quoted_lines}"))
     }
 
-    /// Pre-download a replied-to voice/audio message so `extract_reply_context`
-    /// can reference it even when the original message was dropped by the
-    /// mention-only gate. If built-in transcription is enabled, the audio is
-    /// also transcribed and cached; otherwise only the local file path is kept
-    /// so the agent can call `transcriber__transcribe_audio` itself.
-    async fn prepopulate_voice_reply_context(&self, update: &serde_json::Value) {
+    /// Pre-download a replied-to voice/audio/document message so
+    /// `extract_reply_context` can reference it even when the original
+    /// message was dropped by the mention-only gate. If built-in
+    /// transcription is enabled, the audio is also transcribed and cached;
+    /// otherwise only the local file path is kept so the agent can call
+    /// `transcriber__transcribe_audio` itself. Replied-to documents are
+    /// downloaded and path-cached the same way — a quote of a document must
+    /// hand the agent the file, not a bare "[Document]" marker.
+    async fn prepopulate_reply_attachment_context(&self, update: &serde_json::Value) {
         let Some(message) = update.get("message") else {
             return;
         };
         let Some(reply) = message.get("reply_to_message") else {
             return;
         };
-        if reply.get("voice").is_none() && reply.get("audio").is_none() {
+        let is_document = reply.get("document").is_some();
+        if reply.get("voice").is_none() && reply.get("audio").is_none() && !is_document {
             return;
         }
 
@@ -6531,9 +6578,31 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return;
         }
 
-        let (file_id, duration) = match Self::parse_voice_metadata(reply) {
-            Some(v) => v,
-            None => return,
+        let (file_id, duration, filename_stem) = if is_document {
+            let Some(doc) = reply.get("document") else {
+                return;
+            };
+            let file_id = match doc.get("file_id").and_then(serde_json::Value::as_str) {
+                Some(f) => f.to_string(),
+                None => return,
+            };
+            let file_name = doc
+                .get("file_name")
+                .and_then(serde_json::Value::as_str)
+                .map(Self::sanitize_attachment_filename)
+                .unwrap_or_else(|| "file".to_string());
+            (file_id, 0, format!("doc_{chat_id}_{reply_mid}_{file_name}"))
+        } else {
+            let (file_id, duration) = match Self::parse_voice_metadata(reply) {
+                Some(v) => v,
+                None => return,
+            };
+            let stem = if reply.get("voice").is_some() {
+                format!("voice_{chat_id}_{reply_mid}")
+            } else {
+                format!("audio_{chat_id}_{reply_mid}")
+            };
+            (file_id, duration, stem)
         };
 
         let tg_file_path = match self.get_file_path(&file_id).await {
@@ -6546,24 +6615,33 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             Err(_) => return,
         };
 
-        let local_filename = if reply.get("voice").is_some() {
-            let ext = tg_file_path.rsplit('.').next().unwrap_or("ogg");
-            format!("voice_{chat_id}_{reply_mid}.{ext}")
+        let local_filename = if is_document {
+            filename_stem
         } else {
-            let ext = tg_file_path.rsplit('.').next().unwrap_or("mp3");
-            format!("audio_{chat_id}_{reply_mid}.{ext}")
+            let default_ext = if reply.get("voice").is_some() {
+                "ogg"
+            } else {
+                "mp3"
+            };
+            let ext = tg_file_path.rsplit('.').next().unwrap_or(default_ext);
+            format!("{filename_stem}.{ext}")
         };
+
         let local_path = save_dir.join(&local_filename);
         if tokio::fs::write(&local_path, &audio_data).await.is_err() {
             return;
         }
         let path_str = local_path.to_string_lossy().into_owned();
 
-        // Prefer built-in transcription when configured.
-        if let (Some(config), Some(manager)) = (
-            self.transcription.as_ref(),
-            self.transcription_manager.as_deref(),
-        ) && duration <= config.max_duration_secs
+        // Prefer built-in transcription when configured. Documents are never
+        // transcribed here: a document reply hands over the file, and the
+        // agent decides how to read it.
+        if !is_document
+            && let (Some(config), Some(manager)) = (
+                self.transcription.as_ref(),
+                self.transcription_manager.as_deref(),
+            )
+            && duration <= config.max_duration_secs
         {
             let file_name = tg_file_path
                 .rsplit('/')
@@ -8262,10 +8340,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return UpdateOutcome::Advanced;
         }
 
-        // Download and cache the replied-to voice/audio file before
+        // Download and cache the replied-to voice/audio/document file before
         // parsing, so reply context can reference it even when the
         // original message was dropped by the mention-only gate.
-        self.prepopulate_voice_reply_context(update).await;
+        self.prepopulate_reply_attachment_context(update).await;
 
         let disposition = if let Some(m) = self.parse_update_message(update) {
             UpdateDisposition::Parsed(Box::new(m))
@@ -20191,6 +20269,97 @@ mod tests {
         });
         let ctx = ch.extract_reply_context(&msg).unwrap();
         assert_eq!(ctx, "> @bob:\n> [Voice message]");
+    }
+
+    #[test]
+    fn extract_reply_context_document_without_cache_stays_marker() {
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        let msg = serde_json::json!({
+            "reply_to_message": {
+                "from": { "username": "bob" },
+                "document": { "file_id": "abc", "file_name": "report.pdf" }
+            }
+        });
+        let ctx = ch.extract_reply_context(&msg).unwrap();
+        assert_eq!(ctx, "> @bob:\n> [Document]");
+    }
+
+    #[tokio::test]
+    async fn replied_document_is_downloaded_and_quoted_with_path() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "documents/file_9.pdf" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/documents/file_9\.pdf$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"%PDF-1.4 fake".to_vec()))
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 44,
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "from": { "username": "alice", "id": 99 },
+                "text": "а что в этом документе?",
+                "reply_to_message": {
+                    "message_id": 40,
+                    "from": { "username": "bob", "id": 77 },
+                    "document": {
+                        "file_id": "doc-file-id",
+                        "file_name": "Отчёт Q3 final.pdf",
+                        "mime_type": "application/pdf"
+                    },
+                    "caption": "Эксклюзивно и конфиденциально"
+                }
+            }
+        });
+
+        ch.prepopulate_reply_attachment_context(&update).await;
+
+        let ctx = ch
+            .extract_reply_context(&update["message"])
+            .expect("reply context should be present");
+        assert!(
+            ctx.contains("[Document: doc_-100200300_40_") && ctx.contains("Q3_final.pdf"),
+            "quoted document must expose the downloaded path, got: {ctx}"
+        );
+        assert!(
+            ctx.contains(&workspace.path().to_string_lossy().to_string()),
+            "the path must point into the workspace, got: {ctx}"
+        );
+        assert!(
+            ctx.contains("Эксклюзивно и конфиденциально"),
+            "the caption must follow the document path, got: {ctx}"
+        );
+        let saved = std::fs::read_dir(workspace.path().join("telegram_files"))
+            .expect("telegram_files dir")
+            .count();
+        assert_eq!(saved, 1, "the replied-to document must be downloaded once");
     }
 
     #[test]
