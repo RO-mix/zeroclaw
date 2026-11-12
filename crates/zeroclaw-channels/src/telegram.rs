@@ -6467,10 +6467,29 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 body
             }
         } else if reply.get("photo").is_some() {
-            if let Some(caption) = caption {
-                format!("[Photo] {caption}")
+            let reply_mid = reply.get("message_id").and_then(serde_json::Value::as_i64);
+            let chat_id = message
+                .get("chat")
+                .and_then(|c| c.get("id"))
+                .and_then(serde_json::Value::as_i64);
+            let body = if let (Some(mid), Some(cid)) = (reply_mid, chat_id) {
+                let key = format!("{cid}:{mid}");
+                if let Some(path) = self.voice_file_paths.lock().get(&key) {
+                    let file_name = std::path::Path::new(path)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("photo.jpg");
+                    format!("[Document: {file_name}] {path}")
+                } else {
+                    "[Photo]".to_string()
+                }
             } else {
                 "[Photo]".to_string()
+            };
+            if let Some(caption) = caption {
+                format!("{body}\n\n{caption}")
+            } else {
+                body
             }
         } else if reply.get("document").is_some() {
             let reply_mid = reply.get("message_id").and_then(serde_json::Value::as_i64);
@@ -6498,10 +6517,29 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 body
             }
         } else if reply.get("video").is_some() {
-            if let Some(caption) = caption {
-                format!("[Video] {caption}")
+            let reply_mid = reply.get("message_id").and_then(serde_json::Value::as_i64);
+            let chat_id = message
+                .get("chat")
+                .and_then(|c| c.get("id"))
+                .and_then(serde_json::Value::as_i64);
+            let body = if let (Some(mid), Some(cid)) = (reply_mid, chat_id) {
+                let key = format!("{cid}:{mid}");
+                if let Some(path) = self.voice_file_paths.lock().get(&key) {
+                    let file_name = std::path::Path::new(path)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("video.mp4");
+                    format!("[Document: {file_name}] {path}")
+                } else {
+                    "[Video]".to_string()
+                }
             } else {
                 "[Video]".to_string()
+            };
+            if let Some(caption) = caption {
+                format!("{body}\n\n{caption}")
+            } else {
+                body
             }
         } else if reply.get("sticker").is_some() {
             "[Sticker]".to_string()
@@ -6519,14 +6557,15 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         Some(format!("> @{reply_sender}:\n{quoted_lines}"))
     }
 
-    /// Pre-download a replied-to voice/audio/document message so
+    /// Pre-download a replied-to voice/audio/document/photo/video message so
     /// `extract_reply_context` can reference it even when the original
     /// message was dropped by the mention-only gate. If built-in
     /// transcription is enabled, the audio is also transcribed and cached;
     /// otherwise only the local file path is kept so the agent can call
-    /// `transcriber__transcribe_audio` itself. Replied-to documents are
-    /// downloaded and path-cached the same way — a quote of a document must
-    /// hand the agent the file, not a bare "[Document]" marker.
+    /// `transcriber__transcribe_audio` itself. Replied-to documents,
+    /// photos, and videos are downloaded and path-cached the same way — a
+    /// quote of an attachment must hand the agent the file, not a bare
+    /// "[Document]"/"[Photo]"/"[Video]" marker.
     async fn prepopulate_reply_attachment_context(&self, update: &serde_json::Value) {
         let Some(message) = update.get("message") else {
             return;
@@ -6535,7 +6574,19 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return;
         };
         let is_document = reply.get("document").is_some();
-        if reply.get("voice").is_none() && reply.get("audio").is_none() && !is_document {
+        let is_audio = reply.get("voice").is_some() || reply.get("audio").is_some();
+        // Telegram delivers a photo as an array of sizes; the last one is
+        // the highest resolution.
+        let photo_file_id = reply
+            .get("photo")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|sizes| sizes.last())
+            .and_then(|best| best.get("file_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let is_photo = photo_file_id.is_some();
+        let is_video = reply.get("video").is_some();
+        if !is_audio && !is_document && !is_photo && !is_video {
             return;
         }
 
@@ -6592,6 +6643,17 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .map(Self::sanitize_attachment_filename)
                 .unwrap_or_else(|| "file".to_string());
             (file_id, 0, format!("doc_{chat_id}_{reply_mid}_{file_name}"))
+        } else if let Some(file_id) = photo_file_id {
+            (file_id, 0, format!("photo_{chat_id}_{reply_mid}"))
+        } else if is_video {
+            let Some(video) = reply.get("video") else {
+                return;
+            };
+            let file_id = match video.get("file_id").and_then(serde_json::Value::as_str) {
+                Some(f) => f.to_string(),
+                None => return,
+            };
+            (file_id, 0, format!("video_{chat_id}_{reply_mid}"))
         } else {
             let (file_id, duration) = match Self::parse_voice_metadata(reply) {
                 Some(v) => v,
@@ -6610,7 +6672,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             Err(_) => return,
         };
 
-        let audio_data = match self.download_file(&tg_file_path).await {
+        let media_data = match self.download_file(&tg_file_path).await {
             Ok(d) => d,
             Err(_) => return,
         };
@@ -6620,23 +6682,27 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         } else {
             let default_ext = if reply.get("voice").is_some() {
                 "ogg"
-            } else {
+            } else if reply.get("audio").is_some() {
                 "mp3"
+            } else if is_photo {
+                "jpg"
+            } else {
+                "mp4"
             };
             let ext = tg_file_path.rsplit('.').next().unwrap_or(default_ext);
             format!("{filename_stem}.{ext}")
         };
 
         let local_path = save_dir.join(&local_filename);
-        if tokio::fs::write(&local_path, &audio_data).await.is_err() {
+        if tokio::fs::write(&local_path, &media_data).await.is_err() {
             return;
         }
         let path_str = local_path.to_string_lossy().into_owned();
 
-        // Prefer built-in transcription when configured. Documents are never
-        // transcribed here: a document reply hands over the file, and the
-        // agent decides how to read it.
-        if !is_document
+        // Prefer built-in transcription when configured. Documents, photos,
+        // and videos are never transcribed here: a reply hands over the
+        // file, and the agent decides how to read it.
+        if is_audio
             && let (Some(config), Some(manager)) = (
                 self.transcription.as_ref(),
                 self.transcription_manager.as_deref(),
@@ -6648,7 +6714,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .next()
                 .unwrap_or("voice.ogg")
                 .to_string();
-            if let Ok(text) = manager.transcribe(&audio_data, &file_name).await
+            if let Ok(text) = manager.transcribe(&media_data, &file_name).await
                 && !text.trim().is_empty()
             {
                 let mut cache = self.voice_transcriptions.lock();
@@ -20360,6 +20426,175 @@ mod tests {
             .expect("telegram_files dir")
             .count();
         assert_eq!(saved, 1, "the replied-to document must be downloaded once");
+    }
+
+    #[test]
+    fn extract_reply_context_photo_without_cache_stays_marker() {
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        let msg = serde_json::json!({
+            "reply_to_message": {
+                "from": { "username": "bob" },
+                "photo": [{ "file_id": "small" }, { "file_id": "big" }]
+            }
+        });
+        let ctx = ch.extract_reply_context(&msg).unwrap();
+        assert_eq!(ctx, "> @bob:\n> [Photo]");
+    }
+
+    #[test]
+    fn extract_reply_context_video_without_cache_stays_marker() {
+        let ch = TelegramChannel::new(
+            "t".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        let msg = serde_json::json!({
+            "reply_to_message": {
+                "from": { "username": "bob" },
+                "video": { "file_id": "vid-file-id" },
+                "caption": "смотри тут"
+            }
+        });
+        let ctx = ch.extract_reply_context(&msg).unwrap();
+        assert_eq!(ctx, "> @bob:\n> [Video]\n> \n> смотри тут");
+    }
+
+    #[tokio::test]
+    async fn replied_photo_is_downloaded_and_quoted_with_path() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "photos/file_7.jpg" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/photos/file_7\.jpg$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(b"\xFF\xD8\xFF fake-jpg".to_vec()),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 45,
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "from": { "username": "alice", "id": 99 },
+                "text": "а что на фото?",
+                "reply_to_message": {
+                    "message_id": 41,
+                    "from": { "username": "bob", "id": 77 },
+                    "photo": [
+                        { "file_id": "photo-small" },
+                        { "file_id": "photo-big" }
+                    ],
+                    "caption": "таблица сравнения"
+                }
+            }
+        });
+
+        ch.prepopulate_reply_attachment_context(&update).await;
+
+        let ctx = ch
+            .extract_reply_context(&update["message"])
+            .expect("reply context should be present");
+        assert!(
+            ctx.contains("[Document: photo_-100200300_41.jpg]"),
+            "quoted photo must expose the downloaded path, got: {ctx}"
+        );
+        assert!(
+            ctx.contains(&workspace.path().to_string_lossy().to_string()),
+            "the path must point into the workspace, got: {ctx}"
+        );
+        assert!(
+            ctx.contains("таблица сравнения"),
+            "the caption must follow the photo path, got: {ctx}"
+        );
+        let saved = std::fs::read_dir(workspace.path().join("telegram_files"))
+            .expect("telegram_files dir")
+            .count();
+        assert_eq!(saved, 1, "the replied-to photo must be downloaded once");
+    }
+
+    #[tokio::test]
+    async fn replied_video_is_downloaded_and_quoted_with_path() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "videos/file_8.mp4" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/videos/file_8\.mp4$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-mp4".to_vec()))
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 46,
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "from": { "username": "alice", "id": 99 },
+                "text": "что в ролике?",
+                "reply_to_message": {
+                    "message_id": 42,
+                    "from": { "username": "bob", "id": 77 },
+                    "video": { "file_id": "video-file-id" }
+                }
+            }
+        });
+
+        ch.prepopulate_reply_attachment_context(&update).await;
+
+        let ctx = ch
+            .extract_reply_context(&update["message"])
+            .expect("reply context should be present");
+        assert!(
+            ctx.contains("[Document: video_-100200300_42.mp4]"),
+            "quoted video must expose the downloaded path, got: {ctx}"
+        );
+        let saved = std::fs::read_dir(workspace.path().join("telegram_files"))
+            .expect("telegram_files dir")
+            .count();
+        assert_eq!(saved, 1, "the replied-to video must be downloaded once");
     }
 
     #[test]
