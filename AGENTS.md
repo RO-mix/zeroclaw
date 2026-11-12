@@ -64,3 +64,21 @@ Use `./dev/ci.sh all` for full pre-PR validation when the scope warrants it. Doc
 ## Task References
 
 The architecture map routes task-specific documentation. Consult `docs/book/src/contributing/agent-guidelines.md` only for detailed agent examples, risk and stability policy, skill discovery, and protected operational documents. Do not skip a required contract because it is no longer embedded in this bootstrap file.
+
+## Herdr session recovery
+
+Agents of this repo run in herdr terminals. After a power loss herdr restores the shell but not the agent process. So the auto-resume service (Windows task `HerdrKimiResume`, on cachyos-srv `herdr-kimi-resume.service`) can restart your exact session, register it once at session start with the uuid from this session's wire.jsonl path:
+
+    powershell -NoProfile -File C:\Users\Homework\.herdr\register-session.ps1 -SessionId session_<uuid>
+
+On cachyos-srv use `kimi-register.sh session_<uuid>` instead. Without the `kimi.session` label the terminal cannot be auto-resumed.
+
+## Contour (local fork)
+
+This repo carries a local fork contour (RAM-RAMII) on branch `local/fork-main`.
+Upstream-facing work follows the rules above; contour operations follow
+`docs/contour/CONTOUR.md` (single source for fork rules: deploy branch, local
+patches, Windows Service, Nota Bene link, localization, risk tiers). Executable
+ops rituals live in `.agents/skills/zc-*` (`zc-service-ops`, `zc-config-surgery`,
+`zc-cron-ops`, `zc-agent-create`). Production binaries are built only from
+`local/fork-main` after green tests.
