@@ -8,10 +8,10 @@
 
 | PR | Суть | База / зависимости | Ревью | Следующий шаг |
 |---|---|---|---|---|
-| **#12404** | reply-документы агенту как файлы + caption | `origin/master`, самодостаточен | свежий, CI идёт | ждать мейнтейнеров; при замечаниях — фикс сюда |
+| **#12404** | reply-документы агенту как файлы + caption | `origin/master`, самодостаточен | OPEN, CI зелёный; greptile 12.11: 5 findings (P1×2) — сверено 13.11, все валидны: нет дедлайна/лимита 20MiB у скачивания, album-путь мимо, fallback `unknown` в auth, silent Err-swallow | фикс 5 findings → push → ответ greptile |
 | **#12405** | фото/видео в reply-context | Depends #12404 (draft) | — | снять draft после принятия #12404 |
 | **#11601** | transcription retry + voice-drop announce; voice-инфраструктура (notify_voice_drop, VoiceDropReason, transient budget) | `origin/master` | CHANGES_REQUESTED (старое) | фундамент: довести до мерджа — от него зависит voice-линия |
-| **#12197** | voice paths в reply context (captions ВЫНЕСЕНЫ в #12404) | пересобран: master + #11601 | пересобрано 13.11: force-push `72c8c5336a`, комментарий + re-request Audacity88 отправлены | ждать re-review |
+| **#12197** | voice paths в reply context (captions ВЫНЕСЕНЫ в #12404) | пересобран: master + #11601 | пересобрано 13.11: force-push `72c8c5336a`; Audacity88 re-review в ожидании (его CHANGES_REQUESTED — старые, 04–05.11); greptile откомментировал 13.11 | ждать re-review; глянуть свежий greptile |
 
 Владение caption: **только #12404**. В #12197 caption-код не дублировать.
 
