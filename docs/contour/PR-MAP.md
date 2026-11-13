@@ -11,7 +11,7 @@
 | **#12404** | reply-документы агенту как файлы + caption | `origin/master`, самодостаточен | свежий, CI идёт | ждать мейнтейнеров; при замечаниях — фикс сюда |
 | **#12405** | фото/видео в reply-context | Depends #12404 (draft) | — | снять draft после принятия #12404 |
 | **#11601** | transcription retry + voice-drop announce; voice-инфраструктура (notify_voice_drop, VoiceDropReason, transient budget) | `origin/master` | CHANGES_REQUESTED (старое) | фундамент: довести до мерджа — от него зависит voice-линия |
-| **#12197** | voice paths в reply context (captions ВЫНЕСЕНЫ в #12404) | пересборка: master + #11601 | последнее замечание закрыто в tip 5.11, ревью не перезапрошено | ребейз-ветка `fix/telegram-reply-voice-paths`, force-push в ветку PR, комментарий + re-request Audacity88 |
+| **#12197** | voice paths в reply context (captions ВЫНЕСЕНЫ в #12404) | пересобран: master + #11601 | пересобрано 13.11: force-push `72c8c5336a`, комментарий + re-request Audacity88 отправлены | ждать re-review |
 
 Владение caption: **только #12404**. В #12197 caption-код не дублировать.
 
