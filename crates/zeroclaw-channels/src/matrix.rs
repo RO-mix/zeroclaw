@@ -2116,7 +2116,7 @@ mod inbound {
     use serde_json::Value as JsonValue;
     use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc};
 
-    use super::{allowlist, approval, context as ctx_mod, mention};
+    use super::{allowlist, approval, context as ctx_mod, inbound, mention};
     use zeroclaw_api::{channel::ChannelMessage, media::MediaAttachment};
     use zeroclaw_config::schema::MatrixConfig;
 
@@ -2297,15 +2297,15 @@ mod inbound {
         // are dropped entirely. Enabled: the corrected `m.new_content` body
         // flows through the ordinary pipeline, marked `edited`.
         let mut edited = false;
-        let body = match ctx_mod::classify_replacement(&raw) {
-            Some(ctx_mod::InboundEdit::Text { body, .. }) if ctx.config.edited_messages => {
+        let body = match inbound::classify_replacement(&raw) {
+            Some(inbound::InboundEdit::Text { body, .. }) if ctx.config.edited_messages => {
                 edited = true;
                 body
             }
             Some(edit) => {
                 let reason = match edit {
-                    ctx_mod::InboundEdit::Text { .. } => "edited_messages_disabled",
-                    ctx_mod::InboundEdit::NonText => "non_text_edit",
+                    inbound::InboundEdit::Text { .. } => "edited_messages_disabled",
+                    inbound::InboundEdit::NonText => "non_text_edit",
                 };
                 ::zeroclaw_log::record!(
                     DEBUG,
@@ -10656,6 +10656,7 @@ mod tests {
                 device_id: None,
                 allowed_rooms: vec![],
                 interrupt_on_new_message: false,
+                edited_messages: false,
                 stream_mode: Default::default(),
                 stream_tool_arguments: vec![],
                 draft_update_interval_ms: 1500,
