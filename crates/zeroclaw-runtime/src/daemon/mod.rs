@@ -4488,6 +4488,7 @@ mod tests {
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
                 debounce_ms: None,
+                edited_messages: false,
             },
         );
         assert!(has_supervised_channels(&config));
@@ -4798,6 +4799,7 @@ mod tests {
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
                 debounce_ms: None,
+                edited_messages: false,
             },
         );
 
@@ -4834,6 +4836,7 @@ mod tests {
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
                 debounce_ms: None,
+                edited_messages: false,
             },
         );
         // Inbound peer authorization lives in peer_groups in V3.
@@ -4892,6 +4895,7 @@ mod tests {
                 reply_queue_depth_max: 0,
                 multi_message_delay_ms: 800,
                 debounce_ms: None,
+                edited_messages: false,
                 per_user_session: true,
                 passive_group_context: false,
             },
