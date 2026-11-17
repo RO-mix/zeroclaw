@@ -6434,6 +6434,632 @@ mod tests {
         }
     }
 
+    /// Epic 9-3 dispatch gate, end to end: agent-originated destroy of a
+    /// protected (narrative) memory key is denied before the tool executes,
+    /// with the reason and proposal hint delivered as the tool result; the
+    /// operator origin (second key) and the disabled feature pass through
+    /// byte-identically. Axis-file writes (file_write into workspace
+    /// IDENTITY.md) are denied the same way when axis_files_readonly is on.
+    mod permissions_dispatch_gate {
+        use super::*;
+        use zeroclaw_api::ingress::{IngressContext, TurnOrigin};
+
+        struct TurnOutcome {
+            _tmp: tempfile::TempDir,
+            memory: Arc<zeroclaw_memory::SqliteMemory>,
+            history: Vec<ChatMessage>,
+        }
+
+        async fn run_turn(
+            permissions_enabled: bool,
+            axis_readonly: bool,
+            origin: TurnOrigin,
+            tool_call: &str,
+            tool: Box<dyn Tool>,
+        ) -> TurnOutcome {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut config = Config::default();
+            config.data_dir = tmp.path().to_path_buf();
+            config.memory.backend = "sqlite".into();
+            config.memory.permissions.enabled = permissions_enabled;
+            config.memory.permissions.axis_files_readonly = axis_readonly;
+
+            let memory = Arc::new(zeroclaw_memory::SqliteMemory::new("test", tmp.path()).unwrap());
+            crate::tools::MemoryStoreTool::new(
+                Arc::clone(&memory) as Arc<dyn zeroclaw_api::memory_traits::Memory>,
+                Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+            )
+            .execute(serde_json::json!({
+                "key": "ignored",
+                "content": "ОБРАЗ v1",
+                "kind": "narrative"
+            }))
+            .await
+            .unwrap();
+
+            let model_provider =
+                ScriptedModelProvider::from_text_responses(vec![tool_call, "done"]);
+            let tools_registry =
+                crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![tool]);
+            let mut history = vec![
+                ChatMessage::system("test-system"),
+                ChatMessage::user("run the step"),
+            ];
+            let observer = NoopObserver;
+            let turn_id = uuid::Uuid::new_v4().to_string();
+            let turn_memory = crate::agent::memory_inject::TurnMemory {
+                handle: memory.as_ref(),
+                query: String::new(),
+                sessions: Vec::new(),
+                suppress: false,
+                cfg: crate::agent::memory_inject::MemoryInjectConfig::default(),
+            };
+
+            run_tool_call_loop(ToolLoop {
+                parent_agent_alias: None,
+                served_route_sink: None,
+                sop_reassembly: None,
+                capability_binding: None,
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider: &model_provider,
+                        provider_name: "mock-provider",
+                        model: "mock-model",
+                        dispatch_model: "mock-model",
+                        temperature: Some(0.0),
+                    },
+                    tools_registry: &tools_registry,
+                    observer: &observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: Some(&config),
+                    max_tool_iterations: 4,
+                    hooks: None,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    keep_tool_context_turns: 2,
+                    context_limits: test_context_limits(0),
+                    context_limits_resolver: None,
+                    receipt_generator: None,
+                    knobs: &LoopKnobs::default(),
+                    security: None,
+                },
+                history: &mut history,
+                history_has_trim_breadcrumb: &mut false,
+                injected_memory_preamble: &mut None,
+                channel_name: "test",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: None,
+                steering: None,
+                new_messages_out: None,
+                image_cache: None,
+                memory: Some(turn_memory),
+                ingress: IngressContext::from_parts(origin, None),
+                agent_alias: None,
+                turn_id: &turn_id,
+            })
+            .await
+            .expect("the turn completes");
+
+            TurnOutcome {
+                _tmp: tmp,
+                memory,
+                history,
+            }
+        }
+
+        fn forget_tool(memory: &Arc<zeroclaw_memory::SqliteMemory>) -> Box<dyn Tool> {
+            Box::new(crate::tools::MemoryForgetTool::new(
+                Arc::clone(memory) as Arc<dyn zeroclaw_api::memory_traits::Memory>,
+                Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+            ))
+        }
+
+        #[tokio::test]
+        async fn channel_forget_of_narrative_is_denied_before_execution() {
+            let invocations = Arc::new(AtomicUsize::new(0));
+            let outcome = run_turn(
+                true,
+                false,
+                TurnOrigin::Channel,
+                r#"<tool_call>
+{"name":"memory_forget","arguments":{"key":"narrative_distillate"}}
+</tool_call>"#,
+                Box::new(CountingTool::new("memory_forget", Arc::clone(&invocations))),
+            )
+            .await;
+            assert_eq!(
+                invocations.load(Ordering::SeqCst),
+                0,
+                "deny must happen before the tool implementation executes"
+            );
+            assert!(
+                outcome
+                    .memory
+                    .get(zeroclaw_memory::narrative::NARRATIVE_KEY)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "the protected row survives"
+            );
+            let transcript = outcome
+                .history
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                transcript.contains("destroy of narrative memory is denied"),
+                "the agent sees the reason in the tool result: {transcript}"
+            );
+            assert!(
+                transcript.contains("proposal"),
+                "the denial carries the proposal hint: {transcript}"
+            );
+        }
+
+        #[tokio::test]
+        async fn interactive_forget_of_narrative_is_the_second_key() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut config = Config::default();
+            config.data_dir = tmp.path().to_path_buf();
+            config.memory.backend = "sqlite".into();
+            config.memory.permissions.enabled = true;
+            let memory = Arc::new(zeroclaw_memory::SqliteMemory::new("test", tmp.path()).unwrap());
+            crate::tools::MemoryStoreTool::new(
+                Arc::clone(&memory) as Arc<dyn zeroclaw_api::memory_traits::Memory>,
+                Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+            )
+            .execute(serde_json::json!({
+                "key": "ignored", "content": "ОБРАЗ v1", "kind": "narrative"
+            }))
+            .await
+            .unwrap();
+            let model_provider = ScriptedModelProvider::from_text_responses(vec![
+                r#"<tool_call>
+{"name":"memory_forget","arguments":{"key":"narrative_distillate"}}
+</tool_call>"#,
+                "done",
+            ]);
+            let tools_registry =
+                crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![forget_tool(
+                    &memory,
+                )]);
+            let mut history = vec![
+                ChatMessage::system("test-system"),
+                ChatMessage::user("run the step"),
+            ];
+            let observer = NoopObserver;
+            let turn_id = uuid::Uuid::new_v4().to_string();
+            let turn_memory = crate::agent::memory_inject::TurnMemory {
+                handle: memory.as_ref(),
+                query: String::new(),
+                sessions: Vec::new(),
+                suppress: false,
+                cfg: crate::agent::memory_inject::MemoryInjectConfig::default(),
+            };
+            run_tool_call_loop(ToolLoop {
+                parent_agent_alias: None,
+                served_route_sink: None,
+                sop_reassembly: None,
+                capability_binding: None,
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider: &model_provider,
+                        provider_name: "mock-provider",
+                        model: "mock-model",
+                        dispatch_model: "mock-model",
+                        temperature: Some(0.0),
+                    },
+                    tools_registry: &tools_registry,
+                    observer: &observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: Some(&config),
+                    max_tool_iterations: 4,
+                    hooks: None,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    keep_tool_context_turns: 2,
+                    context_limits: test_context_limits(0),
+                    context_limits_resolver: None,
+                    receipt_generator: None,
+                    knobs: &LoopKnobs::default(),
+                    security: None,
+                },
+                history: &mut history,
+                history_has_trim_breadcrumb: &mut false,
+                injected_memory_preamble: &mut None,
+                channel_name: "test",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: None,
+                steering: None,
+                new_messages_out: None,
+                image_cache: None,
+                memory: Some(turn_memory),
+                ingress: IngressContext::from_parts(TurnOrigin::Interactive, None),
+                agent_alias: None,
+                turn_id: &turn_id,
+            })
+            .await
+            .expect("the turn completes");
+            assert!(
+                memory
+                    .get(zeroclaw_memory::narrative::NARRATIVE_KEY)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "the operator origin is the second key: destroy executes"
+            );
+        }
+
+        #[tokio::test]
+        async fn feature_off_leaves_agent_origins_untouched() {
+            let invocations = Arc::new(AtomicUsize::new(0));
+            let outcome = run_turn(
+                false,
+                false,
+                TurnOrigin::Channel,
+                r#"<tool_call>
+{"name":"memory_forget","arguments":{"key":"narrative_distillate"}}
+</tool_call>"#,
+                Box::new(CountingTool::new("memory_forget", Arc::clone(&invocations))),
+            )
+            .await;
+            assert_eq!(
+                invocations.load(Ordering::SeqCst),
+                1,
+                "feature off: the call dispatches exactly as before the gate existed"
+            );
+            let transcript = outcome
+                .history
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !transcript.contains("memory permissions"),
+                "no permission text leaks when the feature is off: {transcript}"
+            );
+        }
+
+        #[tokio::test]
+        async fn file_write_to_identity_md_is_denied_for_agent_origin() {
+            let invocations = Arc::new(AtomicUsize::new(0));
+            let outcome = run_turn(
+                true,
+                true,
+                TurnOrigin::Channel,
+                r#"<tool_call>
+{"name":"file_write","arguments":{"path":"IDENTITY.md","content":"drift"}}
+</tool_call>"#,
+                Box::new(CountingTool::new("file_write", Arc::clone(&invocations))),
+            )
+            .await;
+            assert_eq!(
+                invocations.load(Ordering::SeqCst),
+                0,
+                "axis-file write denied before the tool executes"
+            );
+            let transcript = outcome
+                .history
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                transcript.contains("read-only for the agent"),
+                "the agent sees the reason and proposal hint: {transcript}"
+            );
+        }
+
+        /// Acceptance (epic 9-3): narrative store from an agent origin is
+        /// accepted with a receipt — `grounded` when the quote matches
+        /// IDENTITY.md exactly once, `contested` + drift otherwise.
+        #[tokio::test]
+        async fn narrative_store_from_cron_origin_records_receipt() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut config = Config::default();
+            config.data_dir = tmp.path().to_path_buf();
+            config.memory.backend = "sqlite".into();
+            config.memory.permissions.enabled = true;
+            // Ось в воркспейсе (= data_dir без security/alias): цитата ниже
+            // встречается ровно один раз.
+            std::fs::write(
+                tmp.path().join("IDENTITY.md"),
+                "Миссия: стать надёжным хранителем контура RAM.",
+            )
+            .unwrap();
+            let memory = Arc::new(zeroclaw_memory::SqliteMemory::new("test", tmp.path()).unwrap());
+            let model_provider = ScriptedModelProvider::from_text_responses(vec![
+                r#"<tool_call>
+{"name":"memory_store","arguments":{"key":"ignored","content":"ОБРАЗ v2","kind":"narrative","quote":"стать надёжным хранителем контура RAM"}}
+</tool_call>"#,
+                r#"<tool_call>
+{"name":"memory_store","arguments":{"key":"ignored","content":"ОБРАЗ v3","kind":"narrative"}}
+</tool_call>"#,
+                "done",
+            ]);
+            let tools_registry =
+                crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                    crate::tools::MemoryStoreTool::new(
+                        Arc::clone(&memory) as Arc<dyn zeroclaw_api::memory_traits::Memory>,
+                        Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+                    ),
+                )]);
+            let mut history = vec![
+                ChatMessage::system("test-system"),
+                ChatMessage::user("run the step"),
+            ];
+            let observer = NoopObserver;
+            let turn_id = uuid::Uuid::new_v4().to_string();
+            let turn_memory = crate::agent::memory_inject::TurnMemory {
+                handle: memory.as_ref(),
+                query: String::new(),
+                sessions: Vec::new(),
+                suppress: false,
+                cfg: crate::agent::memory_inject::MemoryInjectConfig::default(),
+            };
+            run_tool_call_loop(ToolLoop {
+                parent_agent_alias: None,
+                served_route_sink: None,
+                sop_reassembly: None,
+                capability_binding: None,
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider: &model_provider,
+                        provider_name: "mock-provider",
+                        model: "mock-model",
+                        dispatch_model: "mock-model",
+                        temperature: Some(0.0),
+                    },
+                    tools_registry: &tools_registry,
+                    observer: &observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: Some(&config),
+                    max_tool_iterations: 4,
+                    hooks: None,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    keep_tool_context_turns: 2,
+                    context_limits: test_context_limits(0),
+                    context_limits_resolver: None,
+                    receipt_generator: None,
+                    knobs: &LoopKnobs::default(),
+                    security: None,
+                },
+                history: &mut history,
+                history_has_trim_breadcrumb: &mut false,
+                injected_memory_preamble: &mut None,
+                channel_name: "test",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: None,
+                steering: None,
+                new_messages_out: None,
+                image_cache: None,
+                memory: Some(turn_memory),
+                ingress: IngressContext::from_parts(TurnOrigin::Cron, None),
+                agent_alias: None,
+                turn_id: &turn_id,
+            })
+            .await
+            .expect("the turn completes");
+
+            // Обе правки приняты (проверка не отклоняет).
+            let entry = memory
+                .get(zeroclaw_memory::narrative::NARRATIVE_KEY)
+                .await
+                .unwrap()
+                .expect("narrative record present");
+            assert_eq!(entry.content, "ОБРАЗ v3");
+            let stats = zeroclaw_memory::receipts::self_change_receipt_stats_at(
+                &zeroclaw_memory::receipts::brain_db_path(tmp.path()),
+            )
+            .unwrap();
+            assert_eq!(stats.total, 2);
+            assert_eq!(stats.grounded, 1, "валидная цитата → grounded");
+            assert_eq!(stats.contested, 1, "правка без цитаты → contested");
+            assert_eq!(stats.drift, 1, "drift копит contested-правки");
+            let transcript = history
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                transcript.contains("self-change receipt: grounded"),
+                "агент видит вердикт: {transcript}"
+            );
+            assert!(
+                transcript.contains("self-change receipt: contested"),
+                "агент видит статус «оспорено»: {transcript}"
+            );
+        }
+
+        /// Один раунд с двумя tool_call: denied-вызов не исполняется и его
+        /// synthetic-результат занимает позицию первого вызова, allowed-вызов
+        /// исполняется на своей позиции — порядок результатов не ломается.
+        #[tokio::test]
+        async fn mixed_allow_deny_round_keeps_result_order() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut config = Config::default();
+            config.data_dir = tmp.path().to_path_buf();
+            config.memory.backend = "sqlite".into();
+            config.memory.permissions.enabled = true;
+            let memory = Arc::new(zeroclaw_memory::SqliteMemory::new("test", tmp.path()).unwrap());
+            crate::tools::MemoryStoreTool::new(
+                Arc::clone(&memory) as Arc<dyn zeroclaw_api::memory_traits::Memory>,
+                Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+            )
+            .execute(serde_json::json!({
+                "key": "ignored", "content": "ОБРАЗ v1", "kind": "narrative"
+            }))
+            .await
+            .unwrap();
+            let forget_invocations = Arc::new(AtomicUsize::new(0));
+            let read_invocations = Arc::new(AtomicUsize::new(0));
+            let model_provider = ScriptedModelProvider::from_text_responses(vec![
+                r#"<tool_call>
+{"name":"memory_forget","arguments":{"key":"narrative_distillate"}}
+</tool_call>
+<tool_call>
+{"name":"file_read","arguments":{"path":"IDENTITY.md"}}
+</tool_call>"#,
+                "done",
+            ]);
+            let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                Box::new(CountingTool::new(
+                    "memory_forget",
+                    Arc::clone(&forget_invocations),
+                )),
+                Box::new(CountingTool::new(
+                    "file_read",
+                    Arc::clone(&read_invocations),
+                )),
+            ]);
+            let mut history = vec![
+                ChatMessage::system("test-system"),
+                ChatMessage::user("run the step"),
+            ];
+            let observer = NoopObserver;
+            let turn_id = uuid::Uuid::new_v4().to_string();
+            let turn_memory = crate::agent::memory_inject::TurnMemory {
+                handle: memory.as_ref(),
+                query: String::new(),
+                sessions: Vec::new(),
+                suppress: false,
+                cfg: crate::agent::memory_inject::MemoryInjectConfig::default(),
+            };
+            run_tool_call_loop(ToolLoop {
+                parent_agent_alias: None,
+                served_route_sink: None,
+                sop_reassembly: None,
+                capability_binding: None,
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider: &model_provider,
+                        provider_name: "mock-provider",
+                        model: "mock-model",
+                        dispatch_model: "mock-model",
+                        temperature: Some(0.0),
+                    },
+                    tools_registry: &tools_registry,
+                    observer: &observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: Some(&config),
+                    max_tool_iterations: 4,
+                    hooks: None,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    keep_tool_context_turns: 2,
+                    context_limits: test_context_limits(0),
+                    context_limits_resolver: None,
+                    receipt_generator: None,
+                    knobs: &LoopKnobs::default(),
+                    security: None,
+                },
+                history: &mut history,
+                history_has_trim_breadcrumb: &mut false,
+                injected_memory_preamble: &mut None,
+                channel_name: "test",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: None,
+                steering: None,
+                new_messages_out: None,
+                image_cache: None,
+                memory: Some(turn_memory),
+                ingress: IngressContext::from_parts(TurnOrigin::Channel, None),
+                agent_alias: None,
+                turn_id: &turn_id,
+            })
+            .await
+            .expect("the turn completes");
+
+            assert_eq!(
+                forget_invocations.load(Ordering::SeqCst),
+                0,
+                "deny must happen before the tool implementation executes"
+            );
+            assert_eq!(
+                read_invocations.load(Ordering::SeqCst),
+                1,
+                "the allowed tool executes in the same round"
+            );
+            assert!(
+                memory
+                    .get(zeroclaw_memory::narrative::NARRATIVE_KEY)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "the protected row survives"
+            );
+            let transcript = history
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let deny_pos = transcript
+                .find("destroy of narrative memory is denied")
+                .unwrap_or_else(|| panic!("the agent sees the denial reason: {transcript}"));
+            let allowed_pos = transcript
+                .find("counted:")
+                .unwrap_or_else(|| panic!("the allowed result is in the transcript: {transcript}"));
+            assert!(
+                deny_pos < allowed_pos,
+                "results keep the model's call order: {transcript}"
+            );
+        }
+    }
+
     struct ApprovingChannel {
         approval_requests: Arc<AtomicUsize>,
     }
