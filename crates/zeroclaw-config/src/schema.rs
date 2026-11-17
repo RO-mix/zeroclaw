@@ -12948,15 +12948,32 @@ pub struct MemoryConfig {
     /// Delete archived files permanently after this many days. Set high if you need long-term history; set low for privacy / disk-space reasons.
     #[serde(default = "default_purge_after_days")]
     pub purge_after_days: u32,
-    /// Delete conversation rows older than this many days from the DB (sqlite backend only). Age is measured by `updated_at` (last write time). 0 = keep forever.
+    /// Conversation rows older than this many days leave recall: in `delete` mode (default) they are physically deleted; in `archive` mode only the physical purge via `physical_purge_days` applies. Age is measured by `updated_at` (last write time). 0 = keep forever.
     #[serde(default = "default_conversation_retention_days")]
     pub conversation_retention_days: u32,
-    /// Delete daily memory rows older than this many days from the DB. Age is measured by `updated_at` (last write time). 0 = keep forever.
+    /// Daily memory rows older than this many days: `delete` mode physically removes them; `archive` mode fades them (hidden from recall, direct get by key still finds them). Age is measured by `updated_at`. 0 = keep forever.
     #[serde(default = "default_zero_retention")]
     pub daily_retention_days: u32,
-    /// Delete core memory rows older than this many days from the DB. Age is measured by `created_at` (first-write time). Neither recall nor ordinary rewrites refresh `created_at` under the current SQLite upsert, so core retention is an absolute age limit from first write. Set this to a generously large window for durable core memories, or keep 0 = keep forever.
+    /// Core memory rows older than this many days: `delete` mode physically removes them; `archive` mode fades them via the archive sentinel (see `zeroclaw_memory::ARCHIVED_SENTINEL`); pinned rows are never touched. Age is measured by `created_at` (first-write time). Neither recall nor ordinary rewrites refresh `created_at` under the current SQLite upsert, so core retention is an absolute age limit from first write. Set this to a generously large window for durable core memories, or keep 0 = keep forever.
     #[serde(default = "default_zero_retention")]
     pub core_retention_days: u32,
+    /// How the hygiene pass enforces retention on long-term rows (core/daily).
+    /// `delete` (default) physically removes expired rows — the historical
+    /// behavior. `archive` fades them instead: expired non-pinned rows get
+    /// `superseded_by = "__archived__"`, so recall stops surfacing them while
+    /// a direct get by key still finds them. Physical cleanup then applies
+    /// only to conversation rows, via `physical_purge_days`, and only when no
+    /// `memory_refs` row references them.
+    #[serde(default = "default_memory_retention_mode")]
+    pub retention_mode: String,
+    /// Physical purge horizon for conversation rows when
+    /// `retention_mode = "archive"`, in days. Conversation rows older than
+    /// this are permanently deleted only if nothing references them in
+    /// `memory_refs`; referenced rows are skipped and reported. 0 = never
+    /// purge. Ignored in `delete` mode, where conversation rows use
+    /// `conversation_retention_days`.
+    #[serde(default = "default_physical_purge_days")]
+    pub physical_purge_days: u32,
     /// Source of embedding vectors for semantic search. `none` = keyword-only retrieval (no API calls, no vector cost); `openai` = OpenAI's embedding API; `custom:URL` = any OpenAI-compatible embedding endpoint (LiteLLM, local gateway, etc.).
     #[serde(default = "default_embedding_provider")]
     pub embedding_provider: String,
@@ -13246,6 +13263,12 @@ fn default_fts_early_return_score() -> f64 {
 }
 
 fn validate_memory_rerank_config(memory: &MemoryConfig) -> Result<()> {
+    if memory.retention_mode != "delete" && memory.retention_mode != "archive" {
+        anyhow::bail!(
+            "memory.retention_mode must be \"delete\" or \"archive\" (got {:?})",
+            memory.retention_mode
+        );
+    }
     if !(1..=MAX_MEMORY_RERANK_CANDIDATE_MULTIPLIER).contains(&memory.candidate_multiplier) {
         anyhow::bail!(
             "memory.candidate_multiplier must be in 1..={MAX_MEMORY_RERANK_CANDIDATE_MULTIPLIER} (got {})",
@@ -13539,6 +13562,12 @@ fn default_conversation_retention_days() -> u32 {
 fn default_zero_retention() -> u32 {
     0
 }
+fn default_memory_retention_mode() -> String {
+    "delete".into()
+}
+fn default_physical_purge_days() -> u32 {
+    180
+}
 fn default_embedding_model() -> String {
     "text-embedding-3-small".into()
 }
@@ -13585,6 +13614,8 @@ impl Default for MemoryConfig {
             conversation_retention_days: default_conversation_retention_days(),
             daily_retention_days: default_zero_retention(),
             core_retention_days: default_zero_retention(),
+            retention_mode: default_memory_retention_mode(),
+            physical_purge_days: default_physical_purge_days(),
             embedding_provider: default_embedding_provider(),
             embedding_model: default_embedding_model(),
             embedding_dimensions: default_embedding_dims(),
@@ -30467,6 +30498,19 @@ mod tests {
         assert!((def.mmr_lambda - cfg.mmr_lambda).abs() < f64::EPSILON);
         assert!((def.importance_weight - cfg.importance_weight).abs() < f64::EPSILON);
         assert!((def.recency_weight - cfg.recency_weight).abs() < f64::EPSILON);
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_validate_rejects_unknown_memory_retention_mode() {
+        let mut config = super::Config::default();
+        config.memory.retention_mode = "archvie".into();
+        let err = config
+            .validate()
+            .expect_err("typo in memory.retention_mode must fail validation");
+        assert!(
+            err.to_string().contains("memory.retention_mode"),
+            "expected memory.retention_mode error, got {err}"
+        );
     }
 
     #[::core::prelude::v1::test]

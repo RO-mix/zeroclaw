@@ -347,6 +347,33 @@ impl SqliteMemory {
             "CREATE INDEX IF NOT EXISTS idx_memories_namespace_category ON memories(namespace, category);",
         )
         .with_context(|| "SQLite init_schema failed: CREATE INDEX idx_memories_namespace_category")?;
+        execute_batch_retry(
+            conn,
+            "CREATE INDEX IF NOT EXISTS idx_memories_category_created ON memories(category, created_at);",
+        )
+        .with_context(|| "SQLite init_schema failed: CREATE INDEX idx_memories_category_created")?;
+        execute_batch_retry(
+            conn,
+            "CREATE INDEX IF NOT EXISTS idx_memories_category_updated ON memories(category, updated_at);",
+        )
+        .with_context(|| "SQLite init_schema failed: CREATE INDEX idx_memories_category_updated")?;
+
+        // External references into memories (epic 9-2): the conversation
+        // physical purge in archive retention mode skips any row whose key
+        // appears here. Nothing writes to this table yet — it is created
+        // ahead of the proposals/judgments work so the purge gate can rely
+        // on its existence.
+        execute_batch_retry(
+            conn,
+            "CREATE TABLE IF NOT EXISTS memory_refs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_key TEXT NOT NULL,
+                target_key TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_refs_target ON memory_refs(target_key);",
+        )
+        .with_context(|| "SQLite init_schema failed: CREATE TABLE memory_refs")?;
 
         Self::migrate_session_ids_to_sanitized(conn)?;
 

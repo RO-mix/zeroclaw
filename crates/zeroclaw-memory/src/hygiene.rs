@@ -22,6 +22,9 @@ struct HygieneReport {
     pruned_conversation_rows: u64,
     pruned_daily_rows: u64,
     pruned_core_rows: u64,
+    archived_core_rows: u64,
+    archived_daily_rows: u64,
+    skipped_referenced_conversation_rows: u64,
 }
 
 impl HygieneReport {
@@ -33,6 +36,8 @@ impl HygieneReport {
             + self.pruned_conversation_rows
             + self.pruned_daily_rows
             + self.pruned_core_rows
+            + self.archived_core_rows
+            + self.archived_daily_rows
     }
 }
 
@@ -76,18 +81,44 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
         archived_session_files: archive_session_files(workspace_dir, config.archive_after_days)?,
         purged_memory_archives: purge_memory_archives(workspace_dir, config.purge_after_days)?,
         purged_session_archives: purge_session_archives(workspace_dir, config.purge_after_days)?,
-        pruned_conversation_rows: prune_category_rows(
-            workspace_dir,
-            conversation_retention,
-            "conversation",
-            false,
-        )?,
-        pruned_daily_rows: prune_category_rows(workspace_dir, daily_retention, "daily", false)?,
-        pruned_core_rows: prune_category_rows(workspace_dir, core_retention, "core", true)?,
+        ..HygieneReport::default()
     };
-    let budget_report = compact_budget_rows(workspace_dir, config)?;
-    report.pruned_daily_rows += budget_report.daily_rows;
-    report.pruned_core_rows += budget_report.core_rows;
+
+    // Row-level retention. `delete` mode (default) physically removes expired
+    // rows exactly as before. `archive` mode fades expired core/daily rows via
+    // the supersede sentinel (recall drops them, direct get by key still finds
+    // them) and physically purges conversation rows only past
+    // `physical_purge_days` and only when nothing references them.
+    match config.retention_mode.as_str() {
+        RETENTION_MODE_ARCHIVE | "delete" => {}
+        other => anyhow::bail!("unknown memory.retention_mode: {other}"),
+    }
+    let archive_mode = config.retention_mode == RETENTION_MODE_ARCHIVE;
+    if archive_mode {
+        report.pruned_conversation_rows = purge_conversation_rows(
+            workspace_dir,
+            config.physical_purge_days,
+            &mut report.skipped_referenced_conversation_rows,
+        )?;
+        report.archived_daily_rows =
+            archive_category_rows(workspace_dir, daily_retention, "daily", false)?;
+        report.archived_core_rows =
+            archive_category_rows(workspace_dir, core_retention, "core", true)?;
+    } else {
+        report.pruned_conversation_rows =
+            prune_category_rows(workspace_dir, conversation_retention, "conversation", false)?;
+        report.pruned_daily_rows =
+            prune_category_rows(workspace_dir, daily_retention, "daily", false)?;
+        report.pruned_core_rows = prune_category_rows(workspace_dir, core_retention, "core", true)?;
+    }
+    // Бюджетная компактификация физически DELETE-ит строки — только в
+    // delete-режиме: в archive-режиме долговременные строки не удаляются
+    // никаким путём (ревью 9-2: budget overflow не обходит затухание).
+    if !archive_mode {
+        let budget_report = compact_budget_rows(workspace_dir, config)?;
+        report.pruned_daily_rows += budget_report.daily_rows;
+        report.pruned_core_rows += budget_report.core_rows;
+    }
 
     // Retention cleanup is independent from new audit collection: disabling
     // audit stops new rows, but existing sensitive rows still honor retention.
@@ -107,7 +138,7 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             &format!(
-                "memory hygiene complete: archived_memory={} archived_sessions={} purged_memory={} purged_sessions={} pruned_conversation={} pruned_daily={} pruned_core={}",
+                "memory hygiene complete: archived_memory={} archived_sessions={} purged_memory={} purged_sessions={} pruned_conversation={} pruned_daily={} pruned_core={} archived_core={} archived_daily={} skipped_referenced_conversation={}",
                 report.archived_memory_files,
                 report.archived_session_files,
                 report.purged_memory_archives,
@@ -115,6 +146,9 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
                 report.pruned_conversation_rows,
                 report.pruned_daily_rows,
                 report.pruned_core_rows,
+                report.archived_core_rows,
+                report.archived_daily_rows,
+                report.skipped_referenced_conversation_rows,
             )
         );
     }
@@ -383,6 +417,89 @@ fn prune_category_rows(
         "DELETE FROM memories WHERE category = ?1 AND {timestamp_col} < ?2 AND pinned = 0",
     );
     let affected = conn.execute(&sql, params![category, cutoff])?;
+
+    Ok(u64::try_from(affected).unwrap_or(0))
+}
+
+const RETENTION_MODE_ARCHIVE: &str = "archive";
+
+/// Archive-mode replacement for `prune_category_rows` on long-term rows
+/// (epic 9-2): instead of DELETE, expired non-pinned rows are faded via the
+/// supersede sentinel. Recall already filters `superseded_by IS NULL`, so the
+/// rows disappear from search while a direct get by key still finds them.
+/// Rows already archived are left untouched so repeat runs do not recount.
+fn archive_category_rows(
+    workspace_dir: &Path,
+    retention_days: u32,
+    category: &str,
+    use_created_at: bool,
+) -> Result<u64> {
+    if retention_days == 0 {
+        return Ok(0);
+    }
+
+    let db_path = workspace_dir.join("memory").join("brain.db");
+    if !db_path.exists() {
+        return Ok(0);
+    }
+
+    let conn = Connection::open(db_path)?;
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+    let cutoff = (Local::now() - Duration::days(i64::from(retention_days))).to_rfc3339();
+
+    let timestamp_col = if use_created_at {
+        "created_at"
+    } else {
+        "updated_at"
+    };
+    let sql = format!(
+        "UPDATE memories SET superseded_by = ?3 \
+         WHERE category = ?1 AND {timestamp_col} < ?2 AND pinned = 0 \
+         AND superseded_by IS NULL",
+    );
+    let affected = conn.execute(&sql, params![category, cutoff, crate::ARCHIVED_SENTINEL])?;
+
+    Ok(u64::try_from(affected).unwrap_or(0))
+}
+
+/// Archive-mode physical cleanup for conversation rows (epic 9-2): DELETE
+/// only rows older than `purge_days`, and only when no `memory_refs` row
+/// targets their key. Referenced rows are kept and counted into `skipped`.
+fn purge_conversation_rows(
+    workspace_dir: &Path,
+    purge_days: u32,
+    skipped: &mut u64,
+) -> Result<u64> {
+    *skipped = 0;
+    if purge_days == 0 {
+        return Ok(0);
+    }
+
+    let Some(db_path) = prepare_existing_sqlite_storage(workspace_dir, "brain.db")? else {
+        return Ok(0);
+    };
+
+    let mut conn = Connection::open(db_path)?;
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+    // memory_refs создаётся только в init_schema (SqliteMemory) — единый
+    // источник DDL; без defensive CREATE, чтобы не плодить дрейф схемы.
+    let cutoff = (Local::now() - Duration::days(i64::from(purge_days))).to_rfc3339();
+
+    // COUNT и DELETE в одной транзакции: отчёт не расходится с фактом при
+    // конкурентной записи memory_refs.
+    let tx = conn.transaction()?;
+    let referenced: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM memories          WHERE category = 'conversation' AND updated_at < ?1 AND pinned = 0          AND EXISTS (SELECT 1 FROM memory_refs WHERE target_key = memories.key)",
+        params![cutoff],
+        |row| row.get(0),
+    )?;
+    *skipped = u64::try_from(referenced).unwrap_or(0);
+
+    let affected = tx.execute(
+        "DELETE FROM memories          WHERE category = 'conversation' AND updated_at < ?1 AND pinned = 0          AND NOT EXISTS (SELECT 1 FROM memory_refs WHERE target_key = memories.key)",
+        params![cutoff],
+    )?;
+    tx.commit()?;
 
     Ok(u64::try_from(affected).unwrap_or(0))
 }
@@ -910,6 +1027,280 @@ mod tests {
         );
     }
 
+    fn superseded_by_of(workspace: &Path, key: &str) -> Option<String> {
+        let conn = Connection::open(workspace.join("memory").join("brain.db")).unwrap();
+        conn.query_row(
+            "SELECT superseded_by FROM memories WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn archive_cfg() -> MemoryConfig {
+        let mut cfg = default_cfg();
+        cfg.archive_after_days = 0;
+        cfg.purge_after_days = 0;
+        cfg.retention_mode = "archive".into();
+        cfg
+    }
+
+    #[test]
+    fn default_retention_mode_is_delete_with_180_day_physical_purge() {
+        let cfg = default_cfg();
+        assert_eq!(cfg.retention_mode, "delete");
+        assert_eq!(cfg.physical_purge_days, 180);
+    }
+
+    #[tokio::test]
+    async fn archive_mode_fades_expired_core_rows_instead_of_deleting() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+
+        let mem = SqliteMemory::new("sqlite", workspace).unwrap();
+        mem.store(
+            "core_old",
+            "obsolete durable fact",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        drop(mem);
+
+        let conn = Connection::open(workspace.join("memory").join("brain.db")).unwrap();
+        let old_cutoff = (Local::now() - Duration::days(120)).to_rfc3339();
+        conn.execute(
+            "UPDATE memories SET created_at = ?1, updated_at = ?1 WHERE key = 'core_old'",
+            params![old_cutoff],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut cfg = archive_cfg();
+        cfg.core_retention_days = 30;
+        run_if_due(&cfg, workspace).unwrap();
+
+        let mem2 = SqliteMemory::new("sqlite", workspace).unwrap();
+        let entry = mem2
+            .get("core_old")
+            .await
+            .unwrap()
+            .expect("archived row must still be reachable by direct get");
+        assert_eq!(
+            entry.superseded_by.as_deref(),
+            Some(crate::ARCHIVED_SENTINEL),
+            "expired core row must be faded via the archive sentinel"
+        );
+        let recalled = mem2
+            .recall("obsolete durable fact", 10, None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            recalled.iter().all(|e| e.key != "core_old"),
+            "archived row must not surface in recall"
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_mode_does_not_touch_pinned_expired_rows() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+
+        let mem = SqliteMemory::new("sqlite", workspace).unwrap();
+        mem.store_with_options(
+            "core_pinned",
+            "pinned durable fact",
+            MemoryCategory::Core,
+            None,
+            StoreOptions {
+                pinned: true,
+                ..StoreOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        drop(mem);
+
+        let conn = Connection::open(workspace.join("memory").join("brain.db")).unwrap();
+        let old_cutoff = (Local::now() - Duration::days(120)).to_rfc3339();
+        conn.execute(
+            "UPDATE memories SET created_at = ?1, updated_at = ?1 WHERE key = 'core_pinned'",
+            params![old_cutoff],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut cfg = archive_cfg();
+        cfg.core_retention_days = 30;
+        run_if_due(&cfg, workspace).unwrap();
+
+        assert_eq!(
+            superseded_by_of(workspace, "core_pinned"),
+            None,
+            "pinned expired row must not be archived"
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_mode_fades_expired_daily_rows() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+
+        let mem = SqliteMemory::new("sqlite", workspace).unwrap();
+        mem.store("daily_old", "stale daily note", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+        drop(mem);
+
+        let conn = Connection::open(workspace.join("memory").join("brain.db")).unwrap();
+        let old_cutoff = (Local::now() - Duration::days(60)).to_rfc3339();
+        conn.execute(
+            "UPDATE memories SET created_at = ?1, updated_at = ?1 WHERE key = 'daily_old'",
+            params![old_cutoff],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut cfg = archive_cfg();
+        cfg.daily_retention_days = 30;
+        run_if_due(&cfg, workspace).unwrap();
+
+        assert_eq!(
+            superseded_by_of(workspace, "daily_old"),
+            Some(crate::ARCHIVED_SENTINEL.to_string()),
+            "expired daily row must be faded via the archive sentinel"
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_mode_purges_unreferenced_conversation_rows() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+
+        let mem = SqliteMemory::new("sqlite", workspace).unwrap();
+        mem.store(
+            "conv_old",
+            "outdated chatter",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+        drop(mem);
+
+        let conn = Connection::open(workspace.join("memory").join("brain.db")).unwrap();
+        let old_cutoff = (Local::now() - Duration::days(200)).to_rfc3339();
+        conn.execute(
+            "UPDATE memories SET created_at = ?1, updated_at = ?1 WHERE key = 'conv_old'",
+            params![old_cutoff],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut cfg = archive_cfg();
+        cfg.physical_purge_days = 180;
+        run_if_due(&cfg, workspace).unwrap();
+
+        let mem2 = SqliteMemory::new("sqlite", workspace).unwrap();
+        assert!(
+            mem2.get("conv_old").await.unwrap().is_none(),
+            "unreferenced conversation row past physical_purge_days must be deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_mode_skips_referenced_conversation_rows_and_reports_them() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+
+        let mem = SqliteMemory::new("sqlite", workspace).unwrap();
+        mem.store(
+            "conv_old",
+            "outdated chatter",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+        drop(mem);
+
+        let conn = Connection::open(workspace.join("memory").join("brain.db")).unwrap();
+        let old_cutoff = (Local::now() - Duration::days(200)).to_rfc3339();
+        conn.execute(
+            "UPDATE memories SET created_at = ?1, updated_at = ?1 WHERE key = 'conv_old'",
+            params![old_cutoff],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memory_refs (source_key, target_key, created_at) \
+             VALUES ('proposal_1', 'conv_old', ?1)",
+            params![Local::now().to_rfc3339()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut cfg = archive_cfg();
+        cfg.physical_purge_days = 180;
+        run_if_due(&cfg, workspace).unwrap();
+
+        let mem2 = SqliteMemory::new("sqlite", workspace).unwrap();
+        assert!(
+            mem2.get("conv_old").await.unwrap().is_some(),
+            "referenced conversation row must survive the physical purge"
+        );
+
+        let state: HygieneState = serde_json::from_str(
+            &fs::read_to_string(workspace.join("state").join(STATE_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            state.last_report.skipped_referenced_conversation_rows, 1,
+            "the skipped reference must be counted in the hygiene report"
+        );
+        assert_eq!(
+            state.last_report.pruned_conversation_rows, 0,
+            "no conversation row may be purged while it is referenced"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_retention_still_disables_archive_fading() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+
+        let mem = SqliteMemory::new("sqlite", workspace).unwrap();
+        mem.store(
+            "core_old",
+            "obsolete durable fact",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        drop(mem);
+
+        let conn = Connection::open(workspace.join("memory").join("brain.db")).unwrap();
+        let old_cutoff = (Local::now() - Duration::days(120)).to_rfc3339();
+        conn.execute(
+            "UPDATE memories SET created_at = ?1, updated_at = ?1 WHERE key = 'core_old'",
+            params![old_cutoff],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Archive mode with retention 0 = keep forever, exactly like delete mode.
+        let cfg = archive_cfg();
+        assert_eq!(cfg.core_retention_days, 0);
+        run_if_due(&cfg, workspace).unwrap();
+
+        assert_eq!(
+            superseded_by_of(workspace, "core_old"),
+            None,
+            "retention 0 must keep rows live even in archive mode"
+        );
+    }
+
     #[tokio::test]
     async fn run_if_due_enforces_the_core_row_budget() {
         let tmp = TempDir::new().unwrap();
@@ -1113,5 +1504,123 @@ mod tests {
                 0o666
             );
         }
+    }
+    #[tokio::test]
+    async fn archive_mode_purge_days_zero_keeps_aged_conversation() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+
+        let mem = SqliteMemory::new("sqlite", workspace).unwrap();
+        mem.store(
+            "conv_old",
+            "ancient conversation context",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+        drop(mem);
+
+        let conn = Connection::open(workspace.join("memory").join("brain.db")).unwrap();
+        let old = (Local::now() - Duration::days(400)).to_rfc3339();
+        conn.execute(
+            "UPDATE memories SET created_at = ?1, updated_at = ?1 WHERE key = 'conv_old'",
+            params![old],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut cfg = archive_cfg();
+        cfg.physical_purge_days = 0;
+        run_if_due(&cfg, workspace).unwrap();
+
+        let mem2 = SqliteMemory::new("sqlite", workspace).unwrap();
+        let entry = mem2.get("conv_old").await.unwrap();
+        assert!(
+            entry.is_some(),
+            "physical_purge_days = 0 must keep conversation rows forever"
+        );
+        assert!(entry.unwrap().superseded_by.is_none());
+    }
+
+    #[tokio::test]
+    async fn archive_mode_keeps_core_row_with_recent_activity() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+
+        let mem = SqliteMemory::new("sqlite", workspace).unwrap();
+        mem.store(
+            "core_updated",
+            "still-maintained durable fact",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        drop(mem);
+
+        let conn = Connection::open(workspace.join("memory").join("brain.db")).unwrap();
+        let old_created = (Local::now() - Duration::days(120)).to_rfc3339();
+        conn.execute(
+            "UPDATE memories SET created_at = ?1 WHERE key = 'core_updated'",
+            params![old_created],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut cfg = archive_cfg();
+        cfg.core_retention_days = 30;
+        run_if_due(&cfg, workspace).unwrap();
+
+        // Семантика (дока schema.rs): core-возраст — абсолютный, от first
+        // write; свежий updated_at не спасает от архивации. Пин от регресса
+        // на updated_at: при нём эта строка НЕ заархивировалась бы.
+        assert_eq!(
+            superseded_by_of(workspace, "core_updated"),
+            Some(crate::ARCHIVED_SENTINEL.to_string()),
+            "core retention is absolute age from created_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_mode_repeat_run_does_not_recount_archived_rows() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+
+        let mem = SqliteMemory::new("sqlite", workspace).unwrap();
+        mem.store(
+            "core_old",
+            "obsolete durable fact",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        drop(mem);
+
+        let conn = Connection::open(workspace.join("memory").join("brain.db")).unwrap();
+        let old = (Local::now() - Duration::days(120)).to_rfc3339();
+        conn.execute(
+            "UPDATE memories SET created_at = ?1, updated_at = ?1 WHERE key = 'core_old'",
+            params![old],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut cfg = archive_cfg();
+        cfg.core_retention_days = 30;
+        run_if_due(&cfg, workspace).unwrap();
+
+        // сброс троттлинга и повторный прогон
+        std::fs::remove_file(state_path(workspace)).unwrap();
+        run_if_due(&cfg, workspace).unwrap();
+
+        let state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(state_path(workspace)).unwrap()).unwrap();
+        assert_eq!(
+            state["last_report"]["archived_core_rows"].as_u64(),
+            Some(0),
+            "repeat run must not recount already-archived rows"
+        );
     }
 }

@@ -27,6 +27,12 @@ pub mod lucid;
 pub mod markdown;
 pub mod merge;
 pub mod narrative;
+/// Sentinel value written into `memories.superseded_by` by the hygiene pass
+/// when `memory.retention_mode = "archive"` (epic 9-2). The row fades out of
+/// recall like any superseded row, but is never physically deleted, and a
+/// direct get by key still finds it. The sentinel names no real successor
+/// record — that is intentional; supersede accepts an arbitrary key string.
+pub const ARCHIVED_SENTINEL: &str = "__archived__";
 pub mod none;
 pub mod normalize;
 pub mod policy;
