@@ -82,3 +82,41 @@ patches, Windows Service, Nota Bene link, localization, risk tiers). Executable
 ops rituals live in `.agents/skills/zc-*` (`zc-service-ops`, `zc-config-surgery`,
 `zc-cron-ops`, `zc-agent-create`). Production binaries are built only from
 `local/fork-main` after green tests.
+
+## Связь между агентами (herdr-core)
+
+- Карта ВСЕХ агентов на ВСЕХ машинах одной командой: `hc ls --json`. Локальные адреса — голые (`tN`), чужие машины — с префиксом (`cachyos-srv/tN`). Голый `tN` с чужой машины НЕ резолвится.
+- Написать агенту: `hc send cachyos-srv/t1q "текст"` (полный адрес с префиксом машины). Прочитать чужой экран: `hc read cachyos-srv/t1q --lines 20`.
+- Дисциплина доставки: 1) до отправки `hc read` — промпт должен быть чистым; 2) после отправки `hc read` снова — если в строке ParserError или мусор, сообщение НЕ доставлено, пиши оператору (t3), не повторяй вслепую.
+- Адресная книга контуров: `~/.herdr/agents.md` — ищи адресата там, не угадывай.
+- Адреса меняются при восстановлении — сверяйся с книгой каждый раз.
+- Почта: `hmail book` — живая книга всех машин (на лету из hc ls); `hmail send "<Имя>" "текст"` — сам найдёт полный адрес и проверит доставку (при ParserError у адресата предупредит); `hmail read "<Имя>" [N]`. Имена надёжнее адресов: адреса tN дублируются между машинами, имена уникальны. Парковка: hmail видит только keep=true терминалы.
+- Hermes (cachyos-srv/t1p) НЕ репортит статус в herdr (status:null всегда) — занятость определяй пробником: два `hc read cachyos-srv/t1p --lines 4` с интервалом 20 с; идентичная статус-строка = свободен (шли сообщение), изменилась = работает (жди).
+
+## Контур RAM — память и файловая модель агентов (ветка `feat/memory-strata`)
+
+Линия разработки с Ram (владелец), не апстрим. При компакции контекста или
+возобновлении сессии опираться на эти документы, а не на память разговора:
+
+- **`docs/contour/AGENT-FILE-CANON.md`** — канон файловой модели агента: роли
+  7 personality-файлов (IDENTITY/SOUL/USER/AGENTS/TOOLS/HEARTBEAT/MEMORY) + wiki/,
+  как создаётся личность (provisioner `~/.zeroclaw/service/provision-agent.py`,
+  материализация, не наследование), конвенция выноса в скиллы v2.1
+  (триггер-таблица обязательна; процедура >25 строк — только в скилл; стиль
+  только в SOUL.md; MEMORY.md ≤ 6000 Б; read_skill обязателен в allowed_tools
+  при compact). Источник-оригинал `_maintenance/agent-template-design.md`
+  локальный (gitignore) — суть перенесена в канон.
+- **`docs/contour/AGENT-MEMORY-CONCEPT.md`** (v0.5) — концепт памяти: слои
+  L0–L3, **Д0: ось миссии = IDENTITY.md** (агент read-only; пересмотр оси —
+  только proposal через ратификацию 9-4; самоизменение разрешено, но receipt
+  правки обязан содержать цитату из IDENTITY.md; единственный жёсткий запрет —
+  destroy без следа). Эпики 9.1–9.6:
+  `_bmad-output/planning-artifacts/epics-agent-memory.md`.
+- Прочее в `docs/contour/`: ADR, тех-пропозал, диалог с Hermes.
+
+Принятые соглашения, не переоткрывать: ручная сборка агентов запрещена (только
+provisioner); шаблон задним числом живых агентов не переписывает (re-provision
+с визой Ram); порядок эпиков Д3→Д4→Д5→Д2→Д1; всё за флагами конфига; в апстрим
+эту линию не предлагать. Статус на 17.11: 9-1 (Narrative kind + DEPLOY-синк) в
+проде; 9-2 (retention archive/delete) закоммичен, на стенд не ставился; 9-3
+(полномочия + ось) — текущая работа.
