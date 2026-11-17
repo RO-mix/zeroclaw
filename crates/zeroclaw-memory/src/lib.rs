@@ -35,12 +35,14 @@ pub mod narrative;
 pub const ARCHIVED_SENTINEL: &str = "__archived__";
 pub mod none;
 pub mod normalize;
+pub mod permissions;
 pub mod policy;
 pub mod policy_gate;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
 pub mod principal_plane;
 pub mod qdrant;
+pub mod receipts;
 pub mod redact;
 pub mod rerank;
 pub mod response_cache;

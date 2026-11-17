@@ -375,6 +375,23 @@ impl SqliteMemory {
         )
         .with_context(|| "SQLite init_schema failed: CREATE TABLE memory_refs")?;
 
+        // Self-change receipts (epic 9-3, Д0): каждая правка narrative/judgment
+        // агентом оставляет receipt с вердиктом quote grounding; contested-
+        // вердикты копят drift-счётчик (memory_meta, см. receipts.rs). Только
+        // CREATE IF NOT EXISTS — старые пути не меняются.
+        execute_batch_retry(
+            conn,
+            "CREATE TABLE IF NOT EXISTS self_change_receipts (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent      TEXT NOT NULL,
+                kind       TEXT NOT NULL,
+                quote      TEXT,
+                verdict    TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );",
+        )
+        .with_context(|| "SQLite init_schema failed: CREATE TABLE self_change_receipts")?;
+
         Self::migrate_session_ids_to_sanitized(conn)?;
 
         Ok(())

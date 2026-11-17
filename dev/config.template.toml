@@ -51,3 +51,16 @@ allow_override = false
 # [cost.prices."openai/gpt-4o"]
 # input = 5.0
 # output = 15.0
+
+# Memory write permissions (epic 9-3, contour RAM): the «category × operation
+# × origin» matrix. Disabled by default — enabling changes behavior only for
+# agent-originated calls; operator paths are the second key and never gated.
+# Receipts of self-edits live in the sqlite brain.db companion file
+# (data/memory/brain.db) regardless of memory.backend; `memory stats` shows
+# them for the sqlite backend.
+# [memory.permissions]
+# enabled = false
+# destroy_narrative = "operator_only"  # agent forget/purge of the narrative distillate: denied before execution
+# destroy_judgment = "operator_only"   # same for the judgment layer (epic 9-4)
+# axis_files_readonly = false          # IDENTITY.md / SOUL.md read-only for agent-originated file_write/file_edit
+# quote_min_chars = 24                 # grounding quote minimum length

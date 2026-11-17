@@ -292,6 +292,35 @@ async fn handle_stats(config: &Config) -> Result<()> {
         }
     }
 
+    // Self-change receipts и drift-метрика (epic 9-3, OQ-3 A): сырьё Д0 —
+    // правки narrative/judgment без проекции на ось. Только sqlite-бэкенд:
+    // таблица self_change_receipts живёт в brain.db.
+    if mem.name() == "sqlite" {
+        let stats = zeroclaw_memory::receipts::self_change_receipt_stats_at(
+            &zeroclaw_memory::receipts::brain_db_path(&config.data_dir),
+        )?;
+        let total = stats.total.to_string();
+        let grounded = stats.grounded.to_string();
+        let contested = stats.contested.to_string();
+        let drift = stats.drift.to_string();
+        let fallback_line = format!(
+            "  Self-change receipts: {total} (grounded {grounded}, contested {contested}, drift {drift})"
+        );
+        println!(
+            "{}",
+            mt_args(
+                "cli-memory-self-change",
+                &[
+                    ("total", total.as_str()),
+                    ("grounded", grounded.as_str()),
+                    ("contested", contested.as_str()),
+                    ("drift", drift.as_str()),
+                ],
+                &fallback_line
+            )
+        );
+    }
+
     Ok(())
 }
 
@@ -558,6 +587,56 @@ mod tests {
         assert_eq!(truncate_content("", 10), "");
     }
 
+    #[cfg(feature = "agent-runtime")]
+    #[tokio::test]
+    async fn clear_yes_deletes_protected_narrative_with_permissions_enabled() {
+        // Epic 9-3 I/O matrix: operator CLI is the second key. Even with the
+        // permission matrix on, `memory clear <narrative key> --yes` destroys
+        // the protected record — the gate never sees operator CLI calls.
+        use zeroclaw_memory::SqliteMemory;
+        use zeroclaw_memory::narrative::NARRATIVE_KEY;
+        use zeroclaw_memory::traits::{MemoryKind, StoreOptions};
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.data_dir = tmp.path().to_path_buf();
+        config.memory.backend = "sqlite".into();
+        config.memory.permissions.enabled = true;
+
+        let seed = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        seed.store_with_options(
+            NARRATIVE_KEY,
+            "ОБРАЗ v1",
+            MemoryCategory::Core,
+            None,
+            StoreOptions {
+                kind: Some(MemoryKind::Narrative),
+                pinned: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        drop(seed);
+
+        handle_command(
+            crate::MemoryCommands::Clear {
+                key: Some(NARRATIVE_KEY.into()),
+                category: None,
+                yes: true,
+            },
+            &config,
+        )
+        .await
+        .unwrap();
+
+        let reopened = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        assert!(
+            reopened.get(NARRATIVE_KEY).await.unwrap().is_none(),
+            "operator CLI must destroy the protected narrative even with the matrix enabled"
+        );
+    }
+
     #[tokio::test]
     async fn clear_rejects_append_only_markdown_backend() {
         let tmp = TempDir::new().unwrap();
@@ -624,5 +703,54 @@ mod tests {
 
         let msg = err.to_string();
         assert!(msg.contains("'qdrant'"), "got: {msg}");
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[tokio::test]
+    async fn stats_prints_self_change_receipts_for_sqlite() {
+        use zeroclaw_memory::SqliteMemory;
+        use zeroclaw_memory::permissions::QuoteVerdict;
+        use zeroclaw_memory::receipts::{
+            brain_db_path, record_self_change_receipt_at, self_change_receipt_stats_at,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.data_dir = tmp.path().to_path_buf();
+        config.memory.backend = "sqlite".into();
+
+        let seed = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        seed.store("narrative", "ОБРАЗ v1", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        drop(seed);
+
+        let db = brain_db_path(tmp.path());
+        record_self_change_receipt_at(
+            &db,
+            "test",
+            "narrative",
+            Some("ОБРАЗ"),
+            QuoteVerdict::Grounded,
+        )
+        .unwrap();
+        record_self_change_receipt_at(
+            &db,
+            "test",
+            "narrative",
+            None,
+            QuoteVerdict::ContestedMissing,
+        )
+        .unwrap();
+
+        handle_stats(&config).await.unwrap();
+
+        // Соседние тесты stdout не захватывают; числа, которые печатает
+        // ветка stats, проверяем косвенно через ту же сводку.
+        let stats = self_change_receipt_stats_at(&db).unwrap();
+        assert_eq!(stats.total, 2);
+        assert_eq!(stats.grounded, 1);
+        assert_eq!(stats.contested, 1);
+        assert_eq!(stats.drift, 1, "drift копит contested-правки");
     }
 }

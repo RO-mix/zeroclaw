@@ -13143,6 +13143,14 @@ pub struct MemoryConfig {
     #[serde(default)]
     #[nested]
     pub types: MemoryTypesConfig,
+
+    /// Operational write permissions (контур RAM, epic 9-3): the
+    /// "category × operation × origin" matrix for memory destroy and
+    /// narrative self-change receipts. Default off — behavior without the
+    /// flag is byte-identical.
+    #[serde(default)]
+    #[nested]
+    pub permissions: MemoryPermissionsConfig,
     // Backend-specific config fields (sqlite_open_timeout_secs, qdrant.*,
     // postgres.*) live on `[storage.<backend>.<alias>]`. The `backend` field
     // carries a dotted alias reference and the runtime looks up the typed
@@ -13162,6 +13170,79 @@ pub struct MemoryTypesConfig {
     /// Assign a first-class MemoryKind to new consolidation writes.
     #[serde(default)]
     pub enabled: bool,
+}
+
+/// Who may destroy (forget/purge) rows of a protected memory category
+/// (контур RAM, epic 9-3, matrix "category × operation × origin").
+#[derive(
+    Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum DestroyPermission {
+    /// The agent may destroy rows of this category from any origin.
+    Agent,
+    /// Only the operator (interactive origin / operator CLI) may destroy;
+    /// agent-initiated origins are denied before the tool executes.
+    #[default]
+    OperatorOnly,
+}
+
+/// Operational write permissions (`[memory.permissions]` section, epic 9-3).
+///
+/// Behavior-neutral by default: `enabled = false` leaves every memory/file
+/// call byte-identical to the pre-feature behavior. When enabled, the matrix
+/// denies agent-initiated destroy on protected categories (narrative/judgment)
+/// before dispatch, makes the workspace axis files (IDENTITY.md/SOUL.md)
+/// read-only for agent origins, and requires narrative self-edits to carry a
+/// grounding quote from IDENTITY.md (edits without a valid quote are still
+/// accepted, but recorded as contested and counted into the drift metric).
+///
+/// Receipts and the drift counter live in the sqlite brain.db companion
+/// file (`data/memory/brain.db`) regardless of `memory.backend`; the
+/// `memory stats` display line is shown for the sqlite backend.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "memory.permissions"]
+pub struct MemoryPermissionsConfig {
+    /// Master switch for the permission matrix. Default off.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Destroy permission for the narrative category (the operator-ratified
+    /// self-image distillate, kind=Narrative). `operator_only` (default)
+    /// denies agent-initiated forget/purge before execution.
+    #[serde(default)]
+    pub destroy_narrative: DestroyPermission,
+    /// Destroy permission for the judgment category (the future proposals
+    /// queue, epic 9-4). `operator_only` (default); no rows carry this kind
+    /// yet, the field exists so the matrix is complete when 9-4 lands.
+    #[serde(default)]
+    pub destroy_judgment: DestroyPermission,
+    /// Make the workspace axis files IDENTITY.md (mission axis) and SOUL.md
+    /// (character core) read-only for agent-originated file_write/file_edit
+    /// calls. Default off.
+    #[serde(default)]
+    pub axis_files_readonly: bool,
+    /// Minimum quote length for narrative self-change grounding, characters.
+    /// The quote must appear in IDENTITY.md exactly once. Default 24.
+    #[serde(default = "default_quote_min_chars")]
+    pub quote_min_chars: usize,
+}
+
+impl Default for MemoryPermissionsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            destroy_narrative: DestroyPermission::OperatorOnly,
+            destroy_judgment: DestroyPermission::OperatorOnly,
+            axis_files_readonly: false,
+            quote_min_chars: default_quote_min_chars(),
+        }
+    }
+}
+
+fn default_quote_min_chars() -> usize {
+    24
 }
 
 /// Memory policy configuration (`[memory.policy]` section).
@@ -13660,6 +13741,7 @@ impl Default for MemoryConfig {
             audit_retention_days: default_audit_retention_days(),
             policy: MemoryPolicyConfig::default(),
             types: MemoryTypesConfig::default(),
+            permissions: MemoryPermissionsConfig::default(),
         }
     }
 }
@@ -55356,5 +55438,46 @@ model_provider = \"ollama.default\"
         duplicate_route
             .validate()
             .expect("legacy duplicate route hints remain valid");
+    }
+
+    #[::core::prelude::v1::test]
+    fn memory_permissions_defaults_are_behavior_neutral() {
+        let cfg = MemoryPermissionsConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.destroy_narrative, DestroyPermission::OperatorOnly);
+        assert_eq!(cfg.destroy_judgment, DestroyPermission::OperatorOnly);
+        assert!(!cfg.axis_files_readonly);
+        assert_eq!(cfg.quote_min_chars, 24);
+
+        // Фича выключена дефолтом и на весь Config тоже.
+        assert!(!Config::default().memory.permissions.enabled);
+    }
+
+    #[::core::prelude::v1::test]
+    fn memory_permissions_toml_roundtrip() {
+        let toml_str = r#"
+            enabled = true
+            destroy_narrative = "agent"
+            destroy_judgment = "operator_only"
+            axis_files_readonly = true
+            quote_min_chars = 40
+        "#;
+        let cfg: MemoryPermissionsConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.destroy_narrative, DestroyPermission::Agent);
+        assert_eq!(cfg.destroy_judgment, DestroyPermission::OperatorOnly);
+        assert!(cfg.axis_files_readonly);
+        assert_eq!(cfg.quote_min_chars, 40);
+
+        // Частичная таблица — дефолты на месте.
+        let partial: MemoryPermissionsConfig = toml::from_str("enabled = true").unwrap();
+        assert!(partial.enabled);
+        assert_eq!(partial.destroy_narrative, DestroyPermission::OperatorOnly);
+        assert_eq!(partial.quote_min_chars, 24);
+
+        let nested: Config =
+            toml::from_str("[memory.permissions]\nenabled = true\nquote_min_chars = 30\n").unwrap();
+        assert!(nested.memory.permissions.enabled);
+        assert_eq!(nested.memory.permissions.quote_min_chars, 30);
     }
 }

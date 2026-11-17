@@ -678,6 +678,7 @@ cli-memory-stats-header = Memory Statistics:
 cli-memory-backend = {"  "}Backend:  {$value}
 cli-memory-total = {"  "}Total:    {$value}
 cli-memory-by-category = {"  "}By category:
+cli-memory-self-change = {"  "}Self-change receipts: {$total} (grounded {$grounded}, contested {$contested}, drift {$drift})
 cli-memory-none-to-clear = No entries to clear.
 cli-memory-found-in-scope = Found {$count} entries in '{$scope}'.
 cli-memory-aborted = Aborted.

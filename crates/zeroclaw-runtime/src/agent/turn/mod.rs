@@ -3494,6 +3494,89 @@ async fn run_tool_call_loop_impl<'a>(
             stream_calls = retained_stream_calls;
         }
 
+        // Epic 9-3: pre-dispatch permission gate (category × operation ×
+        // origin, OQ-2 variant B — origin never reaches Tool::execute, so
+        // the matrix is enforced here, before any tool runs). Built only
+        // when memory.permissions.enabled; otherwise the round passes
+        // through untouched (byte-identical pre-feature behavior). Denied
+        // calls become synthetic tool results carrying the reason and the
+        // proposal hint; narrative stores from agent origins carry a
+        // receipt plan settled after successful execution.
+        let permissions_gate = crate::agent::permissions_gate::PermissionsGate::resolve(
+            config,
+            ingress.origin,
+            security,
+            agent_alias,
+        );
+        let mut receipt_plans: Vec<crate::agent::permissions_gate::ReceiptPlan> = Vec::new();
+        if let Some(ref gate) = permissions_gate {
+            let memory_handle = memory.as_ref().map(|turn_memory| turn_memory.handle);
+            let mut retained_indices = Vec::new();
+            let mut retained_calls = Vec::new();
+            let mut retained_stream_calls = Vec::new();
+            for ((call_idx, call), stream_call) in executable_indices
+                .drain(..)
+                .zip(executable_calls.drain(..))
+                .zip(stream_calls.drain(..))
+            {
+                match gate
+                    .check_call(&call.name, &call.arguments, memory_handle, security)
+                    .await
+                {
+                    crate::agent::permissions_gate::CallGate::Allow => {
+                        retained_indices.push(call_idx);
+                        retained_calls.push(call);
+                        retained_stream_calls.push(stream_call);
+                    }
+                    crate::agent::permissions_gate::CallGate::Receipt { quote } => {
+                        receipt_plans
+                            .push(crate::agent::permissions_gate::ReceiptPlan { call_idx, quote });
+                        retained_indices.push(call_idx);
+                        retained_calls.push(call);
+                        retained_stream_calls.push(stream_call);
+                    }
+                    crate::agent::permissions_gate::CallGate::Deny { reason } => {
+                        call_prep::abandon_unexecuted_prepared_contexts(
+                            &ctx,
+                            iteration,
+                            &[call_idx],
+                            std::slice::from_ref(&call),
+                            &[],
+                        )
+                        .await;
+                        let outcome = crate::agent::tool_execution::ToolExecutionOutcome {
+                            output: reason.clone(),
+                            output_data: None,
+                            success: false,
+                            error_reason: Some(reason),
+                            duration: std::time::Duration::ZERO,
+                            receipt: None,
+                            attachments: Vec::new(),
+                        };
+                        if let Some(tx) = ctx.event_tx {
+                            events::emit_tool_call_pair(tx, &call, &outcome).await;
+                        }
+                        if let (Some(tx), Some(stream_call)) = (ctx.on_delta, stream_call) {
+                            let _ = tx
+                                .send(StreamDelta::ToolComplete {
+                                    tool: call.name.clone(),
+                                    arguments: stream_call.arguments,
+                                    tool_provenance: stream_call.tool_provenance,
+                                    secs: 0,
+                                    success: false,
+                                    error: Some(outcome.output.clone()),
+                                })
+                                .await;
+                        }
+                        ordered_results[call_idx] = Some((call.name, call.tool_call_id, outcome));
+                    }
+                }
+            }
+            executable_indices = retained_indices;
+            executable_calls = retained_calls;
+            stream_calls = retained_stream_calls;
+        }
+
         // Hooks and preparation may rewrite tool names or arguments. Decide
         // parallel eligibility from the final executable calls so policy is
         // applied to what the runtime will actually dispatch.
@@ -3589,6 +3672,25 @@ async fn run_tool_call_loop_impl<'a>(
                 executed_completed_stream_calls.push(stream_call);
                 executed_completed_outcomes.push(outcome);
             }
+        }
+
+        // Epic 9-3: settle narrative-store receipt plans whose calls
+        // actually executed successfully — quote grounding against
+        // IDENTITY.md, receipt row + drift counter in brain.db, and the
+        // verdict appended to the tool output the model sees.
+        if !receipt_plans.is_empty()
+            && let Some(ref gate) = permissions_gate
+            && let Some(config) = config
+        {
+            crate::agent::permissions_gate::settle_receipt_plans(
+                &receipt_plans,
+                gate,
+                &executed_completed_indices,
+                &mut executed_completed_outcomes,
+                config,
+                agent_alias,
+            )
+            .await;
         }
 
         let repetition_disposition = if let Some(guard) =

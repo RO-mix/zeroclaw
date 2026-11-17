@@ -14,6 +14,7 @@ pub mod loop_;
 pub mod loop_detector;
 pub mod memory_inject;
 pub mod memory_strategy;
+pub(crate) mod permissions_gate;
 pub mod personality;
 pub mod personality_templates;
 pub mod pricing_catalog;

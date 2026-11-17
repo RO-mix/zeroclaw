@@ -48,6 +48,10 @@ impl Tool for MemoryStoreTool {
                     "type": "string",
                     "enum": ["narrative"],
                     "description": "Optional. 'narrative' stores the operator-ratified self-image distillate (epic 9-1): the key is forced to 'narrative_distillate', the record is pinned, and content over the hard cap is refused. Publishing into SOUL.md happens on the governance pass when narrative_enabled is set."
+                },
+                "quote": {
+                    "type": "string",
+                    "description": "Optional, meaningful only with kind='narrative' (epic 9-3): an exact substring of the workspace IDENTITY.md, at least the configured minimum length (default 24 chars), occurring exactly once. Grounds the self-edit against the mission axis; a missing or ambiguous quote is recorded as a contested receipt and counted into the drift metric (the edit itself is still accepted)."
                 }
             },
             "required": ["key", "content"]
@@ -100,12 +104,10 @@ impl Tool for MemoryStoreTool {
 
         // Epic 9-1: narrative distillate — pinned record, forced key, hard cap.
         if args.get("kind").and_then(|v| v.as_str()) == Some("narrative") {
-            if let Err(reject) =
-                zeroclaw_memory::narrative::validate_cap(
-                    content,
-                    zeroclaw_memory::narrative::DEFAULT_NARRATIVE_CAP_CHARS,
-                )
-            {
+            if let Err(reject) = zeroclaw_memory::narrative::validate_cap(
+                content,
+                zeroclaw_memory::narrative::DEFAULT_NARRATIVE_CAP_CHARS,
+            ) {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
