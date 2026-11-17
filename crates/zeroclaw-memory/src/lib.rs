@@ -26,6 +26,7 @@ pub mod knowledge_graph_pg;
 pub mod lucid;
 pub mod markdown;
 pub mod merge;
+pub mod narrative;
 pub mod none;
 pub mod normalize;
 pub mod policy;
@@ -1016,7 +1017,42 @@ fn wrap_in_retrieval_pipeline(memory: Arc<dyn Memory>, config: &MemoryConfig) ->
 /// the time we get here every entry on
 /// `agents.<alias>.workspace.read_memory_from` is guaranteed to point
 /// at a sibling on the same backend kind.
+/// Создать стек памяти агента; при включённом `memory.narrative_enabled`
+/// фоном публикует дистиллят образа в SOUL.md воркспейса (epic 9-1,
+/// ADR Решение 1). Источник истины — запись `narrative_distillate`; раздел
+/// в SOUL.md — генерируемая проекция (база → файл, одно направление).
 pub async fn create_memory_for_agent(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+    api_key: Option<&str>,
+) -> anyhow::Result<Arc<dyn Memory>> {
+    let memory = create_memory_for_agent_inner(config, agent_alias, api_key).await?;
+    if config.memory.narrative_enabled {
+        let workspace = config.agent_workspace_dir(agent_alias);
+        let cap = config.memory.narrative_cap_chars;
+        let handle = Arc::clone(&memory);
+        tokio::spawn(async move {
+            match narrative::deploy(handle.as_ref(), &workspace, cap).await {
+                Ok(true) => ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "narrative distillate deployed to SOUL.md"
+                ),
+                Ok(false) => {}
+                Err(e) => ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "narrative deploy rejected; consolidation required"
+                ),
+            }
+        });
+    }
+    Ok(memory)
+}
+
+async fn create_memory_for_agent_inner(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
     api_key: Option<&str>,

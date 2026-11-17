@@ -12931,6 +12931,17 @@ pub struct MemoryConfig {
     /// backend globally and on every agent (validated at config load).
     #[serde(default)]
     pub consolidation_extract_facts: bool,
+    /// Публиковать дистиллят образа (контур RAM, epic 9-1): при фазовом прогоне
+    /// governance запись `narrative_distillate` с kind=Narrative переписывает
+    /// раздел между маркерами NARRATIVE в SOUL.md воркспейса. Default off —
+    /// поведение без флага не меняется.
+    #[serde(default)]
+    pub narrative_enabled: bool,
+    /// Жёсткий cap дистиллята образа, символов. Публикация контента сверх cap
+    /// отклоняется (раздел не переписывается) и журналируется как задача
+    /// консолидации. Default 2200.
+    #[serde(default = "default_narrative_cap_chars")]
+    pub narrative_cap_chars: usize,
     /// Move daily/session files to the archive directory after this many days. Keeps the hot working set small without deleting history.
     #[serde(default = "default_archive_after_days")]
     pub archive_after_days: u32,
@@ -13515,6 +13526,10 @@ fn default_hygiene_enabled() -> bool {
 fn default_archive_after_days() -> u32 {
     7
 }
+/// Cap дистиллята образа по умолчанию, символов (epic 9-1).
+fn default_narrative_cap_chars() -> usize {
+    2200
+}
 fn default_purge_after_days() -> u32 {
     30
 }
@@ -13563,6 +13578,8 @@ impl Default for MemoryConfig {
             auto_save: true,
             hygiene_enabled: default_hygiene_enabled(),
             consolidation_extract_facts: false,
+            narrative_enabled: false,
+            narrative_cap_chars: default_narrative_cap_chars(),
             archive_after_days: default_archive_after_days(),
             purge_after_days: default_purge_after_days(),
             conversation_retention_days: default_conversation_retention_days(),

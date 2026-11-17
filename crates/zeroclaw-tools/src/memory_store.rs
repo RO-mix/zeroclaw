@@ -43,6 +43,11 @@ impl Tool for MemoryStoreTool {
                 "category": {
                     "type": "string",
                     "description": "Memory category: 'core' (permanent), 'daily' (session), 'conversation' (chat), or a custom category name. Defaults to 'core'."
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["narrative"],
+                    "description": "Optional. 'narrative' stores the operator-ratified self-image distillate (epic 9-1): the key is forced to 'narrative_distillate', the record is pinned, and content over the hard cap is refused. Publishing into SOUL.md happens on the governance pass when narrative_enabled is set."
                 }
             },
             "required": ["key", "content"]
@@ -93,6 +98,50 @@ impl Tool for MemoryStoreTool {
             });
         }
 
+        // Epic 9-1: narrative distillate — pinned record, forced key, hard cap.
+        if args.get("kind").and_then(|v| v.as_str()) == Some("narrative") {
+            if let Err(reject) =
+                zeroclaw_memory::narrative::validate_cap(
+                    content,
+                    zeroclaw_memory::narrative::DEFAULT_NARRATIVE_CAP_CHARS,
+                )
+            {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!("narrative distillate refused: {reject}")),
+                });
+            }
+            let options = zeroclaw_memory::traits::StoreOptions {
+                kind: Some(zeroclaw_memory::traits::MemoryKind::Narrative),
+                pinned: true,
+                ..Default::default()
+            };
+            return match self
+                .memory
+                .store_with_options(
+                    zeroclaw_memory::narrative::NARRATIVE_KEY,
+                    content,
+                    MemoryCategory::Core,
+                    None,
+                    options,
+                )
+                .await
+            {
+                Ok(()) => Ok(ToolResult {
+                    success: true,
+                    output: "Stored narrative distillate (published to SOUL.md on governance pass)"
+                        .into(),
+                    error: None,
+                }),
+                Err(e) => Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!("Failed to store narrative distillate: {e}")),
+                }),
+            };
+        }
+
         match self.memory.store(key, content, category, None).await {
             Ok(()) => Ok(ToolResult {
                 success: true,
@@ -134,6 +183,48 @@ mod tests {
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["key"].is_object());
         assert!(schema["properties"]["content"].is_object());
+    }
+
+    #[tokio::test]
+    async fn store_narrative_forces_key_pins_and_round_trips_kind() {
+        let (_tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(Arc::clone(&mem), test_security());
+        let res = tool
+            .execute(serde_json::json!({
+                "key": "ignored_key",
+                "content": "ОБРАЗ v1",
+                "kind": "narrative"
+            }))
+            .await
+            .unwrap();
+        assert!(res.success, "narrative store failed: {:?}", res.error);
+        let entry = mem
+            .get(zeroclaw_memory::narrative::NARRATIVE_KEY)
+            .await
+            .unwrap()
+            .expect("narrative record present");
+        assert!(entry.pinned, "narrative record pinned");
+        assert_eq!(
+            entry.kind,
+            Some(zeroclaw_memory::traits::MemoryKind::Narrative)
+        );
+    }
+
+    #[tokio::test]
+    async fn store_narrative_refuses_over_cap() {
+        let (_tmp, mem) = test_mem();
+        let tool = MemoryStoreTool::new(mem, test_security());
+        let big = "x".repeat(zeroclaw_memory::narrative::DEFAULT_NARRATIVE_CAP_CHARS + 1);
+        let res = tool
+            .execute(serde_json::json!({
+                "key": "k",
+                "content": big,
+                "kind": "narrative"
+            }))
+            .await
+            .unwrap();
+        assert!(!res.success);
+        assert!(res.error.unwrap().contains("over cap"));
     }
 
     #[tokio::test]

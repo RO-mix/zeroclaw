@@ -156,6 +156,10 @@ pub enum MemoryKind {
     Semantic(SemanticSubtype),
     /// How-to or process memory.
     Procedural,
+    /// Operator-ratified self-image distillate (контур RAM, epic 9-1). Единственная
+    /// запись с этим видом — дистиллят образа; публикуется в personality-файл
+    /// SOUL.md между маркерами при фазовом прогоне governance (DEPLOY).
+    Narrative,
 }
 
 /// Semantic memory subtypes.
