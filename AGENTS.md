@@ -118,10 +118,11 @@ ops rituals live in `.agents/skills/zc-*` (`zc-service-ops`, `zc-config-surgery`
 provisioner); шаблон задним числом живых агентов не переписывает (re-provision
 с визой Ram); порядок эпиков Д3→Д4→Д5→Д2→Д1; всё за флагами конфига; в апстрим
 эту линию не предлагать. Статус на 17.11: 9-1 (Narrative kind + DEPLOY-синк) в
-проде; 9-2 (retention archive/delete) закоммичен, на стенд не ставился; 9-3
-(полномочия + ось) — закоммичен (883083b306), не задеплоен: фича выключена
-дефолтом (`memory.permissions.enabled = false`), включение и деплой — отдельной визой
-(вместе с 9-2). Рабочее соглашение (Ram, 17.11): решения
+проде; 9-2 (retention archive/delete) закоммичен, на стенд не ставился; 9-2 и 9-3 — в проде с 18.11 (бинарь пересобран из feat/memory-strata, `883083b306` +
+деплой-коммит; бэкапы `~/.zeroclaw/*.bak-*-9-3`). Конфиг сервиса: `retention_mode
+= "archive"` (daily 7 / core 60, purge 180), `[memory.permissions] enabled = true,
+axis_files_readonly = true`. Ось (IDENTITY.md) теперь read-only для агентов; drift
+виден в `zeroclaw memory stats`. Откат: вернуть бэкапы exe+config, рестарт. Рабочее соглашение (Ram, 17.11): решения
 принимает оператор; фиксируются в `<frozen-after-approval>`-блоках спек
 (`_bmad-output/implementation-artifacts/`) и в каноне `docs/contour/`, не в
 памяти сессии.
