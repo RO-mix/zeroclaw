@@ -1312,6 +1312,8 @@ pub async fn run_with_authority(
 
     let daemon_execution_capability = live_config_authority.execution_capability();
 
+    let dream_capability = daemon_execution_capability.clone();
+
     if config.heartbeat.enabled {
         let heartbeat_cfg = config.clone();
         let heartbeat_execution_capability = daemon_execution_capability.clone();
@@ -1388,6 +1390,39 @@ pub async fn run_with_authority(
         ));
     } else {
         crate::health::mark_component_ok("ratification");
+    }
+
+    // Dream worker (epic 9-6, контур RAM): per-agent ночной прогон
+    // LLM-переоценки суждений. Трёхвентильный триггер (время × объём ×
+    // lock), model-free отбор входов, один вызов модели строгим JSON,
+    // revision-операции — только в очередь ратификации 9-4 (подпись
+    // оператора). Флаг выкл (дефолт): компонент не стартует — поведение
+    // байт-в-байт прежнее.
+    if config.memory.dream.enabled {
+        let dream_cfg = config.clone();
+        let dream_cancel = channels_cancel.clone();
+
+        handles.push(spawn_component_supervisor(
+            "dream",
+            initial_backoff,
+            max_backoff,
+            channels_cancel.clone(),
+            move || {
+                let cfg = dream_cfg.clone();
+                let cancel = dream_cancel.clone();
+                let capability = dream_capability.clone();
+                async move {
+                    Box::pin(crate::agent::dream::run_dream_worker(
+                        cfg,
+                        cancel,
+                        Some(capability),
+                    ))
+                    .await
+                }
+            },
+        ));
+    } else {
+        crate::health::mark_component_ok("dream");
     }
 
     // Wait for shutdown (SIGINT/SIGTERM/Ctrl+C), reload (in-process channel),

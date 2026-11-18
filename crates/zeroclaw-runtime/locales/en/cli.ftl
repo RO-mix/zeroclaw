@@ -680,6 +680,7 @@ cli-memory-total = {"  "}Total:    {$value}
 cli-memory-by-category = {"  "}By category:
 cli-memory-self-change = {"  "}Self-change receipts: {$total} (grounded {$grounded}, contested {$contested}, drift {$drift})
 cli-memory-proposals = {"  "}Proposals: {$total} (pending {$pending}, accepted {$accepted}, rejected {$rejected}, expired {$expired})
+cli-memory-dream = {"  "}Dream [{$agent}]: runs {$runs} last {$last_run} (proposed {$proposed}, accepted {$accepted}, revalidations {$revalidations}, drift {$drift})
 cli-ratification-packet-intro = Ratification packet {$packet}: {$count} item(s), mirror {$mirror}
 cli-ratification-packet-item = {"  "}{$position}. [{$kind}] {$payload}
 cli-ratification-packet-throttled = {"  "}Held back by weekly budget: {$count} proposal(s)

@@ -13162,6 +13162,19 @@ pub struct MemoryConfig {
     #[serde(default)]
     #[nested]
     pub ratification: MemoryRatificationConfig,
+
+    /// Nightly LLM re-evaluation of judgments (`[memory.dream]` section,
+    /// epic 9-6, контур RAM). Behavior-neutral by default: `enabled = false`
+    /// leaves every daemon/consolidation path byte-identical. When enabled,
+    /// a per-agent three-valve trigger (time × delta volume × lock) starts a
+    /// dream run: inputs are selected model-free (contested clusters SQL,
+    /// unrevised proposals, fresh episodes, revalidation queue), the agent's
+    /// own model re-evaluates them ONCE and returns a strict JSON list of
+    /// revision operations, which are proposed into the 9-4 ratification
+    /// queue — durable memory changes only after the operator signs.
+    #[serde(default)]
+    #[nested]
+    pub dream: MemoryDreamConfig,
     // Backend-specific config fields (sqlite_open_timeout_secs, qdrant.*,
     // postgres.*) live on `[storage.<backend>.<alias>]`. The `backend` field
     // carries a dotted alias reference and the runtime looks up the typed
@@ -13332,6 +13345,92 @@ fn default_ratification_weekly_budget() -> u32 {
 
 fn default_ratification_min_packet() -> u32 {
     1
+}
+
+/// Nightly dream cycle — LLM re-evaluation of judgments (`[memory.dream]`
+/// section, epic 9-6, контур RAM).
+///
+/// Behavior-neutral by default: `enabled = false` leaves every daemon path
+/// byte-identical (the dream worker does not start). When enabled, a
+/// per-agent run starts only when all three valves open: at least
+/// `min_interval_days` since the last successful run, at least
+/// `delta_threshold` new signals accumulated, and the run lock free. The
+/// run materializes inputs without the model, calls the agent's own model
+/// exactly once with a pinned prompt and an empty toolset (no file tools,
+/// no memory writes are reachable), parses the strict JSON operation list
+/// and proposes revision operations into the 9-4 ratification queue. The
+/// accepted facts older than `revalidate_days` return for periodic
+/// re-validation (VALIDATE/REFUTE with non-destructive versioning).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "memory.dream"]
+pub struct MemoryDreamConfig {
+    /// Master switch for the dream worker. Default off.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Time valve: minimum days between successful dream runs of one agent.
+    #[serde(default = "default_dream_min_interval_days")]
+    pub min_interval_days: u32,
+    /// Volume valve: minimum accumulated delta signals (new memories,
+    /// proposals and ratification receipts since the last run) to open the
+    /// window. Below the threshold the run does not start and no tokens are
+    /// spent.
+    #[serde(default = "default_dream_delta_threshold")]
+    pub delta_threshold: u32,
+    /// Maximum revision operations admitted from one run's model output;
+    /// the rest of the inputs stays in the delta for the next window.
+    #[serde(default = "default_dream_max_revisions_per_run")]
+    pub max_revisions_per_run: u32,
+    /// Revalidation horizon: accepted ratified facts older than this many
+    /// days are queued for VALIDATE/REFUTE re-evaluation.
+    #[serde(default = "default_dream_revalidate_days")]
+    pub revalidate_days: u32,
+    /// Token budget ceiling for one dream run (prompt + completion).
+    #[serde(default = "default_dream_token_budget")]
+    pub token_budget: u32,
+    /// Pre-model entry gate (minRecallCount-analog): an input position must
+    /// carry at least this many confirming signals (live references from
+    /// other rows/proposals) before it is shown to the model at all.
+    #[serde(default = "default_dream_min_confirming_signals")]
+    pub min_confirming_signals: u32,
+}
+
+impl Default for MemoryDreamConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_interval_days: default_dream_min_interval_days(),
+            delta_threshold: default_dream_delta_threshold(),
+            max_revisions_per_run: default_dream_max_revisions_per_run(),
+            revalidate_days: default_dream_revalidate_days(),
+            token_budget: default_dream_token_budget(),
+            min_confirming_signals: default_dream_min_confirming_signals(),
+        }
+    }
+}
+
+fn default_dream_min_interval_days() -> u32 {
+    3
+}
+
+fn default_dream_delta_threshold() -> u32 {
+    3
+}
+
+fn default_dream_max_revisions_per_run() -> u32 {
+    10
+}
+
+fn default_dream_revalidate_days() -> u32 {
+    30
+}
+
+fn default_dream_token_budget() -> u32 {
+    4096
+}
+
+fn default_dream_min_confirming_signals() -> u32 {
+    2
 }
 
 /// Memory policy configuration (`[memory.policy]` section).
@@ -13832,6 +13931,7 @@ impl Default for MemoryConfig {
             types: MemoryTypesConfig::default(),
             permissions: MemoryPermissionsConfig::default(),
             ratification: MemoryRatificationConfig::default(),
+            dream: MemoryDreamConfig::default(),
         }
     }
 }

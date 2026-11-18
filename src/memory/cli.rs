@@ -346,6 +346,43 @@ async fn handle_stats(config: &Config) -> Result<()> {
                 &fallback_line
             )
         );
+
+        // Dream cycle (epic 9-6): счётчики ночного прогона переоценки
+        // суждений (per-agent; state-file читается напрямую).
+        #[cfg(feature = "agent-runtime")]
+        for (agent, agent_state) in
+            &zeroclaw_runtime::agent::dream::stats_at(&config.data_dir).agents
+        {
+            let counters = &agent_state.counters;
+            let runs = agent_state.run_count.to_string();
+            let last_run = agent_state
+                .last_run_at
+                .clone()
+                .unwrap_or_else(|| "-".to_string());
+            let proposed = counters.revisions_proposed.to_string();
+            let accepted = counters.revisions_accepted.to_string();
+            let revalidations = counters.revalidations.to_string();
+            let drift = counters.drift_events.to_string();
+            let fallback_line = format!(
+                "  Dream [{agent}]: runs {runs} last {last_run} (proposed {proposed}, accepted {accepted}, revalidations {revalidations}, drift {drift})"
+            );
+            println!(
+                "{}",
+                mt_args(
+                    "cli-memory-dream",
+                    &[
+                        ("agent", agent.as_str()),
+                        ("runs", runs.as_str()),
+                        ("last_run", last_run.as_str()),
+                        ("proposed", proposed.as_str()),
+                        ("accepted", accepted.as_str()),
+                        ("revalidations", revalidations.as_str()),
+                        ("drift", drift.as_str()),
+                    ],
+                    &fallback_line
+                )
+            );
+        }
     }
 
     Ok(())

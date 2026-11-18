@@ -147,6 +147,263 @@ pub struct FileEvent {
     pub created_at: String,
 }
 
+// ── Dream revision operations (epic 9-6) ─────────────────────────────
+
+/// The eight dream revision actions with equal status in the queue
+/// (OQ: «очередь только новых фактов обречена» — validate/prune/relink
+/// идут с тем же весом, что и promote).
+pub const REVISION_ACTIONS: &[&str] = &[
+    "promote",
+    "demote",
+    "link",
+    "archive",
+    "supersede",
+    "merge",
+    "validate",
+    "refute",
+];
+
+/// Одна revision-операция из строгого JSON-ответа сна. Ратифицируются
+/// факты и доказательства, не формат (Anthropic-вывод): `rationale` —
+/// обязательное обоснование, `refs` — durable-ссылки на эпизоды/строки,
+/// по которым принимается решение.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RevisionOp {
+    /// Одно из [`REVISION_ACTIONS`].
+    pub action: String,
+    /// Целевая строка памяти (key) для операций над существующим суждением.
+    #[serde(default)]
+    pub target: Option<String>,
+    /// Новый текст (новая версия/факт) для promote/supersede/merge/refute.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// Обязательное обоснование операции.
+    pub rationale: String,
+    /// Durable-ссылки (keys) на доказательства.
+    #[serde(default)]
+    pub refs: Vec<String>,
+}
+
+/// Разобрать строгий JSON ответ сна в список операций (не прозу).
+/// Принимает либо JSON-массив операций, либо объект с полем `operations`.
+/// Каждая операция валидируется: action ∈ REVISION_ACTIONS, rationale
+/// непуст, для операций над существующим суждением target обязателен.
+/// Результат усечён до `max_ops` — остаток входов остаётся в дельте.
+pub fn parse_revision_ops(payload: &str, max_ops: usize) -> Result<Vec<RevisionOp>> {
+    let trimmed = payload.trim();
+    let value: serde_json::Value = serde_json::from_str(trimmed)
+        .with_context(|| "dream output is not valid JSON (operations, not prose)")?;
+    let list = match &value {
+        serde_json::Value::Array(items) => items.clone(),
+        serde_json::Value::Object(map) => map
+            .get("operations")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .with_context(|| "dream output object lacks an `operations` array")?,
+        _ => bail!("dream output must be a JSON array of operations"),
+    };
+    let mut ops = Vec::new();
+    for item in list {
+        let op: RevisionOp = serde_json::from_value(item)
+            .with_context(|| "dream operation has invalid structure")?;
+        if !REVISION_ACTIONS.contains(&op.action.as_str()) {
+            bail!("unknown dream revision action: {}", op.action);
+        }
+        if op.rationale.trim().is_empty() {
+            bail!("dream revision operation '{}' lacks a rationale", op.action);
+        }
+        // promote создаёт новую запись (target не нужен); все операции над
+        // существующими суждениями — включая link — требуют target: иначе
+        // link маппил бы обоснование как source_key и писал мусорные
+        // memory_refs.
+        let needs_target = op.action != "promote";
+        if needs_target && op.target.as_deref().is_none_or(str::is_empty) {
+            bail!("dream revision operation '{}' lacks a target", op.action);
+        }
+        if matches!(
+            op.action.as_str(),
+            "promote" | "supersede" | "merge" | "refute"
+        ) && op.content.as_deref().is_none_or(str::is_empty)
+        {
+            bail!("dream revision operation '{}' lacks content", op.action);
+        }
+        ops.push(op);
+        if ops.len() >= max_ops {
+            break;
+        }
+    }
+    Ok(ops)
+}
+
+/// Предложение kind=revision из dream-операции (payload — строгий JSON,
+/// схема proposals не меняется).
+#[must_use]
+pub fn revision_proposal(
+    agent: Option<&str>,
+    op: &RevisionOp,
+    run_tag: &str,
+) -> RatificationProposal {
+    let mut refs: Vec<String> = op.refs.clone();
+    if let Some(target) = &op.target
+        && !refs.contains(target)
+    {
+        refs.push(target.clone());
+    }
+    let payload = serde_json::to_string(op).unwrap_or_default();
+    let mut proposal = RatificationProposal::new(
+        RatificationProposal::KIND_REVISION,
+        payload,
+        RatificationProposal::PRIORITY_NORMAL,
+        source_hash(&["dream-revision", run_tag, &op.action, &op.rationale]),
+    )
+    .with_refs(refs);
+    proposal.agent = agent.map(str::to_string);
+    proposal
+}
+
+/// Очередь ревалидации: принятые ратификатором факты (исходные эпизоды
+/// accepted, Core, не-суперседнутые) старше `older_than_days` возвращаются
+/// на переоценку против свежих эпизодов. Per-agent scope через join на
+/// agents; `agent = None` — общий план (системный сон отдельной визой).
+pub fn revalidate_queue(
+    conn: &Connection,
+    older_than_days: u32,
+    agent: Option<&str>,
+    limit: usize,
+) -> Result<Vec<String>> {
+    let cutoff = chrono::Local::now() - chrono::Duration::days(i64::from(older_than_days));
+    let cutoff = cutoff.to_rfc3339();
+    let agent_clause = if agent.is_some() {
+        "AND (SELECT alias FROM agents WHERE agents.id = memories.agent_id) = ?2"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT key FROM memories \
+         WHERE category = 'core' AND superseded_by IS NULL \
+           AND key LIKE 'ratification_accepted_%' AND updated_at <= ?1 \
+           {agent_clause} \
+         ORDER BY updated_at LIMIT ?3"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        rusqlite::params![cutoff, agent.unwrap_or(""), limit as i64],
+        |row| row.get(0),
+    )?;
+    rows.collect::<Result<Vec<String>, _>>().map_err(Into::into)
+}
+
+/// Исполнить revision-операцию детерминированно, non-destructive: старые
+/// версии суперседятся (supersede-цепочка memories, reuse 9-2 sentinel),
+/// никаких DELETE. Выполняется внутри транзакции apply_signed — только
+/// после подписи оператора (сон сам ничего не пишет в memories).
+fn execute_revision_op(
+    tx: &rusqlite::Transaction,
+    op: &RevisionOp,
+    now: &str,
+    proposal_id: i64,
+) -> Result<()> {
+    let insert_version = |tx: &rusqlite::Transaction, key: &str, content: &str| -> Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO memories (
+                id, key, content, category, created_at, updated_at,
+                session_id, namespace, importance, agent_id, kind, pinned, tenant_id,
+                superseded_by
+             )
+             VALUES (?1, ?2, ?3, 'core', ?4, ?5, NULL, 'default', 0.5,
+                     (SELECT id FROM agents WHERE alias = 'default' LIMIT 1),
+                     NULL, 0, NULL, NULL)",
+            rusqlite::params![id, key, content, now, now],
+        )?;
+        Ok(id)
+    };
+    let link_refs = |tx: &rusqlite::Transaction, source_key: &str| -> Result<()> {
+        for reference in &op.refs {
+            tx.execute(
+                "INSERT INTO memory_refs (source_key, target_key, created_at) \
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![source_key, reference, now],
+            )?;
+        }
+        Ok(())
+    };
+    let supersede_target = |tx: &rusqlite::Transaction, target: &str, new_id: &str| -> Result<()> {
+        tx.execute(
+            "UPDATE memories SET superseded_by = ?1 WHERE key = ?2 AND superseded_by IS NULL",
+            rusqlite::params![new_id, target],
+        )?;
+        Ok(())
+    };
+
+    match op.action.as_str() {
+        "promote" => {
+            let key = format!("dream_promote_{proposal_id}");
+            insert_version(tx, &key, op.content.as_deref().unwrap_or_default())?;
+            link_refs(tx, &key)?;
+        }
+        "demote" => {
+            // Обратимое понижение значимости; строка остаётся находимой.
+            tx.execute(
+                "UPDATE memories SET importance = MAX(importance - 0.2, 0.05), updated_at = ?1 \
+                 WHERE key = ?2 AND superseded_by IS NULL",
+                rusqlite::params![now, op.target],
+            )?;
+        }
+        "link" => {
+            let source = op
+                .target
+                .as_deref()
+                .unwrap_or_else(|| op.rationale.as_str());
+            link_refs(tx, source)?;
+        }
+        "archive" => {
+            // Архивирование = обратимое скрытие (sentinel 9-2), не DELETE.
+            tx.execute(
+                "UPDATE memories SET superseded_by = ?1, updated_at = ?2 \
+                 WHERE key = ?3 AND superseded_by IS NULL",
+                rusqlite::params![crate::ARCHIVED_SENTINEL, now, op.target],
+            )?;
+        }
+        "supersede" | "refute" => {
+            let key = format!("dream_{}_{proposal_id}", op.action);
+            let body = match op.action.as_str() {
+                "refute" => format!(
+                    "REFUTED: {}\n{}",
+                    op.rationale,
+                    op.content.as_deref().unwrap_or_default()
+                ),
+                _ => op.content.clone().unwrap_or_default(),
+            };
+            let new_id = insert_version(tx, &key, &body)?;
+            if let Some(target) = &op.target {
+                supersede_target(tx, target, &new_id)?;
+            }
+            link_refs(tx, &key)?;
+        }
+        "merge" => {
+            let key = format!("dream_merge_{proposal_id}");
+            let new_id = insert_version(tx, &key, op.content.as_deref().unwrap_or_default())?;
+            if let Some(target) = &op.target {
+                supersede_target(tx, target, &new_id)?;
+            }
+            for reference in &op.refs {
+                supersede_target(tx, reference, &new_id)?;
+            }
+        }
+        "validate" => {
+            // Продление статуса: факт подтверждён свежими эпизодами.
+            tx.execute(
+                "UPDATE memories SET updated_at = ?1 WHERE key = ?2 AND superseded_by IS NULL",
+                rusqlite::params![now, op.target],
+            )?;
+            link_refs(tx, op.target.as_deref().unwrap_or_default())?;
+        }
+        other => bail!("unknown dream revision action: {other}"),
+    }
+    Ok(())
+}
+
 fn sha256_hex(data: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data.as_bytes());
@@ -357,9 +614,11 @@ fn load_items(conn: &Connection, ids: &[i64]) -> Result<Vec<PacketItem>> {
     Ok(items)
 }
 
-/// Throttle: коррекции оператора бессрочны и бюджету не подлежат; остальные
-/// классы удерживаются в порядке ценности (expensive_episode, contradiction,
-/// trend) в пределах недельного бюджета — trend вырезается первым.
+/// Throttle: коррекции оператора бессрочны и бюджету не подлежат; revision-
+/// операции сна (epic 9-6) идут с равным статусом (validate/prune/relink —
+/// не дно очереди); остальные классы удерживаются в порядке ценности
+/// (expensive_episode, contradiction, trend) в пределах недельного бюджета —
+/// trend вырезается первым.
 /// Возвращает (admitted, throttled_count).
 fn apply_throttle(items: Vec<PacketItem>, weekly_budget: u32) -> (Vec<PacketItem>, u32) {
     let mut admitted: Vec<PacketItem> = items
@@ -369,6 +628,7 @@ fn apply_throttle(items: Vec<PacketItem>, weekly_budget: u32) -> (Vec<PacketItem
         .collect();
     let mut remaining = (weekly_budget as usize).saturating_sub(admitted.len());
     for keep in [
+        RatificationProposal::KIND_REVISION,
         RatificationProposal::KIND_EXPENSIVE_EPISODE,
         RatificationProposal::KIND_CONTRADICTION,
         RatificationProposal::KIND_TREND,
@@ -557,6 +817,28 @@ pub fn apply_signed(
             .map_or(ItemDecision::Accept, |(_, d)| *d)
     };
 
+    // Revision-позиции (epic 9-6): payload — строгий JSON операции. Разбор
+    // до транзакции: мусорный payload отказывает применение целиком
+    // (receipt не пишется, DEPLOY не выполняется).
+    let mut revision_ops: std::collections::HashMap<i64, RevisionOp> =
+        std::collections::HashMap::new();
+    for item in &selected {
+        if item.kind == RatificationProposal::KIND_REVISION
+            && decision_of(item.position) == ItemDecision::Accept
+        {
+            let op = parse_revision_ops(&item.payload, 1)
+                .with_context(|| {
+                    format!("revision proposal {} has invalid payload", item.proposal_id)
+                })?
+                .into_iter()
+                .next()
+                .with_context(|| {
+                    format!("revision proposal {} has empty payload", item.proposal_id)
+                })?;
+            revision_ops.insert(item.proposal_id, op);
+        }
+    }
+
     let now = chrono::Local::now().to_rfc3339();
     let tx = conn.unchecked_transaction()?;
     let mut outcome = ApplyOutcome::default();
@@ -568,7 +850,18 @@ pub fn apply_signed(
         let episode_key = format!("ratification_{status}_{}", item.proposal_id);
         let episode_content = match decision_of(item.position) {
             ItemDecision::Accept => {
-                format!("[ratified {}] {}", item.kind, item.payload)
+                if let Some(op) = revision_ops.get(&item.proposal_id) {
+                    // Исход — эпизод с action/обоснованием/source-refs;
+                    // сама операция исполняется ниже (non-destructive).
+                    format!(
+                        "[ratified revision] {}: {} refs=[{}]",
+                        op.action,
+                        op.rationale,
+                        op.refs.join(", ")
+                    )
+                } else {
+                    format!("[ratified {}] {}", item.kind, item.payload)
+                }
             }
             ItemDecision::Reject => {
                 format!(
@@ -608,6 +901,10 @@ pub fn apply_signed(
             "UPDATE proposals SET status = ?1, resolved_at = ?2 WHERE id = ?3",
             params![status, now, item.proposal_id],
         )?;
+        if let Some(op) = revision_ops.get(&item.proposal_id) {
+            execute_revision_op(&tx, op, &now, item.proposal_id)
+                .with_context(|| format!("executing revision proposal {}", item.proposal_id))?;
+        }
         match decision_of(item.position) {
             ItemDecision::Accept => outcome.accepted.push(item.proposal_id),
             ItemDecision::Reject => outcome.rejected.push(item.proposal_id),
@@ -1127,5 +1424,271 @@ mod tests {
     fn source_hash_is_deterministic() {
         assert_eq!(source_hash(&["a", "b"]), source_hash(&["a", "b"]));
         assert_ne!(source_hash(&["a", "b"]), source_hash(&["b", "a"]));
+    }
+
+    // ── Dream revision operations (epic 9-6) ────────────────────────
+
+    #[test]
+    fn parse_revision_ops_round_trips_all_eight_actions() {
+        let ops: Vec<RevisionOp> = [
+            ("promote", None, Some("new durable fact")),
+            ("demote", Some("core_a"), None),
+            ("link", Some("core_a"), None),
+            ("archive", Some("core_a"), None),
+            ("supersede", Some("core_a"), Some("new version")),
+            ("merge", Some("core_a"), Some("merged text")),
+            ("validate", Some("core_a"), None),
+            ("refute", Some("core_a"), Some("correction")),
+        ]
+        .iter()
+        .map(|(action, target, content)| RevisionOp {
+            action: action.to_string(),
+            target: target.map(str::to_string),
+            content: content.map(str::to_string),
+            rationale: format!("grounded rationale for {action}"),
+            refs: vec!["daily_1".to_string()],
+        })
+        .collect();
+        let payload = serde_json::to_string(&ops).unwrap();
+        let parsed = parse_revision_ops(&payload, 20).unwrap();
+        assert_eq!(parsed, ops, "all eight actions round-trip");
+        // Объектная обёртка {"operations": [...]} тоже принимается.
+        let wrapped = serde_json::json!({ "operations": ops }).to_string();
+        assert_eq!(parse_revision_ops(&wrapped, 20).unwrap().len(), 8);
+    }
+
+    #[test]
+    fn parse_revision_ops_rejects_prose_and_bad_actions() {
+        assert!(parse_revision_ops("I think we should archive it", 10).is_err());
+        assert!(parse_revision_ops("[{\"action\":\"rewrite\"}]", 10).is_err());
+        // rationale обязателен (ратифицируются факты и обоснования, не формат).
+        let no_rationale = r#"[{"action":"archive","target":"core_a","rationale":""}]"#;
+        assert!(parse_revision_ops(no_rationale, 10).is_err());
+        // supersede без target/content отказывает.
+        let bare = r#"[{"action":"supersede","rationale":"x","refs":[]}]"#;
+        assert!(parse_revision_ops(bare, 10).is_err());
+    }
+
+    #[test]
+    fn parse_revision_ops_caps_at_limit() {
+        let payload = serde_json::to_string(
+            &(0..5)
+                .map(|i| RevisionOp {
+                    action: "validate".to_string(),
+                    target: Some(format!("core_{i}")),
+                    content: None,
+                    rationale: format!("r{i}"),
+                    refs: vec![],
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let parsed = parse_revision_ops(&payload, 2).unwrap();
+        assert_eq!(parsed.len(), 2, "operations capped at the run limit");
+    }
+
+    #[test]
+    fn revalidate_queue_returns_aged_accepted_facts() {
+        let (_tmp, _db, conn) = mem_db();
+        let now = chrono::Local::now().to_rfc3339();
+        let old = (chrono::Local::now() - chrono::Duration::days(40)).to_rfc3339();
+        // Принятый факт (исходной эпизод accepted) старше горизонта.
+        conn.execute(
+            "INSERT INTO memories (id, key, content, category, created_at, updated_at,
+                session_id, namespace, importance, agent_id, kind, pinned, tenant_id)
+             VALUES ('v1', 'ratification_accepted_1', 'ratified fact', 'core', ?1, ?2,
+                     NULL, 'default', 0.5,
+                     (SELECT id FROM agents WHERE alias = 'default' LIMIT 1),
+                     NULL, 0, NULL)",
+            params![old, old],
+        )
+        .unwrap();
+        // Молодой принятый факт — не в очереди.
+        conn.execute(
+            "INSERT INTO memories (id, key, content, category, created_at, updated_at,
+                session_id, namespace, importance, agent_id, kind, pinned, tenant_id)
+             VALUES ('v2', 'ratification_accepted_2', 'fresh ratified fact', 'core', ?1, ?1,
+                     NULL, 'default', 0.5,
+                     (SELECT id FROM agents WHERE alias = 'default' LIMIT 1),
+                     NULL, 0, NULL)",
+            params![now],
+        )
+        .unwrap();
+        // Суперседнутый старый факт — не в очереди (версионность non-destructive).
+        conn.execute(
+            "INSERT INTO memories (id, key, content, category, created_at, updated_at,
+                session_id, namespace, importance, agent_id, kind, pinned, tenant_id, superseded_by)
+             VALUES ('v3', 'ratification_accepted_3', 'aged superseded fact', 'core', ?1, ?1,
+                     NULL, 'default', 0.5,
+                     (SELECT id FROM agents WHERE alias = 'default' LIMIT 1),
+                     NULL, 0, NULL, 'newer')",
+            params![old],
+        )
+        .unwrap();
+
+        let queue = revalidate_queue(&conn, 30, Some("default"), 10).unwrap();
+        assert_eq!(queue, vec!["ratification_accepted_1".to_string()]);
+    }
+
+    #[test]
+    fn apply_signed_executes_revision_ops_non_destructively() {
+        let (_tmp, _db, conn) = mem_db();
+        let rat = test_ratification();
+        let now = chrono::Local::now().to_rfc3339();
+        for (id, key, content) in [
+            ("t1", "core_target", "deploys happen on Mondays"),
+            ("t2", "core_evidence_a", "CI failed on Monday deploy"),
+            ("t3", "core_evidence_b", "CI green on Tuesday deploy"),
+        ] {
+            conn.execute(
+                "INSERT INTO memories (id, key, content, category, created_at, updated_at,
+                    session_id, namespace, importance, agent_id, kind, pinned, tenant_id)
+                 VALUES (?1, ?2, ?3, 'core', ?4, ?4, NULL, 'default', 0.5,
+                         (SELECT id FROM agents WHERE alias = 'default' LIMIT 1),
+                         NULL, 0, NULL)",
+                params![id, key, content, now],
+            )
+            .unwrap();
+        }
+        // Пакет из трёх revision-предложений (supersede/validate/archive):
+        // одно предложение = одна операция (одна позиция = одно решение).
+        let mk = |action: &str,
+                  target: Option<&str>,
+                  content: Option<&str>,
+                  rationale: &str,
+                  refs: &[&str],
+                  tag: &str| {
+            let op = RevisionOp {
+                action: action.to_string(),
+                target: target.map(str::to_string),
+                content: content.map(str::to_string),
+                rationale: rationale.to_string(),
+                refs: refs.iter().map(|r| r.to_string()).collect(),
+            };
+            let payload = serde_json::to_string(&[op]).unwrap();
+            let proposal = RatificationProposal::new(
+                RatificationProposal::KIND_REVISION,
+                payload,
+                RatificationProposal::PRIORITY_NORMAL,
+                tag,
+            );
+            propose(&conn, &proposal).unwrap().proposal_id
+        };
+        let id_supersede = mk(
+            "supersede",
+            Some("core_target"),
+            Some("deploys happen on Tuesdays"),
+            "two episodes contradict Monday deploys",
+            &["core_evidence_a", "core_evidence_b"],
+            "rev-apply-1",
+        );
+        let id_validate = mk(
+            "validate",
+            Some("core_evidence_b"),
+            None,
+            "fresh episodes confirm",
+            &["core_evidence_b"],
+            "rev-apply-2",
+        );
+        let id_archive = mk(
+            "archive",
+            Some("core_evidence_a"),
+            None,
+            "episode stale",
+            &[],
+            "rev-apply-3",
+        );
+        let packet = assemble_packet(
+            &conn,
+            "pkt-rev",
+            &[id_supersede, id_validate, id_archive],
+            20,
+        )
+        .unwrap()
+        .unwrap();
+        mark_delivered(&conn, "pkt-rev").unwrap();
+
+        let outcome = apply_signed(&conn, &rat, &packet, "operator-1", &[], None).unwrap();
+        assert_eq!(outcome.accepted.len(), 3);
+
+        // Non-destructive: старая версия суперседита новой (не удалена).
+        let superseded_by: String = conn
+            .query_row(
+                "SELECT superseded_by FROM memories WHERE key = 'core_target'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(superseded_by, crate::ARCHIVED_SENTINEL);
+        let new_row: (String, String) = conn
+            .query_row(
+                "SELECT id, content FROM memories WHERE id = ?1",
+                params![superseded_by],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(new_row.1, "deploys happen on Tuesdays");
+        // Archive — обратимое скрытие sentinel'ом 9-2.
+        let archived: String = conn
+            .query_row(
+                "SELECT superseded_by FROM memories WHERE key = 'core_evidence_a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(archived, crate::ARCHIVED_SENTINEL);
+        // Validate продлила строку (updated_at свежий).
+        let updated: String = conn
+            .query_row(
+                "SELECT updated_at FROM memories WHERE key = 'core_evidence_b'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(updated >= now);
+        // Исход — эпизод с action/обоснованием/source-refs.
+        let episode: String = conn
+            .query_row(
+                "SELECT content FROM memories WHERE key = ?1",
+                params![format!("ratification_accepted_{id_supersede}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(episode.contains("[ratified revision] supersede"));
+        assert!(episode.contains("two episodes contradict Monday deploys"));
+        assert!(episode.contains("core_evidence_a"));
+        // Receipt-цепочка сходится.
+        let chain = receipts(&conn).unwrap();
+        assert!(verify_chain(&chain));
+    }
+
+    #[test]
+    fn apply_signed_refuses_invalid_revision_payload() {
+        let (_tmp, _db, conn) = mem_db();
+        let rat = test_ratification();
+        let id = propose(
+            &conn,
+            &RatificationProposal::new(
+                RatificationProposal::KIND_REVISION,
+                "проза вместо JSON-операции",
+                RatificationProposal::PRIORITY_NORMAL,
+                "rev-invalid-1",
+            ),
+        )
+        .unwrap()
+        .proposal_id;
+        let packet = assemble_packet(&conn, "pkt-rev-bad", &[id], 20)
+            .unwrap()
+            .unwrap();
+        mark_delivered(&conn, "pkt-rev-bad").unwrap();
+
+        let err = apply_signed(&conn, &rat, &packet, "operator-1", &[], None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid payload"), "got: {err}");
+        // Ничего не применено: ни DEPLOY, ни receipt.
+        assert!(receipts(&conn).unwrap().is_empty());
+        let stats = counts(&conn).unwrap();
+        assert_eq!(stats.pending, 1);
     }
 }

@@ -44,6 +44,11 @@ impl RatificationProposal {
     pub const KIND_CONTRADICTION: &'static str = "contradiction";
     /// Kind: an expensive episode flagged for archival attention.
     pub const KIND_EXPENSIVE_EPISODE: &'static str = "expensive_episode";
+    /// Kind: a dream-cycle revision operation (epic 9-6) — a strict-JSON
+    /// payload carrying one of the eight revision actions (promote/demote/
+    /// link/archive/supersede/merge/validate/refute) with a mandatory
+    /// rationale and durable refs; ratified through the same packet path.
+    pub const KIND_REVISION: &'static str = "revision";
 
     #[must_use]
     pub fn new(

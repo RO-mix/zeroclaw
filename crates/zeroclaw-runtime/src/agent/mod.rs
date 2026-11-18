@@ -5,6 +5,7 @@ pub mod classifier;
 pub mod context_analyzer;
 pub mod cost;
 pub mod dispatcher;
+pub mod dream;
 pub mod eval;
 pub mod execution_tree_budget;
 pub mod history;

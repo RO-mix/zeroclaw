@@ -157,6 +157,109 @@ pub fn operator_correction_proposal(
     )
 }
 
+// ── Contested clusters (epic 9-6) ────────────────────────────────────
+
+/// Один contested-кластер: группа ключей не-суперседнутых суждений,
+/// похожих по содержанию, но расходящихся по тексту (противоречие).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContestedCluster {
+    pub keys: Vec<String>,
+}
+
+/// Значимые токены для детерминированной кластеризации (модель не нужна).
+fn cluster_tokens(content: &str) -> std::collections::HashSet<String> {
+    const STOPWORDS: &[&str] = &[
+        "the", "and", "for", "with", "that", "this", "from", "into", "are", "was", "were", "при",
+        "для", "что", "это", "как", "не", "на", "в", "и", "с", "по", "от", "из",
+    ];
+    content
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .map(str::to_lowercase)
+        .filter(|token| token.len() >= 4 && !STOPWORDS.contains(&token.as_str()))
+        .collect()
+}
+
+/// Contested-кластеры: entity-SQL (core, не-суперседнуто, per-agent scope)
+/// + детерминированная union-find кластеризация по jaccard-токенам.
+/// Возвращает до `limit` кластеров размера ≥2 (противоречащие друг другу
+/// суждения — генератор противоречий без единого LLM-вызова).
+pub fn contested_clusters(
+    conn: &rusqlite::Connection,
+    agent: Option<&str>,
+    limit: usize,
+) -> anyhow::Result<Vec<ContestedCluster>> {
+    const CANDIDATE_LIMIT: usize = 500;
+    const CLUSTER_JACCARD: f64 = 0.4;
+
+    let agent_clause = if agent.is_some() {
+        "AND (SELECT alias FROM agents WHERE agents.id = memories.agent_id) = ?1"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT key, content FROM memories \
+         WHERE category = 'core' AND superseded_by IS NULL {agent_clause} \
+         ORDER BY updated_at DESC LIMIT {CANDIDATE_LIMIT}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![agent.unwrap_or("")], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let candidates: Vec<(String, std::collections::HashSet<String>)> = rows
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|(key, content)| (key, cluster_tokens(&content)))
+        .filter(|(_, tokens)| !tokens.is_empty())
+        .collect();
+
+    // Union-find по парам с jaccard ≥ порога и разным содержимым.
+    let mut parent: Vec<usize> = (0..candidates.len()).collect();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    let union = |parent: &mut Vec<usize>, a: usize, b: usize| {
+        let (ra, rb) = (find(parent, a), find(parent, b));
+        if ra != rb {
+            parent[rb] = ra;
+        }
+    };
+    for i in 0..candidates.len() {
+        for j in (i + 1)..candidates.len() {
+            let a = &candidates[i].1;
+            let b = &candidates[j].1;
+            let intersection = a.intersection(b).count();
+            if intersection == 0 {
+                continue;
+            }
+            let jaccard = intersection as f64 / a.union(b).count() as f64;
+            if jaccard >= CLUSTER_JACCARD {
+                union(&mut parent, i, j);
+            }
+        }
+    }
+    let mut groups: std::collections::HashMap<usize, Vec<String>> =
+        std::collections::HashMap::new();
+    for (idx, (key, _)) in candidates.iter().enumerate() {
+        let root = find(&mut parent, idx);
+        groups.entry(root).or_default().push(key.clone());
+    }
+    let mut clusters: Vec<ContestedCluster> = groups
+        .into_values()
+        .filter(|keys| keys.len() >= 2)
+        .map(|mut keys| {
+            keys.sort();
+            ContestedCluster { keys }
+        })
+        .collect();
+    clusters.sort_by_key(|cluster| std::cmp::Reverse(cluster.keys.len()));
+    clusters.truncate(limit);
+    Ok(clusters)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,5 +381,99 @@ mod tests {
         // An identical new_content is an update, not a conflict.
         let none = find_text_conflicts(&entries, "User prefers Rust for systems work", 0.3);
         assert!(none.is_empty());
+    }
+
+    // ── Contested clusters (epic 9-6) ───────────────────────────────
+
+    #[test]
+    fn contested_clusters_find_similar_contradicting_judgments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mem = crate::sqlite::SqliteMemory::new("test", tmp.path()).unwrap();
+        drop(mem);
+        let db = crate::receipts::brain_db_path(tmp.path());
+        let conn = rusqlite::Connection::open(db).unwrap();
+        let now = chrono::Local::now().to_rfc3339();
+        let insert = |id: &str, key: &str, content: &str| {
+            conn.execute(
+                "INSERT INTO memories (id, key, content, category, created_at, updated_at,
+                    session_id, namespace, importance, agent_id, kind, pinned, tenant_id)
+                 VALUES (?1, ?2, ?3, 'core', ?4, ?4, NULL, 'default', 0.5,
+                         (SELECT id FROM agents WHERE alias = 'default' LIMIT 1),
+                         NULL, 0, NULL)",
+                rusqlite::params![id, key, content, now],
+            )
+            .unwrap();
+        };
+        // Два похожих, но расходящихся суждения — кластер противоречия
+        // (3 общих токена из 7 ≥ порога 0.4).
+        insert(
+            "c1",
+            "judg_a",
+            "deploys drift to Mondays and CI breaks often",
+        );
+        insert(
+            "c2",
+            "judg_b",
+            "deploys drift to Tuesdays and CI breaks rarely",
+        );
+        // Токенно-далёкая строка — не в кластере.
+        insert("c3", "unrelated", "quantum chromodynamics notes");
+
+        let clusters = contested_clusters(&conn, Some("default"), 10).unwrap();
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(
+            clusters[0].keys,
+            vec!["judg_a".to_string(), "judg_b".to_string()]
+        );
+
+        // Суперседнутое суждение выходит из кластера (non-destructive).
+        conn.execute(
+            "UPDATE memories SET superseded_by = 'newer' WHERE key = 'judg_b'",
+            [],
+        )
+        .unwrap();
+        let after = contested_clusters(&conn, Some("default"), 10).unwrap();
+        assert!(after.is_empty(), "superseded rows leave the cluster");
+    }
+
+    #[test]
+    fn contested_clusters_respect_agent_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mem = crate::sqlite::SqliteMemory::new("test", tmp.path()).unwrap();
+        drop(mem);
+        let db = crate::receipts::brain_db_path(tmp.path());
+        let conn = rusqlite::Connection::open(db).unwrap();
+        let now = chrono::Local::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO agents (id, alias, created_at) VALUES ('agent-x', 'other', ?1)",
+            rusqlite::params![now],
+        )
+        .unwrap();
+        for (i, content) in [
+            "deploys drift to Mondays and CI breaks often",
+            "deploys drift to Tuesdays and CI breaks rarely",
+        ]
+        .iter()
+        .enumerate()
+        {
+            conn.execute(
+                "INSERT INTO memories (id, key, content, category, created_at, updated_at,
+                    session_id, namespace, importance, agent_id, kind, pinned, tenant_id)
+                 VALUES (?1, ?2, ?3, 'core', ?4, ?4, NULL, 'default', 0.5,
+                         'agent-x', NULL, 0, NULL)",
+                rusqlite::params![format!("x{i}"), format!("foreign_{i}"), content, now],
+            )
+            .unwrap();
+        }
+        assert!(
+            contested_clusters(&conn, Some("default"), 10)
+                .unwrap()
+                .is_empty(),
+            "own scope must not read foreign agent rows"
+        );
+        assert_eq!(
+            contested_clusters(&conn, Some("other"), 10).unwrap().len(),
+            1
+        );
     }
 }
