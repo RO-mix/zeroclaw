@@ -22,7 +22,7 @@ use zeroclaw_api::memory_traits::RatificationProposal;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::proposals::{self, ItemDecision, Packet, mirror_hash};
 
-use crate::i18n::get_required_cli_string_with_args;
+use crate::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 
 /// Тик worker'а: событийный канал (коррекция → немедленная сборка)
 /// опрашивается на каждом тике; календарный — раз в сутки.
@@ -339,14 +339,95 @@ pub(crate) struct PendingDelivery {
     pub text: String,
 }
 
+/// Зеркало per-decision (9-5): для revision-позиций пакета собирает
+/// затронутый подграф графа знаний (1–2 hops от узлов, резолвленных из
+/// target'ов операций) в mirror-данные пакета. Гейт — `knowledge.auto_capture`
+/// (флаг выкл → секция не добавляется, байт-в-байт; knowledge.db не
+/// создаётся). Граф пуст или недоступен → None (не ошибка).
+fn graph_mirror_context(config: &Config, packet: &Packet) -> Option<String> {
+    if !config.knowledge.auto_capture {
+        return None;
+    }
+    // Target'ы — строгий JSON revision-операций (массив — форма apply_signed 9-6).
+    let mut targets: Vec<String> = Vec::new();
+    for item in &packet.items {
+        if item.kind != RatificationProposal::KIND_REVISION {
+            continue;
+        }
+        if let Ok(ops) = proposals::parse_revision_ops(&item.payload, 1) {
+            targets.extend(ops.iter().filter_map(|op| op.target.clone()));
+        }
+    }
+    targets.sort();
+    targets.dedup();
+    if targets.is_empty() {
+        return None;
+    }
+    let db_path = config.knowledge.resolved_db_path();
+    if !db_path.exists() {
+        return None;
+    }
+    let graph =
+        zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(&db_path, config.knowledge.max_nodes)
+            .ok()?;
+    let mut root_ids: Vec<String> = Vec::new();
+    for target in &targets {
+        root_ids.extend(graph.nodes_by_provenance("memory", target).ok()?);
+        root_ids.extend(graph.nodes_by_provenance("episode", target).ok()?);
+    }
+    root_ids.sort();
+    root_ids.dedup();
+    if root_ids.is_empty() {
+        return None;
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for root in root_ids.iter().take(4) {
+        let Ok((nodes, edges)) = graph.get_subgraph(root, 2) else {
+            continue;
+        };
+        let titles: std::collections::HashMap<String, String> = nodes
+            .iter()
+            .map(|node| (node.id.clone(), node.title.clone()))
+            .collect();
+        for node in nodes.iter().take(8) {
+            lines.push(get_required_cli_string_with_args(
+                "cli-ratification-graph-mirror-node",
+                &[("type", node.node_type.as_str()), ("title", &node.title)],
+            ));
+        }
+        for edge in edges.iter().take(8) {
+            let to = titles.get(&edge.to_id).map(String::as_str).unwrap_or("?");
+            lines.push(get_required_cli_string_with_args(
+                "cli-ratification-graph-mirror-edge",
+                &[("relation", edge.relation.as_str()), ("to", to)],
+            ));
+        }
+    }
+    lines.sort();
+    lines.dedup();
+    if lines.is_empty() {
+        None
+    } else {
+        let mut section = get_required_cli_string("cli-ratification-graph-mirror-header");
+        section.push('\n');
+        section.push_str(&lines.join("\n"));
+        Some(section)
+    }
+}
+
 /// Подготовить доставку существующего пакета (retry-путь и свежие пакеты).
 fn pending_for_packet(config: &Config, packet: &Packet) -> Option<PendingDelivery> {
     let (channel, target) = resolve_delivery_target(config)?;
+    let mut text = render_packet(packet);
+    if let Some(context) = graph_mirror_context(config, packet) {
+        text.push_str("\n\n");
+        text.push_str(&context);
+    }
     Some(PendingDelivery {
         packet_id: packet.packet_id.clone(),
         channel,
         target,
-        text: render_packet(packet),
+        text,
     })
 }
 
@@ -580,6 +661,10 @@ pub(crate) fn worker_tick_sync(
         // Генераторы.
         let _episodes = generate_expensive_episodes(conn)?;
         let _silent = generate_silent_corrections(conn)?;
+        // Фидер графа знаний (9-5): accepted-исходы → узлы/рёбра. Момент —
+        // self-review-пакет; ноль LLM. Гейт: knowledge.auto_capture (worker
+        // и так живёт под memory.ratification.enabled).
+        drain_graph_feeder(config, conn);
         // Пакет из предложений старше порога.
         let aged = proposals::aged_pending(conn, ratification.packet_trigger_days)?;
         if let Some(delivery) = assemble_delivery(config, conn, &aged, ratification.min_packet)? {
@@ -604,6 +689,63 @@ pub(crate) fn worker_tick_sync(
         }
     }
     Ok(pending)
+}
+
+/// Фидер графа знаний (9-5): accepted-исходы ратификации → узлы/рёбра
+/// knowledge.db. Best-effort: любая ошибка (нет knowledge.db, занят файл,
+/// ошибка drain) — WARN/DEBUG и пропуск; worker не падает. Метку дельты
+/// продвигает только drain (внутри, за обработанные исходы).
+fn drain_graph_feeder(config: &Config, brain: &rusqlite::Connection) {
+    if !config.knowledge.auto_capture {
+        return;
+    }
+    let graph = match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+        &config.knowledge.resolved_db_path(),
+        config.knowledge.max_nodes,
+    ) {
+        Ok(graph) => graph,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                "graph feeder: knowledge graph unavailable, skipping drain"
+            );
+            return;
+        }
+    };
+    match zeroclaw_memory::graph_feeder::drain(
+        brain,
+        &graph,
+        &config.data_dir,
+        config.knowledge.max_nodes,
+    ) {
+        Ok(report) => {
+            if report.nodes_added > 0 || report.refused_max_nodes > 0 {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "nodes_added": report.nodes_added,
+                            "edges_added": report.edges_added,
+                            "duplicates_skipped": report.duplicates_skipped,
+                            "refused_max_nodes": report.refused_max_nodes,
+                        })),
+                    "graph feeder drain completed"
+                );
+            }
+        }
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                "graph feeder drain failed"
+            );
+        }
+    }
 }
 
 /// Рабочий компонент ratification-worker (daemon supervisor): календарный
@@ -942,6 +1084,188 @@ mod tests {
             1,
             "failed delivery stays pending for scheduled retry"
         );
+    }
+
+    #[tokio::test]
+    async fn worker_tick_calendar_phase_drains_graph_feeder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = config_with(&tmp, ratification_on());
+        config.knowledge.enabled = true;
+        config.knowledge.auto_capture = true;
+        config.knowledge.db_path = tmp.path().join("knowledge.db").display().to_string();
+        let conn = db_conn(&tmp);
+
+        // Один accepted-исход: proposal → пакет → доставка → подпись.
+        let outcome = RatificationProposal::new(
+            "trend",
+            "deploys drift to Tuesdays",
+            "normal",
+            proposals::source_hash(&["g", "1"]),
+        );
+        let id = proposals::propose(&conn, &outcome).unwrap().proposal_id;
+        let packet = proposals::assemble_packet(&conn, "pkt-g", &[id], 20)
+            .unwrap()
+            .unwrap();
+        proposals::mark_delivered(&conn, "pkt-g").unwrap();
+        proposals::apply_signed(
+            &conn,
+            &config.memory.ratification,
+            &packet,
+            "operator-1",
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let pending = worker_tick_sync(&config, &conn).unwrap();
+        assert!(pending.is_empty(), "no deliveries without transport");
+
+        // Фидер отработал в календарной фазе: узел в графе, метка продвинута.
+        let graph = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &config.knowledge.resolved_db_path(),
+            config.knowledge.max_nodes,
+        )
+        .unwrap();
+        let stats = graph.stats().unwrap();
+        assert_eq!(stats.total_nodes, 1, "accepted outcome must feed one node");
+        assert_eq!(
+            zeroclaw_memory::graph_feeder::stats_at(tmp.path()).last_id,
+            id,
+            "feeder watermark advanced past the accepted outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_tick_skips_feeder_when_auto_capture_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config_with(&tmp, ratification_on());
+        // auto_capture выключен (дефолт): фидер молчит даже с accepted.
+        let conn = db_conn(&tmp);
+        let outcome = RatificationProposal::new(
+            "trend",
+            "some ratified fact",
+            "normal",
+            proposals::source_hash(&["g", "off"]),
+        );
+        let id = proposals::propose(&conn, &outcome).unwrap().proposal_id;
+        let packet = proposals::assemble_packet(&conn, "pkt-go", &[id], 20)
+            .unwrap()
+            .unwrap();
+        proposals::mark_delivered(&conn, "pkt-go").unwrap();
+        proposals::apply_signed(
+            &conn,
+            &config.memory.ratification,
+            &packet,
+            "operator-1",
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let _ = worker_tick_sync(&config, &conn).unwrap();
+        let db = tmp.path().join("knowledge.db");
+        assert!(
+            !db.exists(),
+            "feeder state/db must not appear with auto_capture off"
+        );
+    }
+
+    #[test]
+    fn delivery_includes_graph_mirror_context_for_revision_packet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = config_with(&tmp, ratification_on());
+        config.memory.ratification.principal_transport = "telegram.work".into();
+        config.knowledge.auto_capture = true;
+        config.knowledge.db_path = tmp.path().join("knowledge.db").display().to_string();
+
+        // Узел графа, резолвленный из target'а revision-операции.
+        let graph = zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+            &config.knowledge.resolved_db_path(),
+            config.knowledge.max_nodes,
+        )
+        .unwrap();
+        let node_id = graph
+            .add_node_feed(
+                zeroclaw_memory::knowledge_graph::NodeType::Lesson,
+                "deploys happen on Mondays",
+                "old ratified fact",
+                &["ratified".to_string()],
+                Some("operator-1"),
+                "mirror-test-hash",
+            )
+            .unwrap()
+            .unwrap();
+        graph
+            .add_provenance(&node_id, "memory", "core_target")
+            .unwrap();
+
+        let packet = Packet {
+            packet_id: "pkt-mirror".into(),
+            items: vec![proposals::PacketItem {
+                proposal_id: 7,
+                position: 1,
+                kind: "revision".into(),
+                // Payload — строгий JSON revision-операций (массив, форма apply_signed).
+                payload: serde_json::json!([{
+                    "action": "supersede",
+                    "target": "core_target",
+                    "content": "deploys happen on Tuesdays",
+                    "rationale": "two fresh episodes contradict Monday",
+                    "refs": ["daily_x"],
+                }])
+                .to_string(),
+                priority: "normal".into(),
+            }],
+            throttled: 0,
+        };
+        let delivery = pending_for_packet(&config, &packet)
+            .expect("dotted transport resolves without aliases");
+        let header = crate::i18n::get_required_cli_string("cli-ratification-graph-mirror-header");
+        assert!(
+            delivery.text.contains(&header),
+            "revision packet must carry the touched subgraph, got:\n{}",
+            delivery.text
+        );
+        assert!(
+            delivery.text.contains("deploys happen on Mondays"),
+            "mirror must name the affected node"
+        );
+    }
+
+    #[test]
+    fn delivery_omits_graph_mirror_context_when_auto_capture_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = config_with(&tmp, ratification_on());
+        config.memory.ratification.principal_transport = "telegram.work".into();
+        // auto_capture выключен (дефолт): байт-в-байт — секции зеркала нет,
+        // knowledge.db не создаётся.
+        config.knowledge.db_path = tmp.path().join("knowledge.db").display().to_string();
+        let packet = Packet {
+            packet_id: "pkt-mirror-off".into(),
+            items: vec![proposals::PacketItem {
+                proposal_id: 7,
+                position: 1,
+                kind: "revision".into(),
+                payload: serde_json::json!([{
+                    "action": "supersede",
+                    "target": "core_target",
+                    "content": "v2",
+                    "rationale": "r",
+                    "refs": [],
+                }])
+                .to_string(),
+                priority: "normal".into(),
+            }],
+            throttled: 0,
+        };
+        let delivery = pending_for_packet(&config, &packet)
+            .expect("dotted transport resolves without aliases");
+        let header = crate::i18n::get_required_cli_string("cli-ratification-graph-mirror-header");
+        assert!(
+            !delivery.text.contains(&header),
+            "mirror section must be absent with auto_capture off"
+        );
+        assert!(!tmp.path().join("knowledge.db").exists());
     }
 
     #[tokio::test]

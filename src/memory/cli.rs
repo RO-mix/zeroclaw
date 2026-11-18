@@ -383,6 +383,64 @@ async fn handle_stats(config: &Config) -> Result<()> {
                 )
             );
         }
+
+        // Граф знаний (9-5): здоровье графа + метка фидера — материал
+        // self-review (узлы/рёбра по типам, длины replaces-цепочек,
+        // feed-отказы по max_nodes). Гейт — `knowledge.auto_capture`
+        // (флаг выкл → секции нет, байт-в-байт); knowledge.db не
+        // создаётся — без файла строка нулевая.
+        if config.knowledge.auto_capture {
+            let db_path = config.knowledge.resolved_db_path();
+            let graph_line = if db_path.exists() {
+                zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+                    &db_path,
+                    config.knowledge.max_nodes,
+                )
+                .and_then(|graph| graph.stats())
+                .map(|stats| {
+                    let by_type = stats
+                        .nodes_by_type
+                        .iter()
+                        .map(|(kind, count)| format!("{kind} {count}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let chains = if stats.replaces_chain_lengths.is_empty() {
+                        "-".to_string()
+                    } else {
+                        stats
+                            .replaces_chain_lengths
+                            .iter()
+                            .map(usize::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    };
+                    format!(
+                        "{} nodes, {} edges ({by_type}); replaces chains: {chains}",
+                        stats.total_nodes, stats.total_edges
+                    )
+                })
+                .unwrap_or_else(|_| "unavailable".to_string())
+            } else {
+                "no knowledge.db yet".to_string()
+            };
+            let feeder = zeroclaw_memory::graph_feeder::stats_at(&config.data_dir);
+            let feeder_line = format!(
+                "feeder last accepted id {}, max_nodes refusals {}",
+                feeder.last_id, feeder.refused_max_nodes
+            );
+            let fallback_line = format!("  Graph: {graph_line}; {feeder_line}");
+            println!(
+                "{}",
+                mt_args(
+                    "cli-memory-graph",
+                    &[
+                        ("graph", graph_line.as_str()),
+                        ("feeder", feeder_line.as_str()),
+                    ],
+                    &fallback_line
+                )
+            );
+        }
     }
 
     Ok(())
@@ -856,5 +914,82 @@ mod tests {
         let stats = counts_at(&db).unwrap();
         assert_eq!(stats.pending, 1);
         assert_eq!(stats.total(), 1);
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[tokio::test]
+    async fn stats_prints_graph_counters_when_auto_capture_on() {
+        use zeroclaw_memory::SqliteMemory;
+        use zeroclaw_memory::graph_feeder;
+        use zeroclaw_memory::knowledge_graph::{KnowledgeGraph, NodeType};
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.data_dir = tmp.path().to_path_buf();
+        config.memory.backend = "sqlite".into();
+        config.knowledge.auto_capture = true;
+        config.knowledge.db_path = tmp.path().join("knowledge.db").display().to_string();
+
+        let seed = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        drop(seed);
+
+        // Один fed-узел с replaces-цепочкой длины 2 + отказ фидера по лимиту.
+        let graph = KnowledgeGraph::new(
+            &config.knowledge.resolved_db_path(),
+            config.knowledge.max_nodes,
+        )
+        .unwrap();
+        let old = graph
+            .add_node_feed(NodeType::Lesson, "v1", "c", &[], None, "h1")
+            .unwrap()
+            .unwrap();
+        let new = graph
+            .add_node_feed(NodeType::Lesson, "v2", "c", &[], None, "h2")
+            .unwrap()
+            .unwrap();
+        graph.add_replaces_edge(&new, &old).unwrap();
+        drop(graph);
+        std::fs::write(
+            tmp.path().join(graph_feeder::GRAPH_FEEDER_STATE_FILE),
+            serde_json::json!({"last_id": 7, "refused_max_nodes": 3}).to_string(),
+        )
+        .unwrap();
+
+        handle_stats(&config).await.unwrap();
+
+        // Сводка, которую печатает ветка stats: цепочка 2 видна в stats графа.
+        let stats = KnowledgeGraph::new(
+            &config.knowledge.resolved_db_path(),
+            config.knowledge.max_nodes,
+        )
+        .unwrap()
+        .stats()
+        .unwrap();
+        assert_eq!(stats.total_nodes, 2);
+        assert_eq!(stats.replaces_chain_lengths, vec![2]);
+        assert_eq!(graph_feeder::stats_at(tmp.path()).refused_max_nodes, 3);
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[tokio::test]
+    async fn stats_skips_graph_counters_when_auto_capture_off() {
+        use zeroclaw_memory::SqliteMemory;
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.data_dir = tmp.path().to_path_buf();
+        config.memory.backend = "sqlite".into();
+        // auto_capture выключен (дефолт): stats не создаёт knowledge.db.
+        config.knowledge.db_path = tmp.path().join("knowledge.db").display().to_string();
+
+        let seed = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        drop(seed);
+
+        handle_stats(&config).await.unwrap();
+
+        assert!(
+            !tmp.path().join("knowledge.db").exists(),
+            "memory stats must not create knowledge.db with auto_capture off"
+        );
     }
 }

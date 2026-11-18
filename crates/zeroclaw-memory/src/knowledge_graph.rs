@@ -3,7 +3,7 @@
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -97,11 +97,30 @@ pub struct KnowledgeNode {
 }
 
 /// A directed edge in the knowledge graph.
+///
+/// Temporal columns (epic 9-5, контур RAM): `valid_from` ставится на всех
+/// новых рёбрах; `valid_until`/`superseded_by` — non-destructive invalidate
+/// при supersession (замещённое ребро остаётся в БД, просто перестаёт быть
+/// валидным). Унаследованные рёбра до 9-5 имеют NULL — читаются как валидные.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnowledgeEdge {
     pub from_id: String,
     pub to_id: String,
     pub relation: Relation,
+    pub valid_from: Option<String>,
+    pub valid_until: Option<String>,
+    pub superseded_by: Option<String>,
+}
+
+/// Provenance link of a knowledge node (epic 9-5): typed reference to the
+/// source fact. A table, not json — one node can carry many refs
+/// (episode key, memory key, proposal id, evidence refs).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvenanceRef {
+    pub node_id: String,
+    pub ref_kind: String,
+    pub ref_key: String,
+    pub created_at: String,
 }
 
 /// A search result with relevance score.
@@ -118,6 +137,11 @@ pub struct GraphStats {
     pub total_edges: usize,
     pub nodes_by_type: HashMap<String, usize>,
     pub top_tags: Vec<(String, usize)>,
+    /// Edges grouped by relation value (epic 9-5).
+    pub edges_by_relation: HashMap<String, usize>,
+    /// Lengths of supersession chains following `replaces` edges
+    /// (newest → oldest), one entry per chain head (epic 9-5).
+    pub replaces_chain_lengths: Vec<usize>,
 }
 
 // ── Knowledge graph ─────────────────────────────────────────────
@@ -189,6 +213,48 @@ impl KnowledgeGraph {
             CREATE INDEX IF NOT EXISTS idx_nodes_source ON nodes(source_project);
             CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_id);
             CREATE INDEX IF NOT EXISTS idx_edges_to ON edges(to_id);",
+        )?;
+
+        // Epic 9-5 (контур RAM): temporal-колонки рёбер, source-hash узла
+        // (идемпотентность фидера) и provenance-таблица. Только ADD COLUMN /
+        // CREATE IF NOT EXISTS — живые knowledge.db не ломаются.
+        ensure_column(
+            &conn,
+            "edges",
+            "valid_from",
+            "ALTER TABLE edges ADD COLUMN valid_from TEXT",
+        )?;
+        ensure_column(
+            &conn,
+            "edges",
+            "valid_until",
+            "ALTER TABLE edges ADD COLUMN valid_until TEXT",
+        )?;
+        ensure_column(
+            &conn,
+            "edges",
+            "superseded_by",
+            "ALTER TABLE edges ADD COLUMN superseded_by TEXT",
+        )?;
+        ensure_column(
+            &conn,
+            "nodes",
+            "source_hash",
+            "ALTER TABLE nodes ADD COLUMN source_hash TEXT",
+        )?;
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_source_hash
+                 ON nodes(source_hash) WHERE source_hash IS NOT NULL;
+
+             CREATE TABLE IF NOT EXISTS node_provenance (
+                node_id    TEXT NOT NULL,
+                ref_kind   TEXT NOT NULL,
+                ref_key    TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (node_id, ref_kind, ref_key)
+             );
+             CREATE INDEX IF NOT EXISTS idx_node_provenance_ref
+                 ON node_provenance(ref_kind, ref_key);",
         )?;
 
         Ok(Self {
@@ -272,11 +338,173 @@ impl KnowledgeGraph {
         }
 
         conn.execute(
-            "INSERT OR IGNORE INTO edges (from_id, to_id, relation) VALUES (?1, ?2, ?3)",
-            params![from_id, to_id, relation.as_str()],
+            "INSERT OR IGNORE INTO edges (from_id, to_id, relation, valid_from) VALUES (?1, ?2, ?3, ?4)",
+            params![from_id, to_id, relation.as_str(), Utc::now().to_rfc3339()],
         )?;
 
         Ok(())
+    }
+
+    /// Idempotent feed insert (epic 9-5): like [`KnowledgeGraph::add_node`],
+    /// but keyed by a deterministic `source_hash`. A node with the same hash
+    /// already fed is skipped — returns `Ok(None)` and writes nothing.
+    /// The max_nodes limit is enforced before any write.
+    pub fn add_node_feed(
+        &self,
+        node_type: NodeType,
+        title: &str,
+        content: &str,
+        tags: &[String],
+        source_project: Option<&str>,
+        source_hash: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock();
+
+        let duplicate: Option<String> = conn
+            .query_row(
+                "SELECT id FROM nodes WHERE source_hash = ?1",
+                params![source_hash],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if duplicate.is_some() {
+            return Ok(None);
+        }
+
+        let count: usize = conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
+        if count >= self.max_nodes {
+            anyhow::bail!(
+                "knowledge graph node limit reached ({}/{})",
+                count,
+                self.max_nodes
+            );
+        }
+
+        for tag in tags {
+            if tag.contains(',') {
+                anyhow::bail!(
+                    "tag '{}' contains a comma, which is used as the tag separator",
+                    tag
+                );
+            }
+        }
+
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        let tags_str = tags.join(",");
+
+        conn.execute(
+            "INSERT INTO nodes (id, node_type, title, content, tags, created_at, updated_at, source_project, source_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                id,
+                node_type.as_str(),
+                title,
+                content,
+                tags_str,
+                now,
+                now,
+                source_project,
+                source_hash,
+            ],
+        )?;
+
+        Ok(Some(id))
+    }
+
+    /// Attach a provenance reference to a node (epic 9-5). Idempotent.
+    pub fn add_provenance(
+        &self,
+        node_id: &str,
+        ref_kind: &str,
+        ref_key: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT OR IGNORE INTO node_provenance (node_id, ref_kind, ref_key, created_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![node_id, ref_kind, ref_key, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Ids of nodes carrying a provenance link of the given kind/key
+    /// (epic 9-5: resolution of supersede targets and mirror roots).
+    pub fn nodes_by_provenance(
+        &self,
+        ref_kind: &str,
+        ref_key: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT node_id FROM node_provenance WHERE ref_kind = ?1 AND ref_key = ?2 \
+             ORDER BY node_id",
+        )?;
+        let rows = stmt.query_map(params![ref_kind, ref_key], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Supersession (epic 9-5): record that `new_id` replaces `old_id` —
+    /// a `replaces` edge with `valid_from = now`, plus a non-destructive
+    /// invalidate of the old node's still-valid outgoing claims (their
+    /// `valid_until` closes now, `superseded_by` points at the new node).
+    /// The old node itself is never deleted.
+    pub fn add_replaces_edge(&self, new_id: &str, old_id: &str) -> anyhow::Result<()> {
+        self.add_edge(new_id, old_id, Relation::Replaces)?;
+        let conn = self.conn.lock();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE edges SET valid_until = ?1, superseded_by = ?2 \
+             WHERE from_id = ?3 AND relation != 'replaces' AND valid_until IS NULL",
+            params![now, new_id, old_id],
+        )?;
+        Ok(())
+    }
+
+    /// Lengths of supersession chains (epic 9-5): follow `replaces` edges
+    /// newest → oldest. One entry per chain head (a node that nothing
+    /// replaces). Nodes outside any chain are not reported.
+    pub fn replaces_chain_lengths(&self) -> anyhow::Result<Vec<usize>> {
+        let conn = self.conn.lock();
+        Self::replaces_chain_lengths_conn(&conn)
+    }
+
+    fn replaces_chain_lengths_conn(conn: &Connection) -> anyhow::Result<Vec<usize>> {
+        let mut stmt =
+            conn.prepare("SELECT from_id, to_id FROM edges WHERE relation = 'replaces'")?;
+        let pairs: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        use std::collections::{HashMap, HashSet};
+        // next-older: follows `replaces` edges newest → oldest.
+        let mut older: HashMap<String, String> = HashMap::new();
+        let mut is_old_end: HashSet<String> = HashSet::new();
+        for (new_id, old_id) in &pairs {
+            older.insert(new_id.clone(), old_id.clone());
+            is_old_end.insert(old_id.clone());
+        }
+
+        let mut lengths = Vec::new();
+        let mut visited: HashSet<String> = HashSet::new();
+        for (new_id, _) in &pairs {
+            if is_old_end.contains(new_id) || !visited.insert(new_id.clone()) {
+                continue;
+            }
+            let mut len = 1usize;
+            let mut current = new_id.clone();
+            while let Some(prev) = older.get(&current) {
+                if !visited.insert(prev.clone()) {
+                    break; // defensive: a cycle ends the walk
+                }
+                len += 1;
+                current = prev.clone();
+            }
+            lengths.push(len);
+        }
+        lengths.sort_unstable_by(|a, b| b.cmp(a));
+        Ok(lengths)
     }
 
     /// Retrieve a node by id.
@@ -578,7 +806,9 @@ impl KnowledgeGraph {
         drop(rows);
 
         // Collect all edges where both endpoints are in the subgraph.
-        let mut edge_stmt = conn.prepare("SELECT from_id, to_id, relation FROM edges")?;
+        let mut edge_stmt = conn.prepare(
+            "SELECT from_id, to_id, relation, valid_from, valid_until, superseded_by FROM edges",
+        )?;
 
         let mut edges = Vec::new();
         let mut edge_rows = edge_stmt.query([])?;
@@ -592,6 +822,9 @@ impl KnowledgeGraph {
                     from_id,
                     to_id,
                     relation,
+                    valid_from: row.get(3)?,
+                    valid_until: row.get(4)?,
+                    superseded_by: row.get(5)?,
                 });
             }
         }
@@ -635,6 +868,14 @@ impl KnowledgeGraph {
         Ok(results)
     }
 
+    /// Current node count (feeder's max_nodes pre-check, epic 9-5).
+    pub fn node_count(&self) -> usize {
+        self.conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+            .unwrap_or(0)
+    }
+
     /// Return summary statistics for the graph.
     pub fn stats(&self) -> anyhow::Result<GraphStats> {
         let conn = self.conn.lock();
@@ -673,13 +914,43 @@ impl KnowledgeGraph {
         top_tags.sort_by_key(|tag| std::cmp::Reverse(tag.1));
         top_tags.truncate(10);
 
+        // Edges by relation and supersession chain lengths (epic 9-5).
+        let mut edges_by_relation = HashMap::new();
+        {
+            let mut stmt =
+                conn.prepare("SELECT relation, COUNT(*) FROM edges GROUP BY relation")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let r: String = row.get(0)?;
+                let c: usize = row.get(1)?;
+                edges_by_relation.insert(r, c);
+            }
+        }
+        let replaces_chain_lengths = Self::replaces_chain_lengths_conn(&conn)?;
+
         Ok(GraphStats {
             total_nodes,
             total_edges,
             nodes_by_type: by_type,
             top_tags,
+            edges_by_relation,
+            replaces_chain_lengths,
         })
     }
+}
+
+/// ADD-only column migration: add `column` to `table` only when missing
+/// (epic 9-5 — живые knowledge.db получают temporal-колонки без пересборки).
+fn ensure_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> anyhow::Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+    if !columns.iter().any(|name| name == column) {
+        conn.execute(ddl, [])?;
+    }
+    Ok(())
 }
 
 /// Parse a database row into a `KnowledgeNode`.
@@ -965,6 +1236,127 @@ mod tests {
             .add_node(NodeType::Lesson, "L3", "C3", &[], None)
             .unwrap_err();
         assert!(err.to_string().contains("node limit reached"));
+    }
+
+    #[test]
+    fn pre_9_5_database_gains_temporal_columns_add_only() {
+        // knowledge.db со схемой до 9-5 (без temporal-колонок и provenance):
+        // открытие новым кодом — только ADD COLUMN, данные живых рёбер целы.
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("knowledge.db");
+        let legacy = Connection::open(&db_path).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE nodes (
+                    id TEXT PRIMARY KEY,
+                    node_type TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    tags TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    source_project TEXT
+                );
+                CREATE TABLE edges (
+                    from_id TEXT NOT NULL,
+                    to_id TEXT NOT NULL,
+                    relation TEXT NOT NULL,
+                    PRIMARY KEY (from_id, to_id, relation)
+                );
+                INSERT INTO nodes VALUES ('n1', 'lesson', 'L', 'c', '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', NULL);
+                INSERT INTO nodes VALUES ('n2', 'lesson', 'M', 'c', '', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', NULL);
+                INSERT INTO edges VALUES ('n1', 'n2', 'extends');",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let graph = KnowledgeGraph::new(&db_path, 1000).unwrap();
+        // Наследованное ребро прочиталось, temporal-поля NULL (валидно).
+        let (_, edges) = graph.get_subgraph("n1", 1).unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].relation, Relation::Extends);
+        assert!(edges[0].valid_from.is_none());
+        assert!(edges[0].valid_until.is_none());
+        assert!(edges[0].superseded_by.is_none());
+        // Повторное открытие — миграции идемпотентны.
+        drop(graph);
+        let graph = KnowledgeGraph::new(&db_path, 1000).unwrap();
+        assert_eq!(graph.stats().unwrap().total_nodes, 2);
+    }
+
+    #[test]
+    fn add_replaces_edge_invalidates_old_claims_non_destructively() {
+        let (_tmp, graph) = test_graph();
+        let old = graph
+            .add_node(NodeType::Decision, "Old", "v1", &[], None)
+            .unwrap();
+        let other = graph
+            .add_node(NodeType::Technology, "T", "tech", &[], None)
+            .unwrap();
+        graph.add_edge(&old, &other, Relation::Uses).unwrap();
+
+        let new = graph
+            .add_node(NodeType::Decision, "New", "v2", &[], None)
+            .unwrap();
+        graph.add_replaces_edge(&new, &old).unwrap();
+
+        // Новое ребро replaces валидно от now; старое ребро закрыто, не удалено.
+        let (_, edges) = graph.get_subgraph(&old, 2).unwrap();
+        let replaces = edges
+            .iter()
+            .find(|e| e.relation == Relation::Replaces)
+            .expect("replaces edge present");
+        assert_eq!(&replaces.from_id, &new);
+        assert_eq!(&replaces.to_id, &old);
+        assert!(replaces.valid_from.is_some());
+        assert!(replaces.valid_until.is_none());
+
+        let uses = edges
+            .iter()
+            .find(|e| e.relation == Relation::Uses)
+            .expect("old edge still present (non-destructive)");
+        assert!(uses.valid_until.is_some());
+        assert_eq!(uses.superseded_by.as_deref(), Some(new.as_str()));
+
+        // И старый, и новый узлы на месте.
+        assert_eq!(graph.node_count(), 3);
+        assert_eq!(graph.replaces_chain_lengths().unwrap(), vec![2]);
+    }
+
+    #[test]
+    fn add_node_feed_is_idempotent_and_honors_max_nodes() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("knowledge.db");
+        let graph = KnowledgeGraph::new(&db_path, 1).unwrap();
+
+        let first = graph
+            .add_node_feed(NodeType::Lesson, "A", "c", &[], Some("agent-a"), "hash-a")
+            .unwrap();
+        assert!(first.is_some());
+        // Тот же source_hash — skip без записи.
+        let dup = graph
+            .add_node_feed(NodeType::Lesson, "A2", "c2", &[], None, "hash-a")
+            .unwrap();
+        assert!(dup.is_none());
+        // Лимит 1 уже достигнут — отказ до записи.
+        let over = graph.add_node_feed(NodeType::Lesson, "B", "c", &[], None, "hash-b");
+        assert!(over.unwrap_err().to_string().contains("node limit reached"));
+        assert_eq!(graph.node_count(), 1);
+    }
+
+    #[test]
+    fn add_edge_gate_rejects_dangling_target() {
+        let (_tmp, graph) = test_graph();
+        let id = graph
+            .add_node(NodeType::Lesson, "L", "c", &[], None)
+            .unwrap();
+        // FK-гейт рёбер (epic 9-5): dangling to_id отклонён до записи.
+        let err = graph.add_edge(&id, "missing-node", Relation::Replaces);
+        assert!(
+            err.unwrap_err()
+                .to_string()
+                .contains("target node not found")
+        );
     }
 
     #[test]

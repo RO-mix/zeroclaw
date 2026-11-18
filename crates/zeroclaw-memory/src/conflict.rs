@@ -182,7 +182,7 @@ fn cluster_tokens(content: &str) -> std::collections::HashSet<String> {
 /// Contested-кластеры: entity-SQL (core, не-суперседнуто, per-agent scope)
 /// + детерминированная union-find кластеризация по jaccard-токенам.
 /// Возвращает до `limit` кластеров размера ≥2 (противоречащие друг другу
-/// суждения — генератор противоречий без единого LLM-вызова).
+///   суждения — генератор противоречий без единого LLM-вызова).
 pub fn contested_clusters(
     conn: &rusqlite::Connection,
     agent: Option<&str>,

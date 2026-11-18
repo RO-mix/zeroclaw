@@ -351,10 +351,7 @@ fn execute_revision_op(
             )?;
         }
         "link" => {
-            let source = op
-                .target
-                .as_deref()
-                .unwrap_or_else(|| op.rationale.as_str());
+            let source = op.target.as_deref().unwrap_or(op.rationale.as_str());
             link_refs(tx, source)?;
         }
         "archive" => {

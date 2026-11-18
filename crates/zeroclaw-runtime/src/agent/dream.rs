@@ -217,7 +217,7 @@ pub(crate) struct DreamPlan {
 
 pub(crate) enum TickOutcome {
     Idle,
-    Run(DreamPlan),
+    Run(Box<DreamPlan>),
 }
 
 /// Сигнальные счётчики дельты: новые строки с последнего прогона
@@ -719,7 +719,7 @@ pub(crate) fn worker_tick_sync(
 
     let prompt = build_prompt(config, agent, &inputs);
     let input_hashes = inputs.iter().map(|input| input.hash.clone()).collect();
-    Ok(TickOutcome::Run(DreamPlan {
+    Ok(TickOutcome::Run(Box::new(DreamPlan {
         agent: agent.to_string(),
         prompt,
         max_ops: config.memory.dream.max_revisions_per_run as usize,
@@ -727,7 +727,7 @@ pub(crate) fn worker_tick_sync(
         leftover_hashes: leftover,
         report,
         _lock: lock,
-    }))
+    })))
 }
 
 /// Применить вывод модели: разбор строгого JSON, propose revision-операций
@@ -1371,7 +1371,7 @@ mod tests {
     #[test]
     fn per_agent_scope_reads_only_own_plane() {
         let tmp = tempfile::tempdir().unwrap();
-        let config = config_with(&tmp, dream_on());
+        let _config = config_with(&tmp, dream_on());
         let conn = db_conn(&tmp);
         // Чужой plane: другой агент + его память.
         conn.execute(
@@ -1411,7 +1411,7 @@ mod tests {
     #[test]
     fn probe_detects_drift_after_batch_apply() {
         let tmp = tempfile::tempdir().unwrap();
-        let config = config_with(&tmp, dream_on());
+        let _config = config_with(&tmp, dream_on());
         let conn = db_conn(&tmp);
         insert_memory(&conn, "core_fact", "deploys happen on Mondays", "core");
         // Базис пробника: дымовой запрос видит core_fact.
