@@ -403,16 +403,26 @@ fn mark_packet_delivered(config: &Config, packet_id: &str) -> Result<()> {
 // ── Генераторы (worker) ──────────────────────────────────────────────
 
 /// Генератор «дорогих эпизодов»: свежие conversation/daily строки больше
-/// порога — кандидаты на внимание оператора. Идемпотентно по source_hash.
+/// порога — кандидаты на внимание оператора. Идемпотентно по source_hash;
+/// уже предложенные ключи исключаются прямо в SQL — иначе каждый тик
+/// упрётся в ON CONFLICT и будет жечь id AUTOINCREMENT впустую.
 fn generate_expensive_episodes(conn: &rusqlite::Connection) -> Result<u32> {
     let mut stmt = conn.prepare(
         "SELECT key, length(content) FROM memories \
          WHERE category IN ('conversation', 'daily') \
            AND length(content) > ?1 AND superseded_by IS NULL \
+           AND key NOT IN ( \
+               SELECT r.ref_key FROM proposal_refs r \
+               JOIN proposals p ON p.id = r.proposal_id \
+               WHERE p.kind = ?2 \
+           ) \
          ORDER BY length(content) DESC LIMIT 20",
     )?;
     let rows = stmt.query_map(
-        rusqlite::params![EXPENSIVE_EPISODE_MIN_CHARS as i64],
+        rusqlite::params![
+            EXPENSIVE_EPISODE_MIN_CHARS as i64,
+            RatificationProposal::KIND_EXPENSIVE_EPISODE
+        ],
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
     )?;
     let mut proposed = 0u32;
@@ -545,7 +555,12 @@ fn calendar_due(config: &Config) -> bool {
 }
 
 /// Синхронный прогон цикла worker'а: вся работа с БД (без await). Возвращает
-/// подготовленные доставки.
+/// подготовленные доставки. Две фазы: календарная (раз в сутки: затухание,
+/// генераторы, пакет по созревшим) и событийная (каждый тик: чистые SELECT'ы
+/// по неупакованным коррекциям и retry). Генераторы сознательно не каждый
+/// тик: их входы растут медленно, а идемпотентные propose-попытки на каждом
+/// тике жгут id AUTOINCREMENT впустую (конфликт source_hash жжёт id ещё до
+/// отката INSERT'а).
 pub(crate) fn worker_tick_sync(
     config: &Config,
     conn: &rusqlite::Connection,
@@ -553,32 +568,31 @@ pub(crate) fn worker_tick_sync(
     let ratification = &config.memory.ratification;
     let mut pending = Vec::new();
 
-    // Затухание-с-аудитом: старые без подписи (не коррекции) → expired.
-    proposals::expire_stale(conn, ratification.packet_trigger_days)?;
-
-    // Генераторы.
-    let _episodes = generate_expensive_episodes(conn)?;
-    let _silent = generate_silent_corrections(conn)?;
-
     // Снимок недоставленных пакетов ДО сборки новых: retry касается только
     // пакетов прошлых тиков — иначе только что собранный пакет попадал бы
     // в список дважды (сборка + retry в том же тике).
     let retry_packets = proposals::undelivered_packets(conn)?;
 
-    // Событийный триггер: коррекции без пакета → немедленная сборка.
+    // Календарная фаза (state-file, паттерн hygiene).
+    if calendar_due(config) {
+        // Затухание-с-аудитом: старые без подписи (не коррекции) → expired.
+        proposals::expire_stale(conn, ratification.packet_trigger_days)?;
+        // Генераторы.
+        let _episodes = generate_expensive_episodes(conn)?;
+        let _silent = generate_silent_corrections(conn)?;
+        // Пакет из предложений старше порога.
+        let aged = proposals::aged_pending(conn, ratification.packet_trigger_days)?;
+        if let Some(delivery) = assemble_delivery(config, conn, &aged, ratification.min_packet)? {
+            pending.push(delivery);
+        }
+    }
+
+    // Событийная фаза: коррекции без пакета → немедленная сборка.
     let corrections = proposals::unpacked_corrections(conn)?;
     if !corrections.is_empty()
         && let Some(delivery) = assemble_delivery(config, conn, &corrections, 1)?
     {
         pending.push(delivery);
-    }
-
-    // Календарный триггер: пакет из предложений старше порога.
-    if calendar_due(config) {
-        let aged = proposals::aged_pending(conn, ratification.packet_trigger_days)?;
-        if let Some(delivery) = assemble_delivery(config, conn, &aged, ratification.min_packet)? {
-            pending.push(delivery);
-        }
     }
 
     // Retry: назначенные, но не доставленные пакеты прошлых тиков.
