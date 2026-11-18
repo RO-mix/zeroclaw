@@ -41,6 +41,7 @@ pub mod policy_gate;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
 pub mod principal_plane;
+pub mod proposals;
 pub mod qdrant;
 pub mod receipts;
 pub mod redact;

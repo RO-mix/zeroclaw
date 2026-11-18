@@ -23,7 +23,7 @@ pub const DRIFT_META_KEY: &str = "self_change_drift";
 /// `memory stats` и гигиена могут держать brain.db одновременно; без
 /// таймаута SQLITE_BUSY молча роняет receipt, и drift-метрика расходится
 /// с фактом. 5 с — тот же порядок, что sqlite_open_timeout_secs.
-const RECEIPT_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const RECEIPT_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Открыть соединение для receipt'ов с busy_timeout.
 fn open_receipts_connection(db_path: &Path) -> anyhow::Result<rusqlite::Connection> {

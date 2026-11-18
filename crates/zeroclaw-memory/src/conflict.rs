@@ -101,6 +101,62 @@ pub fn find_text_conflicts(
         .collect()
 }
 
+/// Явные фразы коррекции оператора (epic 9-4, генератор «коррекции»):
+/// сообщение, матчащее одну из фраз, порождает proposal kind=correction
+/// с priority=highest — сильнейший сигнал слоя суждений.
+pub const OPERATOR_CORRECTION_PHRASES: &[&str] = &[
+    "неправильно",
+    "не так",
+    "запомни",
+    "запомнить",
+    "перестань",
+    "исправь",
+    "that's wrong",
+    "remember this",
+];
+
+/// Матчит ли текст оператора фразы коррекции (case-insensitive, подстрока).
+pub fn detect_operator_correction(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    OPERATOR_CORRECTION_PHRASES
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+}
+
+/// Proposal kind=contradiction для факта разрешённого противоречия:
+/// новая запись reversibly supersede'ит проигравшие строки.
+pub fn contradiction_proposal(
+    update: &str,
+    superseded_ids: &[String],
+) -> zeroclaw_api::memory_traits::RatificationProposal {
+    use zeroclaw_api::memory_traits::RatificationProposal;
+    let excerpt: String = update.chars().take(200).collect();
+    RatificationProposal::new(
+        RatificationProposal::KIND_CONTRADICTION,
+        format!(
+            "Resolved contradiction: new fact supersedes {} row(s): {excerpt}",
+            superseded_ids.len()
+        ),
+        RatificationProposal::PRIORITY_NORMAL,
+        crate::proposals::source_hash(&["contradiction", update, &superseded_ids.join(",")]),
+    )
+    .with_refs(superseded_ids.iter().cloned())
+}
+
+/// Proposal kind=correction из явной фразы оператора (priority=highest,
+/// бессрочно: throttle и затухание её не трогают).
+pub fn operator_correction_proposal(
+    excerpt: &str,
+) -> zeroclaw_api::memory_traits::RatificationProposal {
+    use zeroclaw_api::memory_traits::RatificationProposal;
+    RatificationProposal::new(
+        RatificationProposal::KIND_CORRECTION,
+        format!("Operator correction: {excerpt}"),
+        RatificationProposal::PRIORITY_HIGHEST,
+        crate::proposals::source_hash(&["correction", excerpt]),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

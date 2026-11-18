@@ -319,6 +319,33 @@ async fn handle_stats(config: &Config) -> Result<()> {
                 &fallback_line
             )
         );
+
+        // Judgment-layer proposals (epic 9-4): очередь суждений по статусам.
+        let proposals = zeroclaw_memory::proposals::counts_at(
+            &zeroclaw_memory::receipts::brain_db_path(&config.data_dir),
+        )?;
+        let total = proposals.total().to_string();
+        let pending = proposals.pending.to_string();
+        let accepted = proposals.accepted.to_string();
+        let rejected = proposals.rejected.to_string();
+        let expired = proposals.expired.to_string();
+        let fallback_line = format!(
+            "  Proposals: {total} (pending {pending}, accepted {accepted}, rejected {rejected}, expired {expired})"
+        );
+        println!(
+            "{}",
+            mt_args(
+                "cli-memory-proposals",
+                &[
+                    ("total", total.as_str()),
+                    ("pending", pending.as_str()),
+                    ("accepted", accepted.as_str()),
+                    ("rejected", rejected.as_str()),
+                    ("expired", expired.as_str()),
+                ],
+                &fallback_line
+            )
+        );
     }
 
     Ok(())
@@ -752,5 +779,45 @@ mod tests {
         assert_eq!(stats.grounded, 1);
         assert_eq!(stats.contested, 1);
         assert_eq!(stats.drift, 1, "drift копит contested-правки");
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[tokio::test]
+    async fn stats_prints_proposals_for_sqlite() {
+        use zeroclaw_memory::SqliteMemory;
+        use zeroclaw_memory::proposals::{self, counts_at};
+        use zeroclaw_memory::receipts::brain_db_path;
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.data_dir = tmp.path().to_path_buf();
+        config.memory.backend = "sqlite".into();
+
+        let seed = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        seed.store("seed", "seed fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        drop(seed);
+
+        let db = brain_db_path(tmp.path());
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        proposals::propose(
+            &conn,
+            &zeroclaw_api::memory_traits::RatificationProposal::new(
+                "trend",
+                "deploys drift to Mondays",
+                "normal",
+                proposals::source_hash(&["trend", "x"]),
+            ),
+        )
+        .unwrap();
+        drop(conn);
+
+        handle_stats(&config).await.unwrap();
+
+        // Та же сводка, что печатает ветка stats: одно pending-предложение.
+        let stats = counts_at(&db).unwrap();
+        assert_eq!(stats.pending, 1);
+        assert_eq!(stats.total(), 1);
     }
 }

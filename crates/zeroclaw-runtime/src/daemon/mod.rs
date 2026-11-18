@@ -1362,6 +1362,34 @@ pub async fn run_with_authority(
         );
     }
 
+    // Judgment-layer ratification worker (epic 9-4, контур RAM): календарный
+    // триггер (packet_trigger_days) + событийный канал (коррекция → сборка).
+    // Флаг выкл (дефолт): компонент не стартует, журнал file-events не
+    // регистрируется — поведение байт-в-байт прежнее.
+    if config.memory.ratification.enabled {
+        let ratification_cfg = config.clone();
+        let ratification_cancel = channels_cancel.clone();
+        crate::agent::ratification::register_file_event_journal(config.data_dir.clone());
+        handles.push(spawn_component_supervisor(
+            "ratification",
+            initial_backoff,
+            max_backoff,
+            channels_cancel.clone(),
+            move || {
+                let cfg = ratification_cfg.clone();
+                let cancel = ratification_cancel.clone();
+                async move {
+                    Box::pin(crate::agent::ratification::run_ratification_worker(
+                        cfg, cancel,
+                    ))
+                    .await
+                }
+            },
+        ));
+    } else {
+        crate::health::mark_component_ok("ratification");
+    }
+
     // Wait for shutdown (SIGINT/SIGTERM/Ctrl+C), reload (in-process channel),
     // or an unrecoverable initial socket ownership conflict.
     let rpc_connection_count = socket_client_count.clone();

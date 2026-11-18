@@ -392,6 +392,60 @@ impl SqliteMemory {
         )
         .with_context(|| "SQLite init_schema failed: CREATE TABLE self_change_receipts")?;
 
+        // Judgment-layer ratification queue (epic 9-4, Д0): proposals ждут
+        // пакетной ратификации оператором; ratification_receipts — append-only
+        // журнал с prev-цепочкой; file_events — узкий журнал фактов file_write
+        // (путь, метка, turn-id; БЕЗ diff — ADR-016 в силе). Только CREATE IF
+        // NOT EXISTS — старые пути не меняются; при выключенном флаге таблицы
+        // просто существуют пустыми.
+        execute_batch_retry(
+            conn,
+            "CREATE TABLE IF NOT EXISTS proposals (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent       TEXT,
+                kind        TEXT NOT NULL,
+                payload     TEXT NOT NULL,
+                status      TEXT NOT NULL DEFAULT 'pending',
+                priority    TEXT NOT NULL DEFAULT 'normal',
+                source_hash TEXT NOT NULL UNIQUE,
+                packet_id   TEXT,
+                delivered_at TEXT,
+                created_at  TEXT NOT NULL,
+                resolved_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_proposals_packet ON proposals(packet_id);
+
+            CREATE TABLE IF NOT EXISTS proposal_refs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                proposal_id INTEGER NOT NULL,
+                position    INTEGER NOT NULL,
+                ref_key     TEXT NOT NULL,
+                created_at  TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_proposal_refs_proposal
+                ON proposal_refs(proposal_id);
+
+            CREATE TABLE IF NOT EXISTS ratification_receipts (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                packet_id   TEXT NOT NULL,
+                mirror_hash TEXT NOT NULL,
+                principal   TEXT NOT NULL,
+                prev_hash   TEXT NOT NULL,
+                created_at  TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS file_events (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                path       TEXT NOT NULL,
+                agent      TEXT,
+                turn_id    TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_file_events_path ON file_events(path, created_at);",
+        )
+        .with_context(|| "SQLite init_schema failed: CREATE TABLE proposals")?;
+
         Self::migrate_session_ids_to_sanitized(conn)?;
 
         Ok(())
@@ -2726,6 +2780,19 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = conn.lock();
             crate::conflict::mark_superseded(&conn, &ids, &new_id)
+        })
+        .await?
+    }
+
+    async fn propose_ratification(
+        &self,
+        proposal: &zeroclaw_api::memory_traits::RatificationProposal,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.clone();
+        let proposal = proposal.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            let conn = conn.lock();
+            Ok(crate::proposals::propose(&conn, &proposal)?.created)
         })
         .await?
     }

@@ -529,6 +529,13 @@ impl<M: Memory> Memory for ScannedMemory<M> {
         self.inner.supersede(superseded_ids, new_id).await
     }
 
+    async fn propose_ratification(
+        &self,
+        proposal: &zeroclaw_api::memory_traits::RatificationProposal,
+    ) -> anyhow::Result<bool> {
+        self.inner.propose_ratification(proposal).await
+    }
+
     async fn store_procedural(
         &self,
         messages: &[ProceduralMessage],

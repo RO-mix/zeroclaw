@@ -514,6 +514,19 @@ async fn execute_one_tool_with_provenance(
                     );
                 }
                 if r.success {
+                    // Узкий журнал фактов file_write (epic 9-4): только факт
+                    // вызова (путь, turn-id, агент) — без diff (ADR-016).
+                    // Регистрация журнала — только при включённой ратификации;
+                    // без регистрации это no-op (поведение прежнее).
+                    if call_name == "file_write"
+                        && let Some(path) = call_arguments.get("path").and_then(|v| v.as_str())
+                    {
+                        super::ratification::journal_agent_file_write(
+                            path,
+                            meta.turn_id,
+                            meta.agent_alias,
+                        );
+                    }
                     let normalized_output = if r.output.is_empty() {
                         "(no output)"
                     } else {

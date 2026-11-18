@@ -8477,6 +8477,36 @@ async fn process_channel_message_with_delivery_id(
     let sender = msg.sender.clone();
     let message_id = msg.id.clone();
     let composite_for_body = channel_composite.clone();
+
+    // Judgment-layer ratification (epic 9-4, контур RAM; gated, default off):
+    // сообщение от principal, матчащее текстовую подпись на активный пакет,
+    // обрабатывается как ратификация вместо обычного turn'а. Флаг выкл →
+    // intercept всегда None и путь байт-в-байт прежний.
+    if let Some(reply) = zeroclaw_runtime::agent::ratification::intercept_operator_signature(
+        &ctx.prompt_config,
+        &sender,
+        &msg.content,
+    ) {
+        if let Some(channel) = find_channel_for_message(&ctx.channels_by_name, &msg) {
+            use zeroclaw_api::channel::SendMessage;
+            if let Err(e) = channel
+                .send(&SendMessage::new(&reply, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+                .await
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"sender": msg.sender, "error": format!("{e}")})
+                        ),
+                    "ratification reply delivery failed"
+                );
+            }
+        }
+        return;
+    }
+
     zeroclaw_log::scope!(
         category: "channel",
         agent_alias: agent_alias.as_str(),
@@ -11134,6 +11164,7 @@ async fn process_channel_message_body(
                 let user_msg = msg.content.clone();
                 let assistant_resp = history_response.clone();
                 let autosave_lease = turn_lease.clone();
+                let ratification_cfg = ctx.prompt_config.clone();
                 zeroclaw_spawn::spawn!(async move {
                     let _lease = autosave_lease;
                     if let Err(e) = memory_strategy
@@ -11156,6 +11187,13 @@ async fn process_channel_message_body(
                             "Memory consolidation skipped"
                         );
                     }
+                    // Событийный триггер слоя суждений (epic 9-4): если
+                    // консолидация породила коррекцию, пакет собирается
+                    // немедленно, не дожидаясь тика worker'а. Флаг выкл → no-op.
+                    zeroclaw_runtime::agent::ratification::event_tick_after_consolidation(
+                        &ratification_cfg,
+                    )
+                    .await;
                 });
             }
 

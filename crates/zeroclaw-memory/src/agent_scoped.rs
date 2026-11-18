@@ -588,6 +588,19 @@ impl Memory for AgentScopedMemory {
         self.inner.reindex().await
     }
 
+    async fn propose_ratification(
+        &self,
+        proposal: &zeroclaw_api::memory_traits::RatificationProposal,
+    ) -> Result<bool> {
+        // Авторство суждения — агент обзвона: очередь общая (brain.db),
+        // поле agent фиксирует, чей ход породил предложение.
+        let scoped = match &proposal.agent {
+            Some(_) => proposal.clone(),
+            None => proposal.clone().with_agent(self.agent_id.clone()),
+        };
+        self.inner.propose_ratification(&scoped).await
+    }
+
     async fn store_procedural(
         &self,
         messages: &[ProceduralMessage],

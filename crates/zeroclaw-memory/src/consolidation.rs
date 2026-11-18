@@ -131,6 +131,13 @@ pub async fn consolidate_turn(
             .await?;
     }
 
+    // Phase 1.5: judgment-layer proposals (epic 9-4, Д0; gated, default off —
+    // при выключенном флаге блок не выполняется и trend теряется, как раньше).
+    // Это сигнальная проводка: записи идут в очередь proposals, а не в память.
+    if memory_config.ratification.enabled {
+        record_ratification_signals(memory, &result, user_message, &history_key).await;
+    }
+
     // Phase 2: extract atomic typed facts (gated; default off). Runs before
     // the primary Core update because that path exits early when the update
     // dedups or merges into a survivor, and a duplicate primary update must
@@ -249,20 +256,102 @@ pub async fn consolidate_turn(
             .await?;
 
         // A: reversible soft-hide of superseded rows (gated, default-on).
-        if memory_config.conflict_supersede_enabled
-            && let Err(e) = memory.supersede(&superseded_ids, &mem_key).await
-        {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "memory supersede skipped"
-            );
+        // Факт разрешённого противоречия журналируется как proposal
+        // kind=contradiction (epic 9-4); при выключенной ратификации
+        // supersede-ветка байт-в-байт прежняя.
+        let mut superseded_ok = false;
+        if memory_config.conflict_supersede_enabled {
+            let supersede_result = memory.supersede(&superseded_ids, &mem_key).await;
+            if let Err(e) = &supersede_result {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "memory supersede skipped"
+                );
+            }
+            superseded_ok = supersede_result.is_ok();
+        }
+        if superseded_ok && memory_config.ratification.enabled && !superseded_ids.is_empty() {
+            let proposal = conflict::contradiction_proposal(update, &superseded_ids);
+            propose_best_effort(memory, &proposal, "contradiction").await;
         }
     }
 
     Ok(())
+}
+
+/// Record judgment-layer signals for the ratification queue (epic 9-4).
+/// Runs only when `[memory.ratification].enabled` is set; failures are
+/// logged, never fatal — a missed proposal must not break consolidation.
+async fn record_ratification_signals(
+    memory: &dyn Memory,
+    result: &ConsolidationResult,
+    user_message: &str,
+    history_key: &str,
+) {
+    // trend: доводим сигнал consolidation до записи (до 9-4 trend молча
+    // терялся). Идемпотентно по source_hash — повторный прогон не дублирует.
+    if let Some(trend) = result
+        .trend
+        .as_deref()
+        .map(str::trim)
+        .filter(|trend| !trend.is_empty())
+    {
+        let proposal = zeroclaw_api::memory_traits::RatificationProposal::new(
+            zeroclaw_api::memory_traits::RatificationProposal::KIND_TREND,
+            format!("Cross-turn trend: {trend}"),
+            zeroclaw_api::memory_traits::RatificationProposal::PRIORITY_NORMAL,
+            crate::proposals::source_hash(&["trend", trend]),
+        )
+        .with_refs([history_key]);
+        propose_best_effort(memory, &proposal, "trend").await;
+    }
+
+    // correction: явные фразы оператора — самый сильный сигнал, priority=highest.
+    if conflict::detect_operator_correction(user_message) {
+        let excerpt: String = user_message.trim().chars().take(200).collect();
+        let proposal = conflict::operator_correction_proposal(&excerpt);
+        propose_best_effort(memory, &proposal, "operator correction").await;
+    }
+}
+
+/// Лучшая попытка записи предложения: ошибка очереди не должна ронять
+/// консолидацию.
+async fn propose_best_effort(
+    memory: &dyn Memory,
+    proposal: &zeroclaw_api::memory_traits::RatificationProposal,
+    what: &str,
+) {
+    match memory.propose_ratification(proposal).await {
+        Ok(created) => {
+            if created {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "kind": proposal.kind,
+                            "priority": proposal.priority,
+                        })),
+                    "ratification proposal queued"
+                );
+            }
+        }
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "kind": proposal.kind,
+                        "what": what,
+                        "error": format!("{e}"),
+                    })),
+                "ratification proposal skipped"
+            );
+        }
+    }
 }
 
 /// Store atomic facts extracted from a turn as individual Core memories,
@@ -382,16 +471,25 @@ async fn store_typed_facts(
             )
             .await?;
 
-        if memory_config.conflict_supersede_enabled
-            && let Err(e) = memory.supersede(&superseded_ids, &mem_key).await
-        {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "memory supersede skipped"
-            );
+        // A: reversible soft-hide of superseded rows (gated, default-on);
+        // журналирование противоречия — как в основном core-обновлении.
+        let mut superseded_ok = false;
+        if memory_config.conflict_supersede_enabled {
+            let supersede_result = memory.supersede(&superseded_ids, &mem_key).await;
+            if let Err(e) = &supersede_result {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "memory supersede skipped"
+                );
+            }
+            superseded_ok = supersede_result.is_ok();
+        }
+        if superseded_ok && memory_config.ratification.enabled && !superseded_ids.is_empty() {
+            let proposal = conflict::contradiction_proposal(fact, &superseded_ids);
+            propose_best_effort(memory, &proposal, "contradiction").await;
         }
     }
 
@@ -1651,5 +1749,142 @@ mod consolidate_turn_tests {
         assert!(result.is_err());
         assert_eq!(count(&memory, MemoryCategory::Daily).await, 0);
         assert_eq!(count(&memory, MemoryCategory::Core).await, 0);
+    }
+
+    // ── epic 9-4: judgment-layer proposals (контур RAM) ──────────────
+
+    fn ratification_config() -> MemoryConfig {
+        MemoryConfig {
+            ratification: zeroclaw_config::schema::MemoryRatificationConfig {
+                enabled: true,
+                ..zeroclaw_config::schema::MemoryRatificationConfig::default()
+            },
+            ..MemoryConfig::default()
+        }
+    }
+
+    fn proposal_stats(tmp: &TempDir) -> crate::proposals::ProposalCounts {
+        let db = tmp.path().join("memory").join("brain.db");
+        crate::proposals::counts_at(&db).unwrap()
+    }
+
+    #[tokio::test]
+    async fn flags_off_consolidation_writes_no_proposals() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        // Тот же typed-ответ (с trend), но фича выключена: очередь пуста,
+        // trend теряется как раньше — байт-в-байт критерий.
+        let provider = ScriptedProvider::replying(
+            r#"{"history_entry":"h","memory_update":null,"trend":"deploys drift to Mondays"}"#,
+        );
+
+        run(&provider, &memory, &MemoryConfig::default())
+            .await
+            .unwrap();
+
+        let stats = proposal_stats(&tmp);
+        assert_eq!(stats.total(), 0, "feature off: no proposals at all");
+    }
+
+    #[tokio::test]
+    async fn enabled_trend_is_proposed_with_episode_ref_and_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        let provider = ScriptedProvider::replying(
+            r#"{"history_entry":"h","memory_update":null,"trend":"deploys drift to Mondays"}"#,
+        );
+        let cfg = ratification_config();
+
+        run(&provider, &memory, &cfg).await.unwrap();
+        // Повторный прогон с тем же trend — source_hash совпадает, дубля нет.
+        run(&provider, &memory, &cfg).await.unwrap();
+
+        let stats = proposal_stats(&tmp);
+        assert_eq!(stats.pending, 1, "same trend must not duplicate");
+
+        let db = tmp.path().join("memory").join("brain.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let (kind, priority): (String, String) = conn
+            .query_row("SELECT kind, priority FROM proposals", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(kind, "trend");
+        assert_eq!(priority, "normal");
+        let refs: u64 = conn
+            .query_row("SELECT COUNT(*) FROM proposal_refs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(refs, 1, "source_refs point at the daily episode");
+    }
+
+    #[tokio::test]
+    async fn enabled_operator_correction_phrase_is_proposed_highest_priority() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        let provider = ScriptedProvider::replying(r#"{"history_entry":"h","memory_update":null}"#);
+        let cfg = ratification_config();
+
+        consolidate_turn(
+            &provider,
+            "test-model",
+            None,
+            &memory,
+            &cfg,
+            "неправильно, деплой у нас по вторникам",
+            "assistant response",
+        )
+        .await
+        .unwrap();
+
+        let db = tmp.path().join("memory").join("brain.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let (kind, priority): (String, String) = conn
+            .query_row("SELECT kind, priority FROM proposals", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(kind, "correction");
+        assert_eq!(priority, "highest");
+    }
+
+    #[tokio::test]
+    async fn enabled_resolved_conflict_is_proposed_as_contradiction() {
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        seed_filler_facts(&memory).await;
+        store_core_fact(
+            &memory,
+            "stale_fact",
+            "User deploys the app on Fridays every week",
+        )
+        .await;
+
+        let cfg = MemoryConfig {
+            ratification: zeroclaw_config::schema::MemoryRatificationConfig {
+                enabled: true,
+                ..zeroclaw_config::schema::MemoryRatificationConfig::default()
+            },
+            conflict_threshold: 0.01,
+            ..MemoryConfig::default()
+        };
+        let provider = ScriptedProvider::update_reply("User deploys the app on Mondays every week");
+
+        run(&provider, &memory, &cfg).await.unwrap();
+
+        let db = tmp.path().join("memory").join("brain.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let kind: String = conn
+            .query_row(
+                "SELECT kind FROM proposals WHERE kind = 'contradiction'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind, "contradiction");
+        // Ссылка на проигравшую строку — в proposal_refs.
+        let refs: u64 = conn
+            .query_row("SELECT COUNT(*) FROM proposal_refs", [], |row| row.get(0))
+            .unwrap();
+        assert!(refs >= 1, "superseded row reference recorded");
     }
 }

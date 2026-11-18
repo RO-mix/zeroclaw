@@ -19,6 +19,7 @@ pub mod personality;
 pub mod personality_templates;
 pub mod pricing_catalog;
 pub mod prompt;
+pub mod ratification;
 pub mod system_prompt;
 pub mod thinking;
 pub(crate) mod tool_call_format;

@@ -551,6 +551,13 @@ impl Memory for RetrievalPipeline {
         result
     }
 
+    async fn propose_ratification(
+        &self,
+        proposal: &zeroclaw_api::memory_traits::RatificationProposal,
+    ) -> anyhow::Result<bool> {
+        self.memory.propose_ratification(proposal).await
+    }
+
     async fn store_procedural(
         &self,
         messages: &[ProceduralMessage],

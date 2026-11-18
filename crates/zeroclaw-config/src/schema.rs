@@ -13151,6 +13151,17 @@ pub struct MemoryConfig {
     #[serde(default)]
     #[nested]
     pub permissions: MemoryPermissionsConfig,
+
+    /// Judgment-layer ratification queue (`[memory.ratification]` section,
+    /// epic 9-4, контур RAM). Behavior-neutral by default: `enabled = false`
+    /// leaves consolidation/conflict/ingress paths byte-identical. When
+    /// enabled, extracted trends, resolved contradictions, expensive episodes
+    /// and operator corrections are proposed into the `proposals` queue in
+    /// brain.db and reach durable memory only after the configured principal
+    /// signs the delivered packet.
+    #[serde(default)]
+    #[nested]
+    pub ratification: MemoryRatificationConfig,
     // Backend-specific config fields (sqlite_open_timeout_secs, qdrant.*,
     // postgres.*) live on `[storage.<backend>.<alias>]`. The `backend` field
     // carries a dotted alias reference and the runtime looks up the typed
@@ -13243,6 +13254,84 @@ impl Default for MemoryPermissionsConfig {
 
 fn default_quote_min_chars() -> usize {
     24
+}
+
+/// Judgment-layer ratification queue (`[memory.ratification]` section,
+/// epic 9-4, контур RAM).
+///
+/// Behavior-neutral by default: `enabled = false` leaves every
+/// consolidation/conflict/ingress path byte-identical (the extracted trend
+/// keeps being silently dropped). When enabled, proposals queue in the
+/// sqlite brain.db companion file and are deployed into durable memory only
+/// after the operator principal signs the delivered packet; the append-only
+/// `ratification_receipts` journal records each deployment with a
+/// packet_id + mirror_hash + principal binding and a hash chain.
+///
+/// Source of truth for the signer identity: `principal` here, NOT any
+/// channel `owner_chat_id` (OQ-2). The allowed-senders list of the
+/// transport channel already restricts who can reach the agent at all.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "memory.ratification"]
+pub struct MemoryRatificationConfig {
+    /// Master switch for the proposals queue and packet ratification.
+    /// Default off.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The signer identity (e.g. the Telegram user/chat id as a string).
+    /// Only a message whose sender equals this principal can ratify a
+    /// packet; self-ratification by the agent is impossible by construction
+    /// (the agent never matches this origin). Empty = no one can sign.
+    #[serde(default)]
+    pub principal: String,
+    /// Transport used to deliver packets to the principal (`"telegram"`).
+    /// A bare transport resolves to its first configured channel alias; a
+    /// dotted `<type>.<alias>` value is used verbatim.
+    #[serde(default = "default_ratification_principal_transport")]
+    pub principal_transport: String,
+    /// Calendar trigger: pending proposals older than this many days are
+    /// eligible for the daily packet. Also the fade horizon: older unsigned
+    /// (non-correction) proposals expire with an audit trail.
+    #[serde(default = "default_ratification_packet_trigger_days")]
+    pub packet_trigger_days: u32,
+    /// Weekly budget of proposals admitted to packets. On overflow the
+    /// lowest-value kinds are held back (trend first); operator corrections
+    /// are never dropped.
+    #[serde(default = "default_ratification_weekly_budget")]
+    pub weekly_budget: u32,
+    /// Minimum items in a calendar-triggered packet; smaller packets are
+    /// not delivered. Correction-triggered packets always deliver.
+    #[serde(default = "default_ratification_min_packet")]
+    pub min_packet: u32,
+}
+
+impl Default for MemoryRatificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            principal: String::new(),
+            principal_transport: default_ratification_principal_transport(),
+            packet_trigger_days: default_ratification_packet_trigger_days(),
+            weekly_budget: default_ratification_weekly_budget(),
+            min_packet: default_ratification_min_packet(),
+        }
+    }
+}
+
+fn default_ratification_principal_transport() -> String {
+    "telegram".into()
+}
+
+fn default_ratification_packet_trigger_days() -> u32 {
+    7
+}
+
+fn default_ratification_weekly_budget() -> u32 {
+    20
+}
+
+fn default_ratification_min_packet() -> u32 {
+    1
 }
 
 /// Memory policy configuration (`[memory.policy]` section).
@@ -13742,6 +13831,7 @@ impl Default for MemoryConfig {
             policy: MemoryPolicyConfig::default(),
             types: MemoryTypesConfig::default(),
             permissions: MemoryPermissionsConfig::default(),
+            ratification: MemoryRatificationConfig::default(),
         }
     }
 }

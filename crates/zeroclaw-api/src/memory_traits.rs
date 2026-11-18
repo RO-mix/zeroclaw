@@ -1,6 +1,80 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+/// A judgment-layer item proposed for operator ratification (epic 9-4,
+/// контур RAM).
+///
+/// Producers build this value; backends that keep the proposals queue
+/// (sqlite brain.db) persist it, other backends no-op via the
+/// `Memory::propose_ratification` default. `payload` is operator-readable
+/// text rendered verbatim inside the delivered packet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RatificationProposal {
+    /// Proposal kind: `trend`, `correction`, `contradiction`,
+    /// or `expensive_episode`.
+    pub kind: String,
+    /// Operator-readable payload text (packet line).
+    pub payload: String,
+    /// `highest` for operator corrections (never throttled, never expire);
+    /// `normal` for everything else.
+    pub priority: String,
+    /// Idempotency key — the same source fact proposed twice collapses into
+    /// one queue row (UNIQUE in the proposals table).
+    pub source_hash: String,
+    /// Durable references into the memory plane (e.g. the episode key or
+    /// superseded row ids) recorded in `proposal_refs`.
+    #[serde(default)]
+    pub source_refs: Vec<String>,
+    /// Owning agent id, when the producer knows it (`None` = shared plane).
+    #[serde(default)]
+    pub agent: Option<String>,
+}
+
+impl RatificationProposal {
+    /// Priority value for operator corrections.
+    pub const PRIORITY_HIGHEST: &'static str = "highest";
+    /// Priority value for generated (non-correction) proposals.
+    pub const PRIORITY_NORMAL: &'static str = "normal";
+
+    /// Kind: cross-turn trend extracted by consolidation.
+    pub const KIND_TREND: &'static str = "trend";
+    /// Kind: operator correction (explicit phrase or silent file edit).
+    pub const KIND_CORRECTION: &'static str = "correction";
+    /// Kind: resolved contradiction (a canon/graph fact was superseded).
+    pub const KIND_CONTRADICTION: &'static str = "contradiction";
+    /// Kind: an expensive episode flagged for archival attention.
+    pub const KIND_EXPENSIVE_EPISODE: &'static str = "expensive_episode";
+
+    #[must_use]
+    pub fn new(
+        kind: impl Into<String>,
+        payload: impl Into<String>,
+        priority: impl Into<String>,
+        source_hash: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: kind.into(),
+            payload: payload.into(),
+            priority: priority.into(),
+            source_hash: source_hash.into(),
+            source_refs: Vec::new(),
+            agent: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_refs(mut self, refs: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.source_refs = refs.into_iter().map(Into::into).collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_agent(mut self, agent: impl Into<String>) -> Self {
+        self.agent = Some(agent.into());
+        self
+    }
+}
+
 /// Filter criteria for bulk memory export (GDPR Art. 20 data portability).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExportFilter {
@@ -582,6 +656,24 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// soft-hide behavior; non-SQL backends remain source-compatible.
     async fn supersede(&self, _superseded_ids: &[String], _new_id: &str) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Propose a judgment-layer item for operator ratification (epic 9-4,
+    /// контур RAM).
+    ///
+    /// Producers (consolidation trend/correction signals, resolved
+    /// contradictions, expensive-episode scans) call this; backends that
+    /// keep the proposals queue persist it, everything else returns the
+    /// default `Ok(false)` so feature-off and non-SQLite paths stay
+    /// byte-identical. `Ok(true)` means a new pending proposal row was
+    /// created; `Ok(false)` means the proposal already existed (idempotent
+    /// by `source_hash`) or the backend does not queue proposals.
+    ///
+    /// This is a proposal only: nothing is deployed into durable memory
+    /// here. Deployment happens when the operator principal signs the
+    /// packet (see `zeroclaw_memory::proposals`).
+    async fn propose_ratification(&self, _proposal: &RatificationProposal) -> anyhow::Result<bool> {
+        Ok(false)
     }
 
     /// Store a procedural "how to" trace from a tool-calling turn.

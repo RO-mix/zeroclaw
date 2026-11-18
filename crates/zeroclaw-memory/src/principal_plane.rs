@@ -107,6 +107,13 @@ impl Memory for PrincipalPlaneMemory {
         self.inner.get_for_principal(&self.scope, key).await
     }
 
+    async fn propose_ratification(
+        &self,
+        proposal: &zeroclaw_api::memory_traits::RatificationProposal,
+    ) -> anyhow::Result<bool> {
+        self.inner.propose_ratification(proposal).await
+    }
+
     async fn list(
         &self,
         category: Option<&MemoryCategory>,
