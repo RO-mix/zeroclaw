@@ -388,7 +388,9 @@ impl SqliteMemory {
                 quote      TEXT,
                 verdict    TEXT NOT NULL,
                 created_at TEXT NOT NULL
-            );",
+            );
+            CREATE INDEX IF NOT EXISTS idx_self_change_receipts_created
+                ON self_change_receipts(created_at);",
         )
         .with_context(|| "SQLite init_schema failed: CREATE TABLE self_change_receipts")?;
 
@@ -434,6 +436,8 @@ impl SqliteMemory {
                 prev_hash   TEXT NOT NULL,
                 created_at  TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS idx_ratification_receipts_created
+                ON ratification_receipts(created_at);
 
             CREATE TABLE IF NOT EXISTS file_events (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -442,7 +446,8 @@ impl SqliteMemory {
                 turn_id    TEXT,
                 created_at TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_file_events_path ON file_events(path, created_at);",
+            CREATE INDEX IF NOT EXISTS idx_file_events_path ON file_events(path, created_at);
+            CREATE INDEX IF NOT EXISTS idx_file_events_created ON file_events(created_at);",
         )
         .with_context(|| "SQLite init_schema failed: CREATE TABLE proposals")?;
 

@@ -9808,7 +9808,11 @@ pub struct KnowledgeConfig {
     /// Maximum number of knowledge nodes. Default: 100000.
     #[serde(default = "default_knowledge_max_nodes")]
     pub max_nodes: usize,
-    /// Automatically capture knowledge from conversations. Default: false.
+    /// Main feeder key (epic 9-5, контур RAM): batch-writes accepted
+    /// ratification outcomes (9-4) into the knowledge graph as
+    /// `decision`/`lesson` nodes with provenance links, in the ratification
+    /// worker's calendar phase. Zero LLM calls. Previously a dead key — read
+    /// for the first time by the graph feeder. Default: false.
     #[serde(default)]
     pub auto_capture: bool,
     /// Proactively suggest relevant knowledge on queries. Default: true.
@@ -13133,6 +13137,20 @@ pub struct MemoryConfig {
     #[serde(default = "default_audit_retention_days")]
     pub audit_retention_days: u32,
 
+    // ── Journal Tables (epic 9-8) ───────────────────────────────
+    /// Retention period in days for the brain.db journal tables
+    /// `file_events` and `self_change_receipts` (BH-8/RAM-2): rows older
+    /// than the cutoff are deleted by the hygiene pass. 0 = keep forever
+    /// (default — byte-identical to the pre-feature behavior).
+    #[serde(default = "default_zero_retention")]
+    pub journal_retention_days: u32,
+    /// Retention period in days for the append-only
+    /// `ratification_receipts` journal in brain.db: receipts older than
+    /// the cutoff are deleted by the hygiene pass. 0 = keep forever
+    /// (default — byte-identical to the pre-feature behavior).
+    #[serde(default = "default_zero_retention")]
+    pub ratification_receipts_retention_days: u32,
+
     // ── Policy Engine ───────────────────────────────────────────
     /// Memory policy configuration.
     #[serde(default)]
@@ -13927,6 +13945,8 @@ impl Default for MemoryConfig {
             pin_min_importance: default_pin_min_importance(),
             audit_enabled: false,
             audit_retention_days: default_audit_retention_days(),
+            journal_retention_days: default_zero_retention(),
+            ratification_receipts_retention_days: default_zero_retention(),
             policy: MemoryPolicyConfig::default(),
             types: MemoryTypesConfig::default(),
             permissions: MemoryPermissionsConfig::default(),
@@ -30770,6 +30790,31 @@ mod tests {
         assert!((def.mmr_lambda - cfg.mmr_lambda).abs() < f64::EPSILON);
         assert!((def.importance_weight - cfg.importance_weight).abs() < f64::EPSILON);
         assert!((def.recency_weight - cfg.recency_weight).abs() < f64::EPSILON);
+    }
+
+    #[::core::prelude::v1::test]
+    fn memory_config_journal_retention_defaults_and_parsing() {
+        // An empty [memory] block keeps both journal retentions at 0 =
+        // keep forever (byte-identical pre-feature behavior, epic 9-8).
+        let cfg: super::MemoryConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.journal_retention_days, 0);
+        assert_eq!(cfg.ratification_receipts_retention_days, 0);
+
+        // The Default impl agrees with the serde defaults.
+        let def = super::MemoryConfig::default();
+        assert_eq!(def.journal_retention_days, cfg.journal_retention_days);
+        assert_eq!(
+            def.ratification_receipts_retention_days,
+            cfg.ratification_receipts_retention_days
+        );
+
+        // Explicit values parse.
+        let cfg: super::MemoryConfig = serde_json::from_str(
+            r#"{"journal_retention_days": 14, "ratification_receipts_retention_days": 60}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.journal_retention_days, 14);
+        assert_eq!(cfg.ratification_receipts_retention_days, 60);
     }
 
     #[::core::prelude::v1::test]

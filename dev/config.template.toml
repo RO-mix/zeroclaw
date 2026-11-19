@@ -64,3 +64,14 @@ allow_override = false
 # destroy_judgment = "operator_only"   # same for the judgment layer (epic 9-4)
 # axis_files_readonly = false          # IDENTITY.md / SOUL.md read-only for agent-originated file_write/file_edit
 # quote_min_chars = 24                 # grounding quote minimum length
+
+# Journal retention (epic 9-8, contour RAM): bounds the brain.db journal
+# tables that otherwise grow forever. file_events + self_change_receipts are
+# pruned by journal_retention_days; the append-only ratification_receipts
+# chain by ratification_receipts_retention_days. Rows older than the cutoff
+# are deleted in the hygiene pass. 0 = keep forever (default — byte-identical
+# to the pre-feature behavior). Denial-probing counters live in memory_meta
+# and are surfaced by `memory stats` (no retention on them yet).
+# [memory]
+# journal_retention_days = 90
+# ratification_receipts_retention_days = 365

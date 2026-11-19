@@ -50,6 +50,11 @@ pub(crate) struct PermissionsGate<'a> {
     cfg: &'a MemoryPermissionsConfig,
     origin: TurnOrigin,
     workspace_dir: Option<PathBuf>,
+    /// Путь к brain.db для телеметрии отказов (epic 9-8, BH-13); `None` —
+    /// конфиг неизвестен, счётчик не пишется.
+    denial_db_path: Option<PathBuf>,
+    /// Алиас агента для per-agent счётчика отказов.
+    denial_agent: String,
 }
 
 impl<'a> PermissionsGate<'a> {
@@ -80,6 +85,8 @@ impl<'a> PermissionsGate<'a> {
             cfg,
             origin,
             workspace_dir,
+            denial_db_path: config.map(|c| zeroclaw_memory::receipts::brain_db_path(&c.data_dir)),
+            denial_agent: agent_alias.unwrap_or("unattributed").to_string(),
         })
     }
 
@@ -102,12 +109,66 @@ impl<'a> PermissionsGate<'a> {
         memory: Option<&dyn Memory>,
         security: Option<&SecurityPolicy>,
     ) -> CallGate {
-        match tool {
+        let gate = match tool {
             "memory_store" => self.check_memory_store(args),
             "memory_forget" => self.check_memory_forget(args, memory).await,
             "memory_purge" => self.check_memory_purge(args, memory).await,
             "file_write" | "file_edit" => self.check_axis_file_write(args, security),
             _ => CallGate::Allow,
+        };
+        if matches!(gate, CallGate::Deny { .. }) {
+            self.record_denial(tool).await;
+        }
+        gate
+    }
+
+    /// Телеметрия отказов (epic 9-8, BH-13): модель может ретраить deny
+    /// каждую итерацию (denial probing) — каждый отказ инкрементирует
+    /// атомарные счётчики в memory_meta и журналируется WARN со
+    /// статичным английским текстом и error_key. Best-effort: сбой
+    /// счётчика не меняет исход гейта. Запись в SQLite уезжает в
+    /// `spawn_blocking` (ревью-виток 1, BH-3): блокирующий I/O в async
+    /// turn loop недопустим.
+    async fn record_denial(&self, tool: &str) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "error_key": "permissions_denied",
+                    "tool": tool,
+                    "agent": self.denial_agent,
+                })),
+            "memory permissions: gate deny recorded (denial probing telemetry)"
+        );
+        let (Some(db_path), agent) = (self.denial_db_path.clone(), self.denial_agent.clone())
+        else {
+            return;
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            zeroclaw_memory::receipts::record_denial_at(&db_path, &agent)
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "memory permissions: denial counter not recorded"
+                );
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "memory permissions: denial counter task failed"
+                );
+            }
         }
     }
 
@@ -664,6 +725,54 @@ mod tests {
                 )
                 .await,
             CallGate::Allow,
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_denials_increment_counters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = enabled_config(&tmp);
+        config.memory.permissions.axis_files_readonly = true;
+        // brain.db must exist for the counter to land (паттерн 9-2/9-8).
+        let _mem = zeroclaw_memory::SqliteMemory::new("test", tmp.path()).unwrap();
+        let ws = tmp.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let policy = SecurityPolicy {
+            workspace_dir: ws,
+            ..SecurityPolicy::default()
+        };
+        let gate = PermissionsGate::resolve(
+            Some(&config),
+            TurnOrigin::Channel,
+            Some(&policy),
+            Some("legalplat"),
+        )
+        .expect("gate");
+        // Модель ретраит deny каждую итерацию (denial probing, BH-13).
+        for _ in 0..5 {
+            match gate
+                .check_call(
+                    "file_write",
+                    &serde_json::json!({"path": "IDENTITY.md", "content": "x"}),
+                    None,
+                    None,
+                )
+                .await
+            {
+                CallGate::Deny { .. } => {}
+                other => panic!("expected Deny, got {other:?}"),
+            }
+        }
+
+        let stats = zeroclaw_memory::receipts::denial_stats_at(
+            &zeroclaw_memory::receipts::brain_db_path(&config.data_dir),
+        )
+        .unwrap();
+        assert_eq!(stats.total, 5, "пять отказов — счётчик +5");
+        assert_eq!(
+            stats.per_agent,
+            vec![("legalplat".to_string(), 5)],
+            "per-agent строка видна"
         );
     }
 

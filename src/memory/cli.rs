@@ -347,6 +347,33 @@ async fn handle_stats(config: &Config) -> Result<()> {
             )
         );
 
+        // Телеметрия отказов гейта полномочий (epic 9-8, BH-13): denial
+        // probing виден оператору. Счётчики производные (memory_meta), не
+        // конфиг. Per-agent список отсортирован по убыванию count.
+        let denials = zeroclaw_memory::receipts::denial_stats_at(
+            &zeroclaw_memory::receipts::brain_db_path(&config.data_dir),
+        )?;
+        let total = denials.total.to_string();
+        let agents = if denials.per_agent.is_empty() {
+            "-".to_string()
+        } else {
+            denials
+                .per_agent
+                .iter()
+                .map(|(alias, count)| format!("{alias}={count}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let fallback_line = format!("  Denials: {total} ({agents})");
+        println!(
+            "{}",
+            mt_args(
+                "cli-memory-denials",
+                &[("total", total.as_str()), ("agents", agents.as_str())],
+                &fallback_line
+            )
+        );
+
         // Dream cycle (epic 9-6): счётчики ночного прогона переоценки
         // суждений (per-agent; state-file читается напрямую).
         #[cfg(feature = "agent-runtime")]
@@ -914,6 +941,40 @@ mod tests {
         let stats = counts_at(&db).unwrap();
         assert_eq!(stats.pending, 1);
         assert_eq!(stats.total(), 1);
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[tokio::test]
+    async fn stats_prints_denials_for_sqlite() {
+        use zeroclaw_memory::SqliteMemory;
+        use zeroclaw_memory::receipts::{brain_db_path, denial_stats_at, record_denial_at};
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.data_dir = tmp.path().to_path_buf();
+        config.memory.backend = "sqlite".into();
+
+        let seed = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        seed.store("seed", "seed fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        drop(seed);
+
+        let db = brain_db_path(tmp.path());
+        record_denial_at(&db, "test").unwrap();
+        record_denial_at(&db, "test").unwrap();
+        record_denial_at(&db, "other").unwrap();
+
+        handle_stats(&config).await.unwrap();
+
+        // Соседние тесты stdout не захватывают; сводка, которую печатает
+        // ветка stats, проверяем через ту же функцию.
+        let stats = denial_stats_at(&db).unwrap();
+        assert_eq!(stats.total, 3);
+        assert_eq!(
+            stats.per_agent,
+            vec![("test".to_string(), 2), ("other".to_string(), 1)]
+        );
     }
 
     #[cfg(feature = "agent-runtime")]

@@ -237,11 +237,20 @@ pub fn parse_revision_ops(payload: &str, max_ops: usize) -> Result<Vec<RevisionO
 
 /// Предложение kind=revision из dream-операции (payload — строгий JSON,
 /// схема proposals не меняется).
+///
+/// `source_hash` — семантический (epic 9-8, DR-1): части
+/// `[dream-revision, action, target, content]`. `_run_tag` вызывающий
+/// (dream.rs) передаёт по-прежнему, но в хэш не входит; `rationale`
+/// исключён намеренно — переформулировка обоснования не должна порождать
+/// дубль и не должна маскировать тот же факт. Механика propose прежняя:
+/// UNIQUE + `ON CONFLICT DO NOTHING` — семантический дубль от
+/// последующих прогонов сна молча скипается (pending/accepted/rejected
+/// одинаково: отклонённое не воскресает само).
 #[must_use]
 pub fn revision_proposal(
     agent: Option<&str>,
     op: &RevisionOp,
-    run_tag: &str,
+    _run_tag: &str,
 ) -> RatificationProposal {
     let mut refs: Vec<String> = op.refs.clone();
     if let Some(target) = &op.target
@@ -250,11 +259,13 @@ pub fn revision_proposal(
         refs.push(target.clone());
     }
     let payload = serde_json::to_string(op).unwrap_or_default();
+    let target = op.target.as_deref().unwrap_or_default();
+    let content = op.content.as_deref().unwrap_or_default();
     let mut proposal = RatificationProposal::new(
         RatificationProposal::KIND_REVISION,
         payload,
         RatificationProposal::PRIORITY_NORMAL,
-        source_hash(&["dream-revision", run_tag, &op.action, &op.rationale]),
+        source_hash(&["dream-revision", &op.action, target, content]),
     )
     .with_refs(refs);
     proposal.agent = agent.map(str::to_string);
@@ -1106,6 +1117,87 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(refs, vec!["daily_2026-01-01_x", "core_y"]);
+    }
+
+    #[test]
+    fn revision_proposal_hash_is_semantic_across_runs_and_rationales() {
+        // DR-1 (spec 9-8): run_tag и rationale не входят в source_hash.
+        let op_a = RevisionOp {
+            action: "promote".into(),
+            target: None,
+            content: Some("durable fact".into()),
+            rationale: "two fresh episodes support it".into(),
+            refs: vec!["daily_a".into()],
+        };
+        let op_b = RevisionOp {
+            rationale: "переформулированное обоснование того же факта".into(),
+            ..op_a.clone()
+        };
+        let p1 = revision_proposal(Some("ag"), &op_a, "run-1#0");
+        let p2 = revision_proposal(Some("ag"), &op_b, "run-2#0");
+        assert_eq!(
+            p1.source_hash, p2.source_hash,
+            "одинаковая (action, target, content) от разных прогонов сна — тот же hash"
+        );
+
+        // Changed content → новый hash → новая строка очереди.
+        let op_c = RevisionOp {
+            content: Some("changed fact".into()),
+            ..op_a.clone()
+        };
+        let p3 = revision_proposal(Some("ag"), &op_c, "run-1#0");
+        assert_ne!(
+            p1.source_hash, p3.source_hash,
+            "изменившийся контент — другое предложение"
+        );
+
+        // Changed target → новый hash.
+        let op_d = RevisionOp {
+            action: "demote".into(),
+            target: Some("core_x".into()),
+            content: None,
+            rationale: "stale".into(),
+            refs: vec![],
+        };
+        let op_e = RevisionOp {
+            target: Some("core_y".into()),
+            ..op_d.clone()
+        };
+        let p4 = revision_proposal(Some("ag"), &op_d, "run-1#0");
+        let p5 = revision_proposal(Some("ag"), &op_e, "run-1#0");
+        assert_ne!(
+            p4.source_hash, p5.source_hash,
+            "другой target — другое предложение"
+        );
+    }
+
+    #[test]
+    fn revision_proposal_semantic_dup_collapses_in_queue() {
+        // Два прогона дриминга с одинаковой операцией → одна строка очереди:
+        // вторая propose молча скипается (UNIQUE + ON CONFLICT DO NOTHING).
+        let (_tmp, _db, conn) = mem_db();
+        let op_a = RevisionOp {
+            action: "supersede".into(),
+            target: Some("daily_a".into()),
+            content: Some("deploys drift to Tuesdays".into()),
+            rationale: "two fresh episodes contradict Mondays".into(),
+            refs: vec!["daily_a".into(), "daily_b".into()],
+        };
+        let op_b = RevisionOp {
+            rationale: "fresh evidence again".into(),
+            ..op_a.clone()
+        };
+        let first = propose(&conn, &revision_proposal(Some("ag"), &op_a, "run-1#0")).unwrap();
+        let second = propose(&conn, &revision_proposal(Some("ag"), &op_b, "run-2#0")).unwrap();
+        assert!(first.created);
+        assert!(
+            !second.created,
+            "семантический дубль от последующего прогона сна не плодит строку"
+        );
+        assert_eq!(second.proposal_id, first.proposal_id);
+        let stats = counts(&conn).unwrap();
+        assert_eq!(stats.total(), 1);
+        assert_eq!(stats.pending, 1);
     }
 
     #[test]

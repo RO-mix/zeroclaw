@@ -25,6 +25,15 @@ struct HygieneReport {
     archived_core_rows: u64,
     archived_daily_rows: u64,
     skipped_referenced_conversation_rows: u64,
+    // serde(default): state-файл, записанный бинарником до 9-8, не содержит
+    // этих полей — без default чтение падало и каденс гигиены сбрасывался
+    // (ревью-виток 1, BH).
+    #[serde(default)]
+    pruned_file_event_rows: u64,
+    #[serde(default)]
+    pruned_self_change_receipt_rows: u64,
+    #[serde(default)]
+    pruned_ratification_receipt_rows: u64,
 }
 
 impl HygieneReport {
@@ -38,7 +47,18 @@ impl HygieneReport {
             + self.pruned_core_rows
             + self.archived_core_rows
             + self.archived_daily_rows
+            + self.pruned_file_event_rows
+            + self.pruned_self_change_receipt_rows
+            + self.pruned_ratification_receipt_rows
     }
+}
+
+/// Сколько строк журнальных таблиц подрезано одним прогоном (epic 9-8).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct JournalPruneReport {
+    file_events: u64,
+    self_change_receipts: u64,
+    ratification_receipts: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -131,6 +151,27 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
         );
     }
 
+    // Журнальные таблицы brain.db (epic 9-8, BH-8/RAM-2): retention на
+    // file_events + self_change_receipts и на ratification_receipts. Ошибка
+    // уборки не роняет фазу (тот же паттерн, что prune_audit_entries).
+    match prune_journal_tables(workspace_dir, config) {
+        Ok(journal) => {
+            report.pruned_file_event_rows = journal.file_events;
+            report.pruned_self_change_receipt_rows = journal.self_change_receipts;
+            report.pruned_ratification_receipt_rows = journal.ratification_receipts;
+        }
+        Err(e) => {
+            // WARN, не DEBUG (ревью-виток 1, BH/спека «warn-видимость»):
+            // стойкий фейл уборки иначе неотличим от «нечего подрезать».
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "journal pruning skipped"
+            );
+        }
+    }
+
     write_state(workspace_dir, &report)?;
 
     if report.total_actions() > 0 {
@@ -138,7 +179,7 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             &format!(
-                "memory hygiene complete: archived_memory={} archived_sessions={} purged_memory={} purged_sessions={} pruned_conversation={} pruned_daily={} pruned_core={} archived_core={} archived_daily={} skipped_referenced_conversation={}",
+                "memory hygiene complete: archived_memory={} archived_sessions={} purged_memory={} purged_sessions={} pruned_conversation={} pruned_daily={} pruned_core={} archived_core={} archived_daily={} skipped_referenced_conversation={} pruned_file_events={} pruned_self_change_receipts={} pruned_ratification_receipts={}",
                 report.archived_memory_files,
                 report.archived_session_files,
                 report.purged_memory_archives,
@@ -149,6 +190,9 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
                 report.archived_core_rows,
                 report.archived_daily_rows,
                 report.skipped_referenced_conversation_rows,
+                report.pruned_file_event_rows,
+                report.pruned_self_change_receipt_rows,
+                report.pruned_ratification_receipt_rows,
             )
         );
     }
@@ -563,6 +607,104 @@ fn prune_audit_entries(workspace_dir: &Path, retention_days: u32) -> Result<()> 
     }
 
     Ok(())
+}
+
+/// Журнальные таблицы brain.db (epic 9-8, BH-8/RAM-2): `file_events` и
+/// `self_change_receipts` подпираются `journal_retention_days`, append-only
+/// `ratification_receipts` — своим ключом. DELETE по `created_at < cutoff`;
+/// 0 = keep forever (skip — байт-в-байт до включения). Таблицы нет (БД
+/// старше миграции) — no-op, нули (паттерн receipts.rs `table_exists`).
+/// Имён таблиц извне нет: только фиксированный список констант модуля.
+fn prune_journal_tables(workspace_dir: &Path, config: &MemoryConfig) -> Result<JournalPruneReport> {
+    let mut report = JournalPruneReport::default();
+    if config.journal_retention_days == 0 && config.ratification_receipts_retention_days == 0 {
+        return Ok(report);
+    }
+
+    let Some(db_path) = prepare_existing_sqlite_storage(workspace_dir, "brain.db")? else {
+        return Ok(report);
+    };
+
+    let conn = Connection::open(db_path)?;
+    // БД занята агентским ходом — busy_timeout-паттерн receipts.rs вместо
+    // SQLITE_BUSY на первой же строке.
+    conn.busy_timeout(crate::receipts::RECEIPT_BUSY_TIMEOUT)?;
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+
+    // Одна транзакция на все три таблицы (ревью-виток 1, ECH): частичная
+    // уборка с нулевым отчётом хуже отката фазы целиком.
+    let tx = conn.unchecked_transaction()?;
+    report.file_events = prune_journal_table(
+        &tx,
+        crate::proposals::FILE_EVENTS_TABLE,
+        config.journal_retention_days,
+    )?;
+    report.self_change_receipts = prune_journal_table(
+        &tx,
+        crate::receipts::SELF_CHANGE_RECEIPTS_TABLE,
+        config.journal_retention_days,
+    )?;
+    report.ratification_receipts = prune_journal_table(
+        &tx,
+        crate::proposals::RATIFICATION_RECEIPTS_TABLE,
+        config.ratification_receipts_retention_days,
+    )?;
+    tx.commit()?;
+
+    if report.file_events > 0 || report.self_change_receipts > 0 || report.ratification_receipts > 0
+    {
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "file_events": report.file_events,
+                    "self_change_receipts": report.self_change_receipts,
+                    "ratification_receipts": report.ratification_receipts,
+                })
+            ),
+            "pruned journal rows older than retention"
+        );
+    }
+
+    Ok(report)
+}
+
+/// DELETE из одной журнальной таблицы по возрасту; retention 0 или таблицы
+/// нет — 0.
+fn prune_journal_table(conn: &Connection, table: &str, retention_days: u32) -> Result<u64> {
+    if retention_days == 0 {
+        return Ok(0);
+    }
+    let exists: bool = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        params![table],
+        |row| {
+            let n: i64 = row.get(0)?;
+            Ok(n > 0)
+        },
+    )?;
+    if !exists {
+        return Ok(0);
+    }
+    // u32::MAX days overflows the chrono range → panic inside the hygiene
+    // phase (ревью-виток 1, ECH). Out-of-range retention = skip with WARN.
+    let Some(cutoff_dt) =
+        Local::now().checked_sub_signed(Duration::days(i64::from(retention_days)))
+    else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"retention_days": retention_days})),
+            "journal retention out of range, skipping prune"
+        );
+        return Ok(0);
+    };
+    let cutoff = cutoff_dt.to_rfc3339();
+    let affected = conn.execute(
+        &format!("DELETE FROM {table} WHERE created_at < ?1"),
+        params![cutoff],
+    )?;
+    Ok(u64::try_from(affected).unwrap_or(0))
 }
 
 fn memory_date_from_filename(filename: &str) -> Option<NaiveDate> {
@@ -1439,6 +1581,193 @@ mod tests {
             1,
             "audit rows past audit_retention_days must be pruned"
         );
+    }
+
+    // ── Journal table retention (epic 9-8) ────────────────────────────
+
+    /// State-файл, записанный бинарником ДО 9-8, не содержит новых полей
+    /// отчёта — чтение обязано пройти с нулями, а не сбрасывать каденс
+    /// гигиены (ревью-виток 1, BH; фикс — #[serde(default)] на полях).
+    #[test]
+    fn hygiene_report_tolerates_pre_feature_state_file() {
+        let json = r#"{
+            "last_run_at": "2026-11-01T00:00:00+03:00",
+            "last_report": {
+                "archived_memory_files": 1,
+                "archived_session_files": 0,
+                "purged_memory_archives": 0,
+                "purged_session_archives": 0,
+                "pruned_conversation_rows": 0,
+                "pruned_daily_rows": 0,
+                "pruned_core_rows": 0,
+                "archived_core_rows": 0,
+                "archived_daily_rows": 0,
+                "skipped_referenced_conversation_rows": 0
+            }
+        }"#;
+        let state: HygieneState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.last_report.pruned_file_event_rows, 0);
+        assert_eq!(state.last_report.pruned_self_change_receipt_rows, 0);
+        assert_eq!(state.last_report.pruned_ratification_receipt_rows, 0);
+        assert_eq!(state.last_report.archived_memory_files, 1);
+    }
+
+    /// Посеять в brain.db по две строки (старая + свежая) в каждый из
+    /// трёх журнальных таблиц. Возвращает путь к БД.
+    fn seed_journal_rows(workspace: &Path) -> PathBuf {
+        let mem = SqliteMemory::new("sqlite", workspace).unwrap();
+        drop(mem);
+        let db_path = workspace.join("memory").join("brain.db");
+        let conn = Connection::open(&db_path).unwrap();
+        let old = (Local::now() - Duration::days(90)).to_rfc3339();
+        let recent = Local::now().to_rfc3339();
+        for ts in [&old, &recent] {
+            conn.execute(
+                "INSERT INTO file_events (path, agent, turn_id, created_at) \
+                 VALUES ('note.md', 'ag', NULL, ?1)",
+                params![ts],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO self_change_receipts (agent, kind, quote, verdict, created_at) \
+                 VALUES ('ag', 'narrative', NULL, 'contested', ?1)",
+                params![ts],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO ratification_receipts \
+                     (packet_id, mirror_hash, principal, prev_hash, created_at) \
+                 VALUES ('p1', 'm', 'op', 'prev', ?1)",
+                params![ts],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        db_path
+    }
+
+    fn journal_row_count(db_path: &Path, table: &str) -> i64 {
+        let conn = Connection::open(db_path).unwrap();
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    fn journal_cfg(workspace: &Path) -> MemoryConfig {
+        let mut cfg = default_cfg();
+        cfg.archive_after_days = 0;
+        cfg.purge_after_days = 0;
+        cfg.conversation_retention_days = 0;
+        cfg.daily_retention_days = 0;
+        cfg.core_retention_days = 0;
+        cfg.audit_retention_days = 0;
+        cfg
+    }
+
+    #[test]
+    fn prunes_old_journal_rows_and_reports_counts() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        let db_path = seed_journal_rows(workspace);
+
+        let mut cfg = journal_cfg(workspace);
+        cfg.journal_retention_days = 30;
+        cfg.ratification_receipts_retention_days = 60;
+        run_if_due(&cfg, workspace).unwrap();
+
+        assert_eq!(
+            journal_row_count(&db_path, "file_events"),
+            1,
+            "старая строка file_events подрезана, свежая на месте"
+        );
+        assert_eq!(
+            journal_row_count(&db_path, "self_change_receipts"),
+            1,
+            "старая строка self_change_receipts подрезана, свежая на месте"
+        );
+        assert_eq!(
+            journal_row_count(&db_path, "ratification_receipts"),
+            1,
+            "старая строка ratification_receipts подрезана, свежая на месте"
+        );
+
+        let state: HygieneState = serde_json::from_str(
+            &fs::read_to_string(workspace.join("state").join(STATE_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(state.last_report.pruned_file_event_rows, 1);
+        assert_eq!(state.last_report.pruned_self_change_receipt_rows, 1);
+        assert_eq!(state.last_report.pruned_ratification_receipt_rows, 1);
+    }
+
+    #[test]
+    fn zero_journal_retention_keeps_rows_byte_identical() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        let db_path = seed_journal_rows(workspace);
+
+        // Дефолт: оба ключа 0 = keep forever — ни удалений, ни ошибок.
+        let cfg = journal_cfg(workspace);
+        assert_eq!(cfg.journal_retention_days, 0);
+        assert_eq!(cfg.ratification_receipts_retention_days, 0);
+        run_if_due(&cfg, workspace).unwrap();
+
+        assert_eq!(journal_row_count(&db_path, "file_events"), 2);
+        assert_eq!(journal_row_count(&db_path, "self_change_receipts"), 2);
+        assert_eq!(journal_row_count(&db_path, "ratification_receipts"), 2);
+
+        let state: HygieneState = serde_json::from_str(
+            &fs::read_to_string(workspace.join("state").join(STATE_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(state.last_report.pruned_file_event_rows, 0);
+        assert_eq!(state.last_report.pruned_self_change_receipt_rows, 0);
+        assert_eq!(state.last_report.pruned_ratification_receipt_rows, 0);
+    }
+
+    #[test]
+    fn journal_retention_keys_are_independent() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        let db_path = seed_journal_rows(workspace);
+
+        // Только journal-ключ: ratification_receipts не тронуты.
+        let mut cfg = journal_cfg(workspace);
+        cfg.journal_retention_days = 30;
+        run_if_due(&cfg, workspace).unwrap();
+
+        assert_eq!(journal_row_count(&db_path, "file_events"), 1);
+        assert_eq!(journal_row_count(&db_path, "self_change_receipts"), 1);
+        assert_eq!(
+            journal_row_count(&db_path, "ratification_receipts"),
+            2,
+            "ratification_receipts_retention_days = 0 держит журнал ратификации"
+        );
+    }
+
+    #[test]
+    fn journal_pruning_noop_on_legacy_db_without_tables() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        fs::create_dir_all(workspace.join("memory")).unwrap();
+        let conn = Connection::open(workspace.join("memory").join("brain.db")).unwrap();
+        conn.execute_batch("CREATE TABLE memory_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        drop(conn);
+
+        let mut cfg = journal_cfg(workspace);
+        cfg.journal_retention_days = 30;
+        cfg.ratification_receipts_retention_days = 30;
+        run_if_due(&cfg, workspace).unwrap();
+
+        let state: HygieneState = serde_json::from_str(
+            &fs::read_to_string(workspace.join("state").join(STATE_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(state.last_report.pruned_file_event_rows, 0);
+        assert_eq!(state.last_report.pruned_self_change_receipt_rows, 0);
+        assert_eq!(state.last_report.pruned_ratification_receipt_rows, 0);
     }
 
     #[test]
