@@ -259,6 +259,44 @@ const LEGACY_CURRENT_DATE_TIME_HEADING: &str = "## Current Date & Time\n\n";
 const WHATSAPP_OBSERVED_GROUP_MESSAGE_LABEL: &str = "Observed WhatsApp group message";
 const WHATSAPP_CURRENT_GROUP_MESSAGE_LABEL: &str = "Current WhatsApp group message";
 
+// Synthetic assistant turns closing a failed or timed-out channel request in
+// the session history. Parenthetical and non-directive on purpose: the note
+// is LLM-visible, and a directive-looking marker gets parroted back as the
+// model's own answer (Pasha session, 19.11 — the model echoed `[Task failed
+// — not continuing this request]` verbatim and the user received the raw
+// marker). `substitute_history_note_echo` below is the second line of
+// defense for old histories still carrying the legacy marker text.
+const FAILED_TASK_HISTORY_NOTE: &str =
+    "(system: предыдущая задача завершилась ошибкой и не была продолжена)";
+const TIMED_OUT_TASK_HISTORY_NOTE: &str =
+    "(system: предыдущая задача превысила лимит времени и не была продолжена)";
+// Legacy marker texts still present in durable histories written before the
+// rewording; the echo guard must recognize them too.
+const LEGACY_FAILED_TASK_MARKER: &str = "[Task failed — not continuing this request]";
+const LEGACY_TIMED_OUT_TASK_MARKER: &str = "[Task timed out — not continuing this request]";
+
+/// Echo guard: if the model's final answer is verbatim one of the synthetic
+/// history notes (current or legacy wording), it parroted the failure marker
+/// instead of answering. Substitute a localized service-error notice so the
+/// user never receives the raw marker, and return `true` so the caller can
+/// log the incident.
+fn substitute_history_note_echo(response: &str, localized_notice: &str) -> Option<String> {
+    let trimmed = response.trim();
+    let echoed = [
+        FAILED_TASK_HISTORY_NOTE,
+        TIMED_OUT_TASK_HISTORY_NOTE,
+        LEGACY_FAILED_TASK_MARKER,
+        LEGACY_TIMED_OUT_TASK_MARKER,
+    ]
+    .iter()
+    .any(|note| trimmed == *note);
+    if echoed {
+        Some(localized_notice.to_string())
+    } else {
+        None
+    }
+}
+
 // System prompt functions live in `zeroclaw_runtime::agent::system_prompt`.
 #[allow(unused_imports)]
 pub use zeroclaw_runtime::agent::system_prompt::{
@@ -11108,6 +11146,25 @@ async fn process_channel_message_body(
                 &msg.channel,
                 &msg.reply_target,
             );
+            // Echo guard: a degraded model can parrot the synthetic failure
+            // note stored in this session's history (Pasha session, 19.11).
+            // Never deliver the raw marker — substitute a localized notice.
+            if let Some(notice) = substitute_history_note_echo(
+                &delivered_response,
+                &channel_runtime_cli_string("channel-runtime-task-failed-retry"),
+            ) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "sender": msg.sender,
+                            "history_key": history_key,
+                        })),
+                    "model echoed the synthetic failure history note; substituted service notice"
+                );
+                delivered_response = notice;
+            }
 
             // The runtime commits this candidate only after semantic acceptance.
             // This renderer must therefore receive only the final accepted route.
@@ -11698,7 +11755,7 @@ async fn process_channel_message_body(
                     append_sender_turn(
                         ctx.as_ref(),
                         &history_key,
-                        ChatMessage::assistant("[Task failed — not continuing this request]"),
+                        ChatMessage::assistant(FAILED_TASK_HISTORY_NOTE),
                     );
                 }
                 if let Some(channel) = target_channel.as_ref() {
@@ -11751,7 +11808,7 @@ async fn process_channel_message_body(
                 append_sender_turn(
                     ctx.as_ref(),
                     &history_key,
-                    ChatMessage::assistant("[Task timed out — not continuing this request]"),
+                    ChatMessage::assistant(TIMED_OUT_TASK_HISTORY_NOTE),
                 );
             }
             if let Some(channel) = target_channel.as_ref() {
@@ -24629,7 +24686,7 @@ api_key = "anthropic-key"
     fn normalize_preserves_failure_marker_after_orphan_user_turn() {
         let turns = vec![
             ChatMessage::user("download something from GitHub"),
-            ChatMessage::assistant("[Task failed — not continuing this request]"),
+            ChatMessage::assistant(FAILED_TASK_HISTORY_NOTE),
             ChatMessage::user("what is WAL?"),
         ];
 
@@ -24637,7 +24694,7 @@ api_key = "anthropic-key"
         assert_eq!(normalized.len(), 3);
         assert_eq!(normalized[0].role, "user");
         assert_eq!(normalized[1].role, "assistant");
-        assert!(normalized[1].content.contains("Task failed"));
+        assert!(normalized[1].content.contains("не была продолжена"));
         assert_eq!(normalized[2].role, "user");
         assert_eq!(normalized[2].content, "what is WAL?");
     }
@@ -24646,15 +24703,45 @@ api_key = "anthropic-key"
     fn normalize_preserves_timeout_marker_after_orphan_user_turn() {
         let turns = vec![
             ChatMessage::user("run a long task"),
-            ChatMessage::assistant("[Task timed out — not continuing this request]"),
+            ChatMessage::assistant(TIMED_OUT_TASK_HISTORY_NOTE),
             ChatMessage::user("next question"),
         ];
 
         let normalized = normalize_cached_channel_turns(turns);
         assert_eq!(normalized.len(), 3);
         assert_eq!(normalized[1].role, "assistant");
-        assert!(normalized[1].content.contains("Task timed out"));
+        assert!(normalized[1].content.contains("превысила лимит времени"));
         assert_eq!(normalized[2].content, "next question");
+    }
+
+    #[test]
+    fn history_note_echo_guard_substitutes_only_verbatim_markers() {
+        // All four recognizable wordings (current notes + legacy markers)
+        // are substituted; anything else — including a marker with extra
+        // text around it — passes through untouched.
+        for echoed in [
+            FAILED_TASK_HISTORY_NOTE,
+            TIMED_OUT_TASK_HISTORY_NOTE,
+            LEGACY_FAILED_TASK_MARKER,
+            LEGACY_TIMED_OUT_TASK_MARKER,
+        ] {
+            let substituted = substitute_history_note_echo(echoed, "NOTICE");
+            assert_eq!(substituted.as_deref(), Some("NOTICE"), "echo: {echoed}");
+            let with_padding = substitute_history_note_echo(&format!("  {echoed}\n"), "NOTICE");
+            assert_eq!(with_padding.as_deref(), Some("NOTICE"), "padded echo");
+        }
+        assert_eq!(
+            substitute_history_note_echo("normal answer", "NOTICE"),
+            None
+        );
+        assert_eq!(
+            substitute_history_note_echo(
+                &format!("{FAILED_TASK_HISTORY_NOTE} — но вот ответ:"),
+                "NOTICE"
+            ),
+            None,
+            "a marker embedded in a real answer must not be rewritten"
+        );
     }
 
     #[test]
@@ -28145,7 +28232,8 @@ api_key = "anthropic-key"
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .iter()
-                .any(|m| m.content.contains("Task failed")),
+                .any(|m| m.content.contains(FAILED_TASK_HISTORY_NOTE)
+                    || m.content.contains(LEGACY_FAILED_TASK_MARKER)),
             "a provider error after a failed resync must not append the \
              failure marker onto an unreconciled durable transcript"
         );

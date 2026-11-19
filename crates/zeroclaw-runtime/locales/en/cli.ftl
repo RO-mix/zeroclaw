@@ -1410,6 +1410,7 @@ turn-tool-interrupted-before-result = [interrupted by user before this tool prod
 # Safe reply delivered when the model repeatedly emits malformed internal
 # tool-call protocol and the turn gives up retrying.
 channel-runtime-malformed-tool-output = I generated an internal tool-call format error and could not complete this request. Please try again.
+channel-runtime-task-failed-retry = Сервисная ошибка: ваш запрос не был обработан. Пожалуйста, отправьте его ещё раз.
 # Safe reply delivered when the streaming protocol guard withheld the same
 # response text on two attempts that were both rejected as tool-protocol
 # parse issues (a recovered valid tool call is not stopped this way):
