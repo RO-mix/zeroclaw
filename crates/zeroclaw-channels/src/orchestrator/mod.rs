@@ -13643,18 +13643,6 @@ fn build_channel_by_id(
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_voice_peers("telegram", &alias))
             };
-            let voice_mention_resolver: Arc<dyn Fn() -> bool + Send + Sync> = {
-                let cfg_arc = config_arc.clone();
-                let alias = alias.clone();
-                Arc::new(move || {
-                    cfg_arc
-                        .read()
-                        .channels
-                        .telegram
-                        .get(&alias)
-                        .is_some_and(|tg| tg.voice_without_mention)
-                })
-            };
             Ok(Arc::new(
                 TelegramChannel::new(
                     tg.bot_token.clone(),
@@ -13668,7 +13656,6 @@ fn build_channel_by_id(
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_passive_group_context(tg.passive_group_context)
-                .with_voice_without_mention_resolver(voice_mention_resolver)
                 .with_transcription_manager(
                     config.transcription.clone(),
                     resolved_transcription_manager(&config, &format!("telegram.{alias}")),
@@ -15234,18 +15221,6 @@ fn collect_configured_channels_with_authority(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_voice_peers("telegram", &alias))
         };
-        let voice_mention_resolver: Arc<dyn Fn() -> bool + Send + Sync> = {
-            let cfg_arc = config_arc.clone();
-            let alias = alias.clone();
-            Arc::new(move || {
-                cfg_arc
-                    .read()
-                    .channels
-                    .telegram
-                    .get(&alias)
-                    .is_some_and(|tg| tg.voice_without_mention)
-            })
-        };
         channels.push(ConfiguredChannel {
             display_name: "Telegram",
             alias: Some(alias.clone()),
@@ -15263,7 +15238,6 @@ fn collect_configured_channels_with_authority(
                     .with_ack_reactions(ack)
                     .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                     .with_passive_group_context(tg.passive_group_context)
-                    .with_voice_without_mention_resolver(voice_mention_resolver)
                     .with_transcription_manager(
                         config.transcription.clone(),
                         resolved_transcription_manager(&config, &format!("telegram.{alias}")),
@@ -54865,7 +54839,6 @@ This is an example JSON object for profile settings."#;
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
-                voice_without_mention: false,
                 unauthorized_message: None,
                 per_user_session: true,
                 passive_group_context: false,
@@ -54903,7 +54876,6 @@ This is an example JSON object for profile settings."#;
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
-                voice_without_mention: false,
                 unauthorized_message: None,
                 per_user_session: true,
                 passive_group_context: false,

@@ -268,7 +268,6 @@ mod tests {
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
-                voice_without_mention: false,
                 unauthorized_message: None,
                 owner_chat_id: None,
                 per_user_session: true,
