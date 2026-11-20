@@ -4970,6 +4970,16 @@ impl TelegramChannel {
         if !self.mention_only || !is_group {
             return Some(caption.map(String::from));
         }
+        // Voice-note bypass (stage 9-11): an opted-in voice note is an
+        // admission fact of this shared gate, not a rule of the voice
+        // parser. It lands before the caption requirement because a voice
+        // note is personal address by format: it admits with its caption
+        // (if any) verbatim, and the allowlist check still ran at the
+        // parser. An `audio` file is shared content, not a personal
+        // address, and stays gated (B1).
+        if message.get("voice").is_some() && (self.voice_without_mention_resolver)() {
+            return Some(caption.map(String::from));
+        }
         // Photo / document updates carry no `text` field, so the text-only
         // gate in `parse_update_message` can never see them and they used to
         // slip through unconditionally. Media without a caption is not
@@ -6193,10 +6203,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
         // The duration check used to run here, before the sender was known.
         // It now runs once the chat is resolved and the sender has passed the
-        // allowlist and (unless `voice_without_mention` opts voice notes out
-        // of it) the mention gate, so the skip can be explained to them —
-        // and so a stranger's oversized recording still costs nothing: the
-        // check stays ahead of every download.
+        // allowlist and the shared media gate, so the skip can be explained
+        // to them — and so a stranger's oversized recording still costs
+        // nothing: the check stays ahead of every download.
         let (_, sender_id, sender_identity) = Self::extract_sender_info(message);
 
         let identities = Self::authorization_identities(message);
@@ -6206,16 +6215,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         let voice_caption = message.get("caption").and_then(serde_json::Value::as_str);
-        // Voice notes carry no caption, so in a mention_only group the gate
-        // would drop every one of them. The opt-in bypass keeps the gate for
-        // everything else and applies to voice notes only: an `audio` file is
-        // shared content, not a personal address, so it still needs a mention;
-        // the allowlist check above still applies either way.
-        let is_voice_note = message.get("voice").is_some();
-        if !((self.voice_without_mention_resolver)() && is_voice_note)
-            && self
-                .check_media_mention_gate(message, voice_caption)
-                .is_none()
+        // Admission is the shared media gate alone: the voice-note bypass
+        // lives there as an admission fact (stage 9-11), so this parser has
+        // no participation rules of its own.
+        if self
+            .check_media_mention_gate(message, voice_caption)
+            .is_none()
         {
             return UpdateDisposition::SkipPermanent;
         }
@@ -6739,14 +6744,16 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// participation matrix through the same predicate the gates use —
     /// this is an admission forecast for prefetching, not an enforcement
     /// point (the parsers remain the only gate). Text updates are recorded
-    /// as passive context when the group is listened to; captioned media
-    /// mirrors `check_media_mention_gate` instead, which drops unaddressed
-    /// media even with passive on until the stage-9-12 passive branch
-    /// (B3). A captionless update is admitted only as a voice note through
-    /// the `voice_without_mention` bypass — and only when transcription is
-    /// configured, since the voice parser drops unconfigured notes before
-    /// its gate. Outside groups and without mention_only everything is
-    /// admitted.
+    /// as passive context when the group is listened to, so their forecast
+    /// admits PassiveContext — the text parser delivers them with their
+    /// reply context, unlike media, which has no passive branch until
+    /// stage 9-12 (B3). Captioned media forecasts through
+    /// `check_media_mention_gate` itself (stage 9-11: the forecast is the
+    /// gate, not a mirror of it). A captionless update is admitted only as
+    /// a voice note through the gate's `voice_without_mention` bypass — and
+    /// only when transcription is configured, since the voice parser drops
+    /// unconfigured notes before its download. Outside groups and without
+    /// mention_only everything is admitted.
     fn reply_update_admitted(&self, message: &serde_json::Value) -> bool {
         let is_group = Self::is_group_message(message);
         if !self.mention_only || !is_group {
@@ -6757,6 +6764,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let addressed = |content: &str| self.addressed_to_bot(content, message).unwrap_or(false);
         match (text, caption) {
             (Some(text), _) => {
+                // Text keeps its own participation rule: unlike media, an
+                // unaddressed text update is delivered as passive context
+                // when the group is listened to, and the text parser renders
+                // its reply context — so the prefetch is not wasted work.
                 let addressed = addressed(text);
                 !matches!(
                     Self::participation_decision(
@@ -6769,29 +6780,19 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 )
             }
             (None, Some(caption)) => {
-                // Mirror check_media_mention_gate: until the stage-9-12
-                // passive branch (B3), unaddressed captioned media drops
-                // even with passive_group_context on — only Reply admits.
-                let addressed = addressed(caption);
-                matches!(
-                    Self::participation_decision(
-                        is_group,
-                        addressed,
-                        self.mention_only,
-                        self.passive_group_context,
-                    ),
-                    Participation::Reply
-                )
+                // Stage 9-11: the forecast is the gate itself. Until the
+                // stage-9-12 passive branch (B3), unaddressed captioned
+                // media drops even with passive_group_context on.
+                self.check_media_mention_gate(message, Some(caption))
+                    .is_some()
             }
             (None, None) => {
-                // Checked first, as in try_parse_voice_message: the bypass
-                // admits a voice note regardless of mention; without
-                // transcription configured the parser drops the note before
-                // its gate, so the prefetch would be wasted. Captionless
-                // media is never admitted (the media gate requires a
-                // caption).
-                (self.voice_without_mention_resolver)()
-                    && message.get("voice").is_some()
+                // Voice admission is the gate's bypass (stage 9-11). The
+                // transcription guard stays because the voice parser drops
+                // unconfigured notes before the download, so prefetching
+                // would be wasted work. Captionless non-voice media is
+                // dropped by the gate (no caption to address).
+                self.check_media_mention_gate(message, None).is_some()
                     && self.transcription.is_some()
                     && self.transcription_manager.is_some()
             }
@@ -20314,6 +20315,78 @@ mod tests {
             ch.check_media_mention_gate(&group, Some("@somebody hi"))
                 .is_none(),
             "missing bot_username in group must fail closed"
+        );
+    }
+
+    #[test]
+    fn check_media_mention_gate_admits_bypassed_voice_note_without_caption() {
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_voice_without_mention_resolver(Arc::new(|| true));
+        let mut msg = group_message_with_caption(None);
+        msg["voice"] = serde_json::json!({ "file_id": "voice_file", "duration": 4 });
+        assert_eq!(
+            ch.check_media_mention_gate(&msg, None),
+            Some(None),
+            "stage 9-11: the voice-note bypass is an admission fact of the shared gate"
+        );
+    }
+
+    #[test]
+    fn check_media_mention_gate_bypass_preserves_unaddressed_voice_caption() {
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_voice_without_mention_resolver(Arc::new(|| true));
+        let mut msg = group_message_with_caption(Some("послушай это"));
+        msg["voice"] = serde_json::json!({ "file_id": "voice_file", "duration": 4 });
+        assert_eq!(
+            ch.check_media_mention_gate(&msg, Some("послушай это")),
+            Some(Some("послушай это".to_string())),
+            "the bypass lands before the mention predicate — caption verbatim"
+        );
+    }
+
+    #[test]
+    fn check_media_mention_gate_bypass_still_drops_audio_files() {
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_voice_without_mention_resolver(Arc::new(|| true));
+        let mut msg = group_message_with_caption(None);
+        msg["audio"] = serde_json::json!({ "file_id": "audio_file", "duration": 30 });
+        assert!(
+            ch.check_media_mention_gate(&msg, None).is_none(),
+            "audio is shared content: the bypass never covered it (B1)"
+        );
+    }
+
+    #[test]
+    fn check_media_mention_gate_drops_voice_note_when_bypass_disabled() {
+        // The resolver defaults to false: without the opt-in a captionless
+        // voice note is unaddressable media and drops at the caption
+        // requirement, exactly like a photo without a caption.
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        );
+        let mut msg = group_message_with_caption(None);
+        msg["voice"] = serde_json::json!({ "file_id": "voice_file", "duration": 4 });
+        assert!(
+            ch.check_media_mention_gate(&msg, None).is_none(),
+            "bypass off: a captionless voice note is unaddressable media"
         );
     }
 
