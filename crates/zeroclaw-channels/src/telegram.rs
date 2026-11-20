@@ -1262,6 +1262,20 @@ pub(crate) enum UpdateDisposition {
     RetryTransient,
 }
 
+/// Decision of the participation table for an inbound message (ADR Channel
+/// Layering, step 3): the single source of the "reply / record passively /
+/// drop" rules for every telegram channel parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Participation {
+    /// Addressed to the bot — hand to the agent with a reply.
+    Reply,
+    /// Unaddressed, but the group is listened to — into the chat context
+    /// without a reply.
+    PassiveContext,
+    /// Unaddressed — do not process.
+    Drop,
+}
+
 enum AttachmentMaterialization {
     Ready {
         content: String,
@@ -2924,6 +2938,41 @@ impl TelegramChannel {
         addressed_to_bot: bool,
     ) -> bool {
         passive_group_context && is_group && !addressed_to_bot
+    }
+
+    /// Participation table (pure function, reads only its arguments): outside
+    /// a group, or without mention_only, or when addressed — Reply; otherwise
+    /// PassiveContext when passive_group_context is on, Drop.
+    fn participation_decision(
+        is_group: bool,
+        addressed: bool,
+        mention_only: bool,
+        passive_group_context: bool,
+    ) -> Participation {
+        if !is_group || !mention_only || addressed {
+            return Participation::Reply;
+        }
+        if Self::should_record_passive_group_context(passive_group_context, is_group, addressed) {
+            Participation::PassiveContext
+        } else {
+            Participation::Drop
+        }
+    }
+
+    /// Addressability predicate: a bot mention in the text/caption, or a
+    /// reply to one of the bot's own messages. `None` — the bot identity is
+    /// unresolved (username unknown); the caller decides what that means:
+    /// the text parser falls through (None = "not applicable"), the media
+    /// gate drops (fail closed).
+    fn addressed_to_bot(&self, content: &str, message: &serde_json::Value) -> Option<bool> {
+        let bot_username_guard = self.bot_username.lock();
+        let bot_username = bot_username_guard.as_ref()?;
+        if Self::contains_bot_mention(content, bot_username) {
+            return Some(true);
+        }
+        drop(bot_username_guard);
+        let bot_id = *self.bot_id.lock();
+        Some(bot_id.is_some_and(|id| Self::is_reply_to_bot(message, id)))
     }
 
     /// Configure whether Telegram-native acknowledgement reactions are sent.
@@ -4904,23 +4953,34 @@ impl TelegramChannel {
         if !self.mention_only || !is_group {
             return Some(caption.map(String::from));
         }
-        let bot_username_guard = self.bot_username.lock();
-        let bot_username = bot_username_guard.as_ref()?;
-
-        // If the user is replying directly to the bot's message, bypass the
-        // mention check — replies are an unambiguous signal of intent.
-        if let Some(caption) = caption
-            && let Some(bot_id) = *self.bot_id.lock()
-            && Self::is_reply_to_bot(message, bot_id)
-        {
-            return Some(Self::normalize_incoming_content(caption, bot_username));
-        }
-
+        // Photo / document updates carry no `text` field, so the text-only
+        // gate in `parse_update_message` can never see them and they used to
+        // slip through unconditionally. Media without a caption is not
+        // addressable: a reply-to-bot without a caption drops, as before
+        // (the caption is the content the mention predicate works on).
         let caption = caption?;
-        if !Self::contains_bot_mention(caption, bot_username) {
-            return None;
+        let addressed = self.addressed_to_bot(caption, message)?;
+        match Self::participation_decision(
+            is_group,
+            addressed,
+            self.mention_only,
+            self.passive_group_context,
+        ) {
+            Participation::Reply => {
+                // The username was Some when addressed_to_bot ran; if the
+                // cache were cleared in between, the (unused) username
+                // parameter of normalize_incoming_content just degrades — an
+                // already-addressed message must not drop on this path.
+                let bot_username = self.bot_username.lock();
+                Some(Self::normalize_incoming_content(
+                    caption,
+                    bot_username.as_deref().unwrap_or(""),
+                ))
+            }
+            // Media has no passive branch yet (B3, stage 9-12):
+            // PassiveContext here means Drop, as before the refactor.
+            Participation::PassiveContext | Participation::Drop => None,
         }
-        Some(Self::normalize_incoming_content(caption, bot_username))
     }
 
     /// Single-identifier convenience kept for the unit tests; the polling
@@ -6814,24 +6874,22 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let is_group = Self::is_group_message(message);
         let mut passive_context = false;
         if self.mention_only && is_group {
-            let bot_username = self.bot_username.lock();
-            let bot_username = bot_username.as_ref()?;
             // A direct reply to the bot's message is an unambiguous signal
             // of intent, so it counts as addressed alongside an @-mention.
-            let addressed = Self::contains_bot_mention(text, bot_username) || {
-                let bot_id = *self.bot_id.lock();
-                bot_id.is_some_and(|id| Self::is_reply_to_bot(message, id))
+            let Some(addressed) = self.addressed_to_bot(text, message) else {
+                // Bot identity unresolved — same fall-through as the
+                // pre-matrix `?` on bot_username: "not applicable", not Drop.
+                return None;
             };
-            if !addressed {
-                if Self::should_record_passive_group_context(
-                    self.passive_group_context,
-                    is_group,
-                    addressed,
-                ) {
-                    passive_context = true;
-                } else {
-                    return None;
-                }
+            match Self::participation_decision(
+                is_group,
+                addressed,
+                self.mention_only,
+                self.passive_group_context,
+            ) {
+                Participation::Reply => {}
+                Participation::PassiveContext => passive_context = true,
+                Participation::Drop => return None,
             }
         }
 
@@ -29744,5 +29802,472 @@ mod tests {
                 TELEGRAM_TYPING_REFRESH_INTERVAL_SECS
             )
         );
+    }
+
+    // ---- golden_participation_* -------------------------------------------------
+    // Spec 9-9: behavior-pinning tests for the participation decision
+    // (Reply / PassiveContext / Drop) across the text, media, voice, and
+    // media-group paths. They must stay green with unchanged expectations
+    // across the decision-matrix refactor — a red golden here means the
+    // refactor changed behavior, not the test.
+
+    fn golden_participation_channel(mention_only: bool) -> TelegramChannel {
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        *ch.bot_username.lock() = Some("mybot".to_string());
+        ch
+    }
+
+    fn golden_participation_group_text_update(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "update_id": 909,
+            "message": {
+                "message_id": 90,
+                "text": text,
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "supergroup" }
+            }
+        })
+    }
+
+    #[test]
+    fn golden_participation_addressed_text_in_mention_only_group_replies() {
+        let ch = golden_participation_channel(true);
+        let parsed = ch
+            .parse_update_message(&golden_participation_group_text_update(
+                "hey @mybot what time is it",
+            ))
+            .expect("addressed text in a mention_only group must reply");
+        assert_eq!(parsed.content, "hey @mybot what time is it");
+        assert!(!parsed.passive_context);
+    }
+
+    #[test]
+    fn golden_participation_unaddressed_text_dropped_when_passive_off() {
+        let ch = golden_participation_channel(true);
+        assert!(
+            ch.parse_update_message(&golden_participation_group_text_update(
+                "just chatting between humans"
+            ))
+            .is_none(),
+            "unaddressed text with passive_group_context off must drop"
+        );
+    }
+
+    #[test]
+    fn golden_participation_unaddressed_text_recorded_as_passive_context() {
+        let ch = golden_participation_channel(true).with_passive_group_context(true);
+        let parsed = ch
+            .parse_update_message(&golden_participation_group_text_update(
+                "just chatting between humans",
+            ))
+            .expect("unaddressed text with passive_group_context on must be recorded");
+        assert!(parsed.passive_context);
+        assert_eq!(parsed.content, "just chatting between humans");
+    }
+
+    #[test]
+    fn golden_participation_reply_to_bot_counts_as_addressed() {
+        let ch = golden_participation_channel(true);
+        *ch.bot_id.lock() = Some(42);
+        let mut update = golden_participation_group_text_update("do this");
+        update["message"]["reply_to_message"] = serde_json::json!({
+            "message_id": 80,
+            "from": { "id": 42, "username": "mybot", "is_bot": true },
+            "text": "original"
+        });
+        let parsed = ch
+            .parse_update_message(&update)
+            .expect("a direct reply to the bot's message must count as addressed");
+        assert!(!parsed.passive_context);
+    }
+
+    #[test]
+    fn golden_participation_reply_drops_while_bot_id_unresolved() {
+        // bot_username is known but bot_id is not: the reply heuristic cannot
+        // fire, and the text carries no mention — the message must drop.
+        let ch = golden_participation_channel(true);
+        let mut update = golden_participation_group_text_update("do this");
+        update["message"]["reply_to_message"] = serde_json::json!({
+            "message_id": 80,
+            "from": { "id": 42, "username": "mybot", "is_bot": true },
+            "text": "original"
+        });
+        assert!(
+            ch.parse_update_message(&update).is_none(),
+            "reply with unresolved bot_id and no mention must drop"
+        );
+    }
+
+    #[test]
+    fn golden_participation_media_with_mention_in_caption_replies() {
+        let ch = golden_participation_channel(true);
+        let msg = group_message_with_caption(Some("  @mybot посмотри  "));
+        assert_eq!(
+            ch.check_media_mention_gate(&msg, Some("  @mybot посмотри  ")),
+            Some(Some("@mybot посмотри".to_string())),
+            "addressed media must reply with the caption normalized"
+        );
+    }
+
+    #[test]
+    fn golden_participation_media_without_mention_drops_even_when_passive_on() {
+        // B3 is deferred to stage 9-12: media has no passive branch yet, so
+        // unaddressed group media drops even with passive_group_context on.
+        let ch = golden_participation_channel(true).with_passive_group_context(true);
+        let msg = group_message_with_caption(Some("nice photo"));
+        assert!(
+            ch.check_media_mention_gate(&msg, Some("nice photo"))
+                .is_none(),
+            "unaddressed media must drop — the passive branch (B3) is stage 9-12"
+        );
+    }
+
+    #[test]
+    fn golden_participation_media_in_dm_passes_without_gate() {
+        let ch = golden_participation_channel(true);
+        let dm = serde_json::json!({
+            "message_id": 1,
+            "from": { "id": 1, "username": "alice" },
+            "chat": { "id": 1, "type": "private" },
+            "caption": "hello"
+        });
+        assert_eq!(
+            ch.check_media_mention_gate(&dm, Some("hello")),
+            Some(Some("hello".to_string())),
+            "DM media must pass with the caption verbatim"
+        );
+    }
+
+    #[test]
+    fn golden_participation_media_in_group_passes_when_mention_only_off() {
+        let ch = golden_participation_channel(false);
+        let msg = group_message_with_caption(None);
+        assert_eq!(
+            ch.check_media_mention_gate(&msg, None),
+            Some(None),
+            "mention_only off ⇒ group media passes without any mention"
+        );
+    }
+
+    #[test]
+    fn golden_participation_media_drops_when_bot_username_unresolved() {
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        );
+        let msg = group_message_with_caption(Some("@mybot hi"));
+        assert!(
+            ch.check_media_mention_gate(&msg, Some("@mybot hi"))
+                .is_none(),
+            "unresolved bot_username in a mention_only group must fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_participation_voice_bypass_parses_unmentioned_voice_note() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "voice/file_1.ogg" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/voice/file_1\.ogg$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 64]))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/audio/transcriptions$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "text": "hello there" })),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            api_url: format!("{}/v1/audio/transcriptions", mock_server.uri()),
+            max_duration_secs: 120,
+            ..Default::default()
+        };
+        // B1: `voice_without_mention` bypasses the mention gate for voice
+        // notes in a mention_only group. (The allowlist discipline for the
+        // bypass is pinned separately by
+        // try_parse_voice_message_bypass_keeps_allowlist_mandatory.)
+        let ch = golden_participation_channel(true)
+            .with_voice_without_mention_resolver(Arc::new(|| true))
+            .with_mock_api_base(mock_server.uri())
+            .with_transcription(tc);
+
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 91,
+                "voice": { "file_id": "voice_file", "duration": 4 },
+                "from": { "id": 123, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "supergroup" }
+            }
+        });
+
+        let UpdateDisposition::Parsed(message) = ch.try_parse_voice_message(&update).await else {
+            panic!("bypassed voice note in a mention_only group should parse");
+        };
+        assert_eq!(message.content, "[Voice] hello there");
+    }
+
+    #[tokio::test]
+    async fn golden_participation_album_mention_in_member_caption_admits_whole_album() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/botfake-token/getFile"))
+            .and(query_param("file_id", "second-photo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "photos/second.jpg" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/file/botfake-token/photos/second.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"second".as_slice()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/botfake-token/getFile"))
+            .and(query_param("file_id", "first-photo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "photos/first.jpg" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/file/botfake-token/photos/first.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"first".as_slice()))
+            .mount(&server)
+            .await;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_mock_api_base(server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+        *channel.bot_username.lock() = Some("mybot".to_string());
+
+        // A4: addressability attaches to the glued album — a mention in the
+        // last member's caption admits the whole media group.
+        let first = serde_json::json!({
+            "update_id": 10,
+            "message": {
+                "message_id": 10,
+                "media_group_id": "album-golden",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": -100, "type": "group" },
+                "photo": [{ "file_id": "first-photo", "file_size": 5 }]
+            }
+        });
+        let last = serde_json::json!({
+            "update_id": 11,
+            "message": {
+                "message_id": 11,
+                "media_group_id": "album-golden",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": -100, "type": "group" },
+                "photo": [{ "file_id": "second-photo", "file_size": 5 }],
+                "caption": "@mybot look at these"
+            }
+        });
+
+        let mut pending = std::collections::HashMap::new();
+        let now = Instant::now();
+        TelegramChannel::buffer_media_group_update(&mut pending, &last, now, 1);
+        TelegramChannel::buffer_media_group_update(&mut pending, &first, now, 1);
+
+        let batches = TelegramChannel::take_settled_media_groups(
+            &mut pending,
+            now + TELEGRAM_MEDIA_GROUP_SETTLE_DELAY,
+            2,
+        );
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+
+        let msg = expect_parsed_media_group(
+            channel
+                .try_parse_media_group_with_unsupported(&batch.updates, &batch.unsupported)
+                .await,
+            "an album whose mention sits in the last member's caption must reply as a whole",
+        );
+        assert!(
+            msg.content.contains("[IMAGE:"),
+            "the supported member must still be dispatched"
+        );
+    }
+
+    #[test]
+    fn golden_participation_service_message_ignored_before_matrix() {
+        let ch = golden_participation_channel(true);
+        let update = serde_json::json!({
+            "update_id": 92,
+            "message": {
+                "message_id": 93,
+                "from": { "id": 777, "username": "carol", "is_bot": false },
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "new_chat_members": [
+                    { "id": 888, "username": "dave", "is_bot": false }
+                ]
+            }
+        });
+        assert!(
+            ch.parse_update_message(&update).is_none(),
+            "service messages carry no text and are ignored at step 1"
+        );
+    }
+
+    #[test]
+    fn golden_participation_missing_text_is_not_applicable_not_drop() {
+        // An attachment-only update has no `text`: the text parser returns
+        // None meaning "not my parser", NOT a participation Drop — the
+        // fall-through chain must get its chance at the update.
+        let ch = golden_participation_channel(true);
+        let update = serde_json::json!({
+            "update_id": 94,
+            "message": {
+                "message_id": 95,
+                "photo": [{ "file_id": "photo_file", "file_size": 4 }],
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "supergroup" }
+            }
+        });
+        assert!(
+            ch.parse_update_message(&update).is_none(),
+            "text parser must stay transparent for attachment-only updates"
+        );
+    }
+
+    #[test]
+    fn golden_participation_media_reply_to_bot_admits_without_mention() {
+        // Media addressability via reply-to-bot on the gate path (text twin:
+        // golden_participation_reply_to_bot_counts_as_addressed). Pins the
+        // post-refactor ordering: the caption-null check precedes the
+        // addressedness evaluation, a reply with a caption must admit.
+        let ch = golden_participation_channel(true);
+        *ch.bot_id.lock() = Some(42);
+        let mut msg = group_message_with_caption(Some("look at this"));
+        msg["reply_to_message"] = serde_json::json!({
+            "message_id": 80,
+            "from": { "id": 42, "username": "mybot", "is_bot": true },
+            "text": "original"
+        });
+        assert_eq!(
+            ch.check_media_mention_gate(&msg, Some("look at this")),
+            Some(Some("look at this".to_string())),
+            "a reply to the bot's message must admit media without a mention"
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_participation_album_without_mention_drops() {
+        // Album-level B3 pin: the media-group path reaches the same gate
+        // with an aggregated caption through its own call site — an
+        // unaddressed album in a mention_only group must drop whole, even
+        // with passive_group_context on (the passive branch is stage 9-12).
+        // No wiremock: gating is validated before any file download.
+        let ch = golden_participation_channel(true).with_passive_group_context(true);
+        let first = serde_json::json!({
+            "update_id": 20,
+            "message": {
+                "message_id": 20,
+                "media_group_id": "album-drop",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": -100, "type": "group" },
+                "photo": [{ "file_id": "photo-a", "file_size": 5 }]
+            }
+        });
+        let second = serde_json::json!({
+            "update_id": 21,
+            "message": {
+                "message_id": 21,
+                "media_group_id": "album-drop",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": -100, "type": "group" },
+                "photo": [{ "file_id": "photo-b", "file_size": 5 }]
+            }
+        });
+
+        let mut pending = std::collections::HashMap::new();
+        let now = Instant::now();
+        TelegramChannel::buffer_media_group_update(&mut pending, &first, now, 1);
+        TelegramChannel::buffer_media_group_update(&mut pending, &second, now, 1);
+
+        let batches = TelegramChannel::take_settled_media_groups(
+            &mut pending,
+            now + TELEGRAM_MEDIA_GROUP_SETTLE_DELAY,
+            2,
+        );
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+
+        let disposition = ch
+            .try_parse_media_group_with_unsupported(&batch.updates, &batch.unsupported)
+            .await;
+        assert!(
+            matches!(disposition, UpdateDisposition::SkipPermanent),
+            "an unaddressed album must drop whole in a mention_only group"
+        );
+    }
+
+    #[test]
+    fn golden_participation_decision_table() {
+        // Pin of the table itself: all 16 axis combinations. Expectations
+        // may change only together with the posting (ADR / operator visa),
+        // never to match the code.
+        use Participation::{Drop, PassiveContext, Reply};
+        let cases = [
+            // (is_group, addressed, mention_only, passive, expected)
+            (false, false, false, false, Reply),       // DM
+            (false, true, false, false, Reply),        // DM, addressed
+            (false, false, true, false, Reply),        // DM, mention_only on — never gates DMs
+            (false, false, true, true, Reply),         // DM, mention_only on, passive on
+            (false, true, false, true, Reply),         // DM, passive on
+            (false, true, true, false, Reply),         // DM, addressed, mention_only on
+            (false, true, true, true, Reply),          // DM, addressed, both on
+            (true, false, false, false, Reply),        // group, mention_only off
+            (true, true, false, false, Reply),         // group, off, addressed
+            (true, false, false, true, Reply), // group, off, passive on — passive never engages without mention_only
+            (true, true, false, true, Reply),  // group, off, addressed, passive on
+            (true, true, true, false, Reply),  // addressed — always Reply
+            (true, true, true, true, Reply),   // addressed, passive on
+            (true, false, true, false, Drop),  // unaddressed, no passive
+            (true, false, true, true, PassiveContext), // group listened to
+        ];
+        for (is_group, addressed, mention_only, passive, expected) in cases {
+            assert_eq!(
+                TelegramChannel::participation_decision(is_group, addressed, mention_only, passive),
+                expected,
+                "is_group={is_group} addressed={addressed} \
+                 mention_only={mention_only} passive={passive}"
+            );
+        }
     }
 }
