@@ -1285,6 +1285,23 @@ enum AttachmentMaterialization {
     RetryTransient,
 }
 
+/// Failure of a fetch through the shared media-download chain
+/// (`TelegramChannel::fetch_media`): the getFile lookup classifies
+/// Permanent/Transient, the CDN download failure is always retryable. The
+/// type carries no policy — callers map it to their own disposition
+/// (drop / retry / silent skip).
+enum MediaFetchError {
+    Lookup(FileLookupError),
+    Download(anyhow::Error),
+}
+
+/// Why `{workspace}/telegram_files` could not be prepared.
+#[derive(Debug)]
+enum SaveDirError {
+    NoWorkspace,
+    CreateFailed(std::io::Error),
+}
+
 enum MediaGroupDispatchOutcome {
     Delivered(MediaGroupKey),
     Retry(MediaGroupBatch),
@@ -5530,6 +5547,51 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         Ok(resp.bytes().await?.to_vec())
     }
 
+    /// Single download chain shared by every unpack path (attachment
+    /// materialize, voice, reply-context prepopulate): getFile, then the
+    /// CDN download. Carries no policy — callers keep their own logging,
+    /// sender notices, and dispositions.
+    async fn fetch_media(&self, file_id: &str) -> Result<(String, Vec<u8>), MediaFetchError> {
+        let tg_file_path = self
+            .get_file_path(file_id)
+            .await
+            .map_err(MediaFetchError::Lookup)?;
+        let data = self
+            .download_file(&tg_file_path)
+            .await
+            .map_err(MediaFetchError::Download)?;
+        Ok((tg_file_path, data))
+    }
+
+    /// `{workspace}/telegram_files`, created on demand. The error variant
+    /// tells the caller *why* so it can pick its own disposition
+    /// (prepopulate is silent fire-and-forget; the attachment materialize
+    /// logs and drops/retries).
+    async fn attachment_save_dir(&self) -> Result<std::path::PathBuf, SaveDirError> {
+        let workspace = self
+            .workspace_dir
+            .as_ref()
+            .ok_or(SaveDirError::NoWorkspace)?;
+        let save_dir = workspace.join("telegram_files");
+        tokio::fs::create_dir_all(&save_dir)
+            .await
+            .map_err(SaveDirError::CreateFailed)?;
+        Ok(save_dir)
+    }
+
+    /// Write downloaded bytes into `save_dir` under `local_filename`,
+    /// returning the local path. Callers decide how to report the error
+    /// (prepopulate is silent; the attachment materialize logs and retries).
+    async fn write_attachment_file(
+        save_dir: &std::path::Path,
+        local_filename: &str,
+        data: &[u8],
+    ) -> std::io::Result<std::path::PathBuf> {
+        let local_path = save_dir.join(local_filename);
+        tokio::fs::write(&local_path, data).await?;
+        Ok(local_path)
+    }
+
     /// Extract (file_id, duration) from a voice or audio message.
     fn parse_voice_metadata(message: &serde_json::Value) -> Option<(String, u64)> {
         let voice = message.get("voice").or_else(|| message.get("audio"))?;
@@ -5679,34 +5741,33 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         // Ensure workspace directory is configured
-        let Some(workspace) = self.workspace_dir.as_ref().or_else(|| {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                "Cannot save attachment: workspace_dir not configured"
-            );
-            None
-        }) else {
-            return AttachmentMaterialization::SkipPermanent;
+        let save_dir = match self.attachment_save_dir().await {
+            Ok(dir) => dir,
+            Err(SaveDirError::NoWorkspace) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "Cannot save attachment: workspace_dir not configured"
+                );
+                return AttachmentMaterialization::SkipPermanent;
+            }
+            Err(SaveDirError::CreateFailed(e)) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
+                    "Failed to create telegram_files directory"
+                );
+                return AttachmentMaterialization::RetryTransient;
+            }
         };
 
-        let save_dir = workspace.join("telegram_files");
-        if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
-                "Failed to create telegram_files directory"
-            );
-            return AttachmentMaterialization::RetryTransient;
-        }
-
-        // Download file from Telegram
-        let tg_file_path = match self.get_file_path(&attachment.file_id).await {
-            Ok(p) => p,
-            Err(e) => {
+        // Download file from Telegram through the shared unpack chain.
+        let (tg_file_path, file_data) = match self.fetch_media(&attachment.file_id).await {
+            Ok(fetched) => fetched,
+            Err(MediaFetchError::Lookup(e)) => {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -5724,11 +5785,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     FileLookupFailure::Transient => AttachmentMaterialization::RetryTransient,
                 };
             }
-        };
-
-        let file_data = match self.download_file(&tg_file_path).await {
-            Ok(d) => d,
-            Err(e) => {
+            Err(MediaFetchError::Download(e)) => {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -5768,17 +5825,21 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         };
 
-        let local_path = save_dir.join(&local_filename);
-        if let Err(e) = tokio::fs::write(&local_path, &file_data).await {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
-                &format!("Failed to save attachment to {}", local_path.display())
-            );
-            return AttachmentMaterialization::RetryTransient;
-        }
+        let local_path = match Self::write_attachment_file(&save_dir, &local_filename, &file_data)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
+                    &format!("Failed to save attachment to {}", save_dir.join(&local_filename).display())
+                );
+                return AttachmentMaterialization::RetryTransient;
+            }
+        };
 
         // Preserve the typed envelope as the source of truth for both the
         // rendered marker and downstream attachment classification. Albums
@@ -6201,10 +6262,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return UpdateDisposition::SkipAnnounced;
         }
 
-        // Download and transcribe
-        let file_path = match self.get_file_path(&file_id).await {
-            Ok(p) => p,
-            Err(e) => {
+        // Download and transcribe through the shared unpack chain.
+        let (file_path, audio_data) = match self.fetch_media(&file_id).await {
+            Ok(fetched) => fetched,
+            Err(MediaFetchError::Lookup(e)) => {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -6230,17 +6291,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     FileLookupFailure::Transient => UpdateDisposition::RetryTransient,
                 };
             }
-        };
-
-        let file_name = file_path
-            .rsplit('/')
-            .next()
-            .unwrap_or("voice.ogg")
-            .to_string();
-
-        let audio_data = match self.download_file(&file_path).await {
-            Ok(d) => d,
-            Err(e) => {
+            Err(MediaFetchError::Download(e)) => {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -6251,6 +6302,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 return UpdateDisposition::RetryTransient;
             }
         };
+
+        let file_name = file_path
+            .rsplit('/')
+            .next()
+            .unwrap_or("voice.ogg")
+            .to_string();
 
         // Use the agent's configured provider if set; otherwise fall back to
         // the only available provider. This lets `[transcription]` work for
@@ -6301,20 +6358,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 // later message for the whole bot. Tell the sender and move
                 // on - the same contract as the duration and file-lookup
                 // drops above.
-                return match failure {
-                    super::transcription::TranscriptionFailure::Permanent => {
-                        self.notify_voice_drop(
-                            &chat_id,
-                            thread_id.as_deref(),
-                            VoiceDropReason::TranscriptionRejected,
-                        )
-                        .await;
-                        UpdateDisposition::SkipAnnounced
-                    }
-                    super::transcription::TranscriptionFailure::Transient => {
-                        UpdateDisposition::RetryTransient
-                    }
-                };
+                return self
+                    .voice_transcription_failure_disposition(
+                        &chat_id,
+                        thread_id.as_deref(),
+                        failure,
+                    )
+                    .await;
             }
         };
 
@@ -6659,6 +6709,95 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         Some(format!("> @{reply_sender}:\n{quoted_lines}"))
     }
 
+    /// Disposition for a failed transcription in the voice path. This is
+    /// the addressed-path contract: a Permanent rejection drops with a
+    /// sender notice (retrying the same bytes can never succeed), a
+    /// Transient one retries. Stage 9-12 (B2, passive-voice admission)
+    /// adds the degrade branch *before* this contract is reached — an
+    /// admitted unmentioned voice note must be recorded with a failure
+    /// note instead of dropped — and that branch owns the parsed message,
+    /// so it does not belong in this helper.
+    async fn voice_transcription_failure_disposition(
+        &self,
+        chat_id: &str,
+        thread_id: Option<&str>,
+        failure: super::transcription::TranscriptionFailure,
+    ) -> UpdateDisposition {
+        match failure {
+            super::transcription::TranscriptionFailure::Permanent => {
+                self.notify_voice_drop(chat_id, thread_id, VoiceDropReason::TranscriptionRejected)
+                    .await;
+                UpdateDisposition::SkipAnnounced
+            }
+            super::transcription::TranscriptionFailure::Transient => {
+                UpdateDisposition::RetryTransient
+            }
+        }
+    }
+
+    /// Would any parser deliver `message` in its chat? Mirrors the
+    /// participation matrix through the same predicate the gates use —
+    /// this is an admission forecast for prefetching, not an enforcement
+    /// point (the parsers remain the only gate). Text updates are recorded
+    /// as passive context when the group is listened to; captioned media
+    /// mirrors `check_media_mention_gate` instead, which drops unaddressed
+    /// media even with passive on until the stage-9-12 passive branch
+    /// (B3). A captionless update is admitted only as a voice note through
+    /// the `voice_without_mention` bypass — and only when transcription is
+    /// configured, since the voice parser drops unconfigured notes before
+    /// its gate. Outside groups and without mention_only everything is
+    /// admitted.
+    fn reply_update_admitted(&self, message: &serde_json::Value) -> bool {
+        let is_group = Self::is_group_message(message);
+        if !self.mention_only || !is_group {
+            return true;
+        }
+        let text = message.get("text").and_then(serde_json::Value::as_str);
+        let caption = message.get("caption").and_then(serde_json::Value::as_str);
+        let addressed = |content: &str| self.addressed_to_bot(content, message).unwrap_or(false);
+        match (text, caption) {
+            (Some(text), _) => {
+                let addressed = addressed(text);
+                !matches!(
+                    Self::participation_decision(
+                        is_group,
+                        addressed,
+                        self.mention_only,
+                        self.passive_group_context,
+                    ),
+                    Participation::Drop
+                )
+            }
+            (None, Some(caption)) => {
+                // Mirror check_media_mention_gate: until the stage-9-12
+                // passive branch (B3), unaddressed captioned media drops
+                // even with passive_group_context on — only Reply admits.
+                let addressed = addressed(caption);
+                matches!(
+                    Self::participation_decision(
+                        is_group,
+                        addressed,
+                        self.mention_only,
+                        self.passive_group_context,
+                    ),
+                    Participation::Reply
+                )
+            }
+            (None, None) => {
+                // Checked first, as in try_parse_voice_message: the bypass
+                // admits a voice note regardless of mention; without
+                // transcription configured the parser drops the note before
+                // its gate, so the prefetch would be wasted. Captionless
+                // media is never admitted (the media gate requires a
+                // caption).
+                (self.voice_without_mention_resolver)()
+                    && message.get("voice").is_some()
+                    && self.transcription.is_some()
+                    && self.transcription_manager.is_some()
+            }
+        }
+    }
+
     /// Pre-download a replied-to voice/audio/document/photo/video message so
     /// `extract_reply_context` can reference it even when the original
     /// message was dropped by the mention-only gate. If built-in
@@ -6700,6 +6839,14 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         if !self.is_any_user_allowed(identities.iter().copied()) {
             return;
         }
+        // FR4 (ADR Channel Layering): admission before materialization.
+        // When this update itself would be dropped by the participation
+        // gate, the replied-to attachment can never surface in any delivered
+        // context — do not download it. Fire-and-forget: `false` means
+        // "skip the prefetch", nothing else.
+        if !self.reply_update_admitted(message) {
+            return;
+        }
 
         let reply_mid = match reply.get("message_id").and_then(serde_json::Value::as_i64) {
             Some(m) => m,
@@ -6722,14 +6869,22 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         }
 
-        let workspace = match self.workspace_dir.as_ref() {
-            Some(w) => w,
-            None => return,
+        let save_dir = match self.attachment_save_dir().await {
+            Ok(dir) => dir,
+            Err(e) => {
+                // Fire-and-forget stays silent to the user, but a persistent
+                // disk failure must leave a trace — otherwise "the agent
+                // never sees the replied-to file" is undiagnosable.
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{e:?}")})),
+                    "Reply attachment prefetch skipped: telegram_files unavailable"
+                );
+                return;
+            }
         };
-        let save_dir = workspace.join("telegram_files");
-        if tokio::fs::create_dir_all(&save_dir).await.is_err() {
-            return;
-        }
 
         let (file_id, duration, filename_stem) = if is_document {
             let Some(doc) = reply.get("document") else {
@@ -6769,14 +6924,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             (file_id, duration, stem)
         };
 
-        let tg_file_path = match self.get_file_path(&file_id).await {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-
-        let media_data = match self.download_file(&tg_file_path).await {
-            Ok(d) => d,
-            Err(_) => return,
+        let Ok((tg_file_path, media_data)) = self.fetch_media(&file_id).await else {
+            return;
         };
 
         let local_filename = if is_document {
@@ -6795,10 +6944,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             format!("{filename_stem}.{ext}")
         };
 
-        let local_path = save_dir.join(&local_filename);
-        if tokio::fs::write(&local_path, &media_data).await.is_err() {
+        let Ok(local_path) =
+            Self::write_attachment_file(&save_dir, &local_filename, &media_data).await
+        else {
             return;
-        }
+        };
         let path_str = local_path.to_string_lossy().into_owned();
 
         // Prefer built-in transcription when configured. Documents, photos,
@@ -30269,5 +30419,383 @@ mod tests {
                  mention_only={mention_only} passive={passive}"
             );
         }
+    }
+
+    // ---- spec 9-10: FR4 admission-before-download + shared unpack core ----
+
+    /// Channel for the prepopulate admission tests: mention_only group bot
+    /// with a mocked file server; `bot_id` stays unset unless a test sets it.
+    fn prepopulate_test_channel(api_base: String, workspace: &std::path::Path) -> TelegramChannel {
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        )
+        .with_mock_api_base(api_base)
+        .with_workspace_dir(workspace.to_path_buf());
+        *ch.bot_username.lock() = Some("mybot".to_string());
+        ch
+    }
+
+    fn gated_reply_update() -> serde_json::Value {
+        // An allowed user replies to another user's document without any
+        // mention — the participation gate (mention_only, passive off)
+        // drops this update.
+        serde_json::json!({
+            "update_id": 30,
+            "message": {
+                "message_id": 31,
+                "text": "какой документ?",
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "reply_to_message": {
+                    "message_id": 30,
+                    "from": { "id": 777, "username": "bob" },
+                    "document": { "file_id": "doc_file", "file_name": "report.pdf" }
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn prepopulate_skips_download_when_reply_is_gated() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/bottoken/getFile"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "documents/file_1.pdf" }
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let ch = prepopulate_test_channel(server.uri(), workspace.path());
+
+        ch.prepopulate_reply_attachment_context(&gated_reply_update())
+            .await;
+
+        assert!(
+            ch.voice_file_paths.lock().is_empty(),
+            "a gated reply must not prefetch the replied-to document"
+        );
+        assert!(ch.voice_transcriptions.lock().is_empty());
+        // wiremock fails the test on drop: the getFile mock expected 0 hits.
+    }
+
+    #[tokio::test]
+    async fn prepopulate_prefetches_reply_addressed_to_bot() {
+        // Positive control for the admission forecast: a reply to the bot's
+        // own message is addressed, so the prefetch must run (exactly one
+        // getFile call, document cached by path).
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/bottoken/getFile"))
+            .and(query_param("file_id", "doc_file"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "documents/file_1.pdf" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/file/bottoken/documents/file_1.pdf"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"%PDF-1.4".as_slice()))
+            .mount(&server)
+            .await;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let ch = prepopulate_test_channel(server.uri(), workspace.path());
+        *ch.bot_id.lock() = Some(42);
+
+        let mut update = gated_reply_update();
+        update["message"]["reply_to_message"]["from"] = serde_json::json!({
+            "id": 42, "username": "mybot", "is_bot": true
+        });
+
+        ch.prepopulate_reply_attachment_context(&update).await;
+
+        assert!(
+            ch.voice_file_paths.lock().contains_key("-100200300:30"),
+            "an addressed reply must prefetch the replied-to document"
+        );
+    }
+
+    #[tokio::test]
+    async fn unpack_core_fetch_media_classifies_lookup_failures() {
+        // The shared download chain keeps the vendor-evidence classification:
+        // only an explicit terminal rejection is Permanent, everything else
+        // stays Transient (retryable).
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let terminal = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/bottoken/getFile"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 400,
+                "description": "file_id is invalid"
+            })))
+            .mount(&terminal)
+            .await;
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(terminal.uri());
+        let err = ch.fetch_media("bad_file").await.expect_err("must fail");
+        match err {
+            MediaFetchError::Lookup(e) => assert!(
+                matches!(e.kind, FileLookupFailure::Permanent),
+                "ok:false + error_code 400 is terminal evidence"
+            ),
+            MediaFetchError::Download(_) => panic!("lookup failure classified as download"),
+        }
+
+        let transient = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/bottoken/getFile"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&transient)
+            .await;
+        let ch = ch.with_mock_api_base(transient.uri());
+        let err = ch.fetch_media("any").await.expect_err("must fail");
+        match err {
+            MediaFetchError::Lookup(e) => assert!(
+                matches!(e.kind, FileLookupFailure::Transient),
+                "a bare 500 carries no terminal evidence"
+            ),
+            MediaFetchError::Download(_) => panic!("lookup failure classified as download"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unpack_core_prepopulate_fetch_failure_stays_silent() {
+        // Fire-and-forget contract (decision OQ-1 variant b): a transient
+        // file-server failure on the prepopulate path returns silently, holds
+        // nothing, and leaves the caches untouched.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/bottoken/getFile"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let ch = prepopulate_test_channel(server.uri(), workspace.path());
+        *ch.bot_id.lock() = Some(42);
+
+        let mut update = gated_reply_update();
+        update["message"]["reply_to_message"]["from"] = serde_json::json!({
+            "id": 42, "username": "mybot", "is_bot": true
+        });
+
+        ch.prepopulate_reply_attachment_context(&update).await;
+
+        assert!(ch.voice_file_paths.lock().is_empty());
+        assert!(ch.voice_transcriptions.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepopulate_skips_download_for_passive_captioned_media_reply() {
+        // Forecast/gate mirror: with passive_group_context on, an
+        // unaddressed captioned-media update is dropped by
+        // check_media_mention_gate until the stage-9-12 passive branch
+        // (B3) — the prefetch must not download the replied-to document.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/bottoken/getFile"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "documents/file_1.pdf" }
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let ch = prepopulate_test_channel(server.uri(), workspace.path())
+            .with_passive_group_context(true);
+
+        let update = serde_json::json!({
+            "update_id": 40,
+            "message": {
+                "message_id": 41,
+                "caption": "look at this",
+                "photo": [{ "file_id": "photo_file", "file_size": 5 }],
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "reply_to_message": {
+                    "message_id": 40,
+                    "from": { "id": 777, "username": "bob" },
+                    "document": { "file_id": "doc_file", "file_name": "report.pdf" }
+                }
+            }
+        });
+
+        ch.prepopulate_reply_attachment_context(&update).await;
+
+        assert!(
+            ch.voice_file_paths.lock().is_empty(),
+            "captioned media the media gate drops must not be prefetched"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepopulate_skips_download_for_captionless_media_reply() {
+        // A captionless media update is never admitted (the media gate
+        // requires a caption) — the prefetch must not run.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/bottoken/getFile"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "documents/file_1.pdf" }
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let ch = prepopulate_test_channel(server.uri(), workspace.path());
+
+        let mut update = gated_reply_update();
+        update["message"] = serde_json::json!({
+            "message_id": 51,
+            "photo": [{ "file_id": "photo_file", "file_size": 5 }],
+            "from": { "id": 555, "username": "alice" },
+            "chat": { "id": -100_200_300, "type": "supergroup" },
+            "reply_to_message": {
+                "message_id": 50,
+                "from": { "id": 777, "username": "bob" },
+                "document": { "file_id": "doc_file", "file_name": "report.pdf" }
+            }
+        });
+
+        ch.prepopulate_reply_attachment_context(&update).await;
+
+        assert!(
+            ch.voice_file_paths.lock().is_empty(),
+            "a captionless media update is never admitted — no prefetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepopulate_prefetches_dm_reply_regardless_of_mention() {
+        // The `!is_group` half of the early-true branch: direct chats are
+        // never gated, so a DM reply prefetches even without a mention.
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/bottoken/getFile"))
+            .and(query_param("file_id", "doc_file"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "documents/file_1.pdf" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/file/bottoken/documents/file_1.pdf"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"%PDF-1.4".as_slice()))
+            .mount(&server)
+            .await;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let ch = prepopulate_test_channel(server.uri(), workspace.path());
+
+        let mut update = gated_reply_update();
+        update["message"]["chat"] = serde_json::json!({ "id": 555, "type": "private" });
+
+        ch.prepopulate_reply_attachment_context(&update).await;
+
+        assert!(
+            ch.voice_file_paths.lock().contains_key("555:30"),
+            "a DM reply prefetches regardless of mention state"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepopulate_prefetches_voice_bypass_reply() {
+        // Voice-bypass branch of the forecast: a voice note admitted via
+        // voice_without_mention (transcription configured) prefetches its
+        // replied-to document even without a mention.
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/bottoken/getFile"))
+            .and(query_param("file_id", "doc_file"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "documents/file_1.pdf" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/file/bottoken/documents/file_1.pdf"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"%PDF-1.4".as_slice()))
+            .mount(&server)
+            .await;
+
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            api_url: format!("{}/v1/audio/transcriptions", server.uri()),
+            max_duration_secs: 120,
+            ..Default::default()
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let ch = prepopulate_test_channel(server.uri(), workspace.path())
+            .with_voice_without_mention_resolver(Arc::new(|| true))
+            .with_transcription(tc);
+
+        let update = serde_json::json!({
+            "update_id": 60,
+            "message": {
+                "message_id": 61,
+                "voice": { "file_id": "voice_file", "duration": 4 },
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "reply_to_message": {
+                    "message_id": 60,
+                    "from": { "id": 777, "username": "bob" },
+                    "document": { "file_id": "doc_file", "file_name": "report.pdf" }
+                }
+            }
+        });
+
+        ch.prepopulate_reply_attachment_context(&update).await;
+
+        assert!(
+            ch.voice_file_paths.lock().contains_key("-100200300:60"),
+            "a bypass-admitted voice reply must prefetch the replied-to document"
+        );
     }
 }
