@@ -28,12 +28,12 @@
 | PR | Суть | Статус |
 |---|---|---|
 | #12371 | edited_message с latest-wins coalescing | CHANGES_REQUESTED 14.11 (tidux): default-features check падает (ChannelMessage.edited нет в WhatsApp Web конструкторе) + greptile edit-dispatch findings; Audacity88: ревью paused до починки checks. Пересекается с #12426 по ChannelMessage.edited — при его переделке возможен ребейз | без свежего движения |
-| #12346 | owner-notice о неавторизованных | **ФИКСЫ 18.11 ЗАПУШЕНЫ** (80185f5, ребейз + оба 🔴 закрыты): превью больше не несёт URL/markup (strip_untrusted_markup — disguised link убит); per-(alias, owner_chat) throttle 30с на detached-доставку. 🟡 bystander: превью сохранено, но стерильное; предложен count-only вариант. 31/31 тестов | ждём re-review tidux; 🔵 spawn-path тест + лишние owner_chat_id literals — открыты |
-| #12070 | skills-splice уважает prompt cap | Audacity88 APPROVED повторным ревью 16.11 (59456bdea0, «approve the fix»). РЕБЕЙЗ ЗАПУШЕН 18.11: чистый (97 behind), 13/13 splice/prompt_cap, комментарий в PR. Хвост tidux 13.11 закрыт (body 14.11 + xattr-фикс в базе). **greptile 18.11: «no findings outside the diff»** — чисто | ждём tidux re-review |
+| #12346 | owner-notice о неавторизованных | **ФИКСЫ 18.11 ЗАПУШЕНЫ** (80185f5, ребейз + оба 🔴 закрыты): превью больше не несёт URL/markup (strip_untrusted_markup — disguised link убит); per-(alias, owner_chat) throttle 30с на detached-доставку. 🟡 bystander: превью сохранено, но стерильное; предложен count-only вариант. 31/31 тестов. **РЕБЕЙЗ 21.11** (`df887e45c5`), пинг tidux в PR | ждём re-review tidux; 🔵 spawn-path тест + лишние owner_chat_id literals — открыты |
+| #12070 | skills-splice уважает prompt cap | Audacity88 APPROVED повторным ревью 16.11 (59456bdea0, «approve the fix»). РЕБЕЙЗ ЗАПУШЕН 18.11: чистый (97 behind), 13/13 splice/prompt_cap, комментарий в PR. Хвост tidux 13.11 закрыт (body 14.11 + xattr-фикс в базе). **greptile 18.11: «no findings outside the diff»** — чисто. **РЕБЕЙЗ 21.11** (`5ff374109b`), пинг tidux в PR | ждём tidux re-review |
 | #12056 | identity-секции в head direct-path промптов | APPROVED (IftekharUddin 09.11) |
 | #11910 | fail-closed budget системного промптa | tidux ПОЛНОЕ ревью 16.11 (COMMENTED, не апрувит). **РАБОЧИЙ СПИСОК ЗАКРЫТ 18.11**: ребейз (конфликт scheduler.rs разрешён, 29/29), privacy-правка firstcontact→#11908 (merge gate), 🔵 remediation до cron-terminal, body по шаблону, Fixes→Related, placement row отдельным PR **#12550**. **⚠️ CI КРАСНЫЙ на head bc115bfb (18.11)**: E0063 — фикстура scheduler.rs:2718 без поля `window_is_compatibility_fallback` (пришло с #11578 на мастере); локальный «29/29» был фильтрованный, lib-test целиком не собирался. greptile P1 то же самое + P2 (placement exception — это #12550, в полёте). **CI-ФИКС ЗАПУШЕН 19.11**: `0f072bf05` (fixture + поле, lib-test таргет компилируется, scheduler 75/75), комментарий в PR. **ПАСС 21.11 (head `10035b70c5`)**: comment-hygiene фикс (убраны `#NNNN`-рефы из двух комментариев — гейт ронял Lint), ребейз на мастер (14 behind, 0 конфликтов) — подтянуты wasmtime/advisory-починки (#12610 и др., красный Security был унаследован); верификация: runtime lib 6068/0, config lib 1948/1 (фейл powershell-CJK — окружение), гейт по репо green; комментарий + пинг tidux в PR. **CI Required Gate ЗЕЛЁНЫЙ на head (21.11 вечер)** | ждём мерджа #12550 → re-review tidux/Audacity88 |
 | #11934 | agent_alias атрибуция cron/gateway | APPROVED (IftekharUddin 09.11) |
-| #11935 | `cron runs` CLI | tidux COMMENTED 16.11 (блокеры resolved). **РЕБЕЙЗ ЗАПУШЕН 18.11**: строка исключения вынесена в record-PR **#12549** (апрув Audacity88 06.11), Wasmtime-бамп снимает красный Security, 217/217 cron-тестов | ждём мерджа #12549 → re-review tidux |
+| #11935 | `cron runs` CLI | tidux COMMENTED 16.11 (блокеры resolved). **РЕБЕЙЗ ЗАПУШЕН 18.11**: строка исключения вынесена в record-PR **#12549** (апрув Audacity88 06.11), Wasmtime-бамп снимает красный Security, 217/217 cron-тестов | **ребейз 21.11** (`8ce8780ea7`), гейт должен позеленеть; ждём мерджа #12549 → re-review tidux |
 | #11983 | policy refusal с reason/remediation | APPROVED (tidux 13.11) |
 | #12204 | web_search compiled-out warning | APPROVED (tidux 13.11) |
 
@@ -41,8 +41,8 @@
 
 | PR | Для | Суть |
 |---|---|---|
-| #12549 | #11935 | Строка исключения cron run-history read (апрув Audacity88 06.11) — **greptile clean 18.11** (no actionable issues, low impact) — ждём мерджа до re-review #11935 |
-| #12550 | #11910 | Строка исключения fail-closed floor gate (апрув Audacity88 06.11, scope дословно) — **greptile clean 18.11** (no actionable issues; P2 greptile на #11910 = этот PR) — ждём мерджа до апрува #11910 |
+| #12549 | #11935 | Строка исключения cron run-history read (апрув Audacity88 06.11) — **greptile clean 18.11** (no actionable issues, low impact). **РЕБЕЙЗ 21.11** (`91edc29463`) — ждём мерджа до re-review #11935 |
+| #12550 | #11910 | Строка исключения fail-closed floor gate (апрув Audacity88 06.11, scope дословно) — **greptile clean 18.11** (no actionable issues; P2 greptile на #11910 = этот PR). **РЕБЕЙЗ 21.11** (`3caa483ab3`) — ждём мерджа до апрува #11910 |
 
 ## Matrix-кластер (NB-дорожка)
 
@@ -61,6 +61,13 @@
 
 Реестр ребейзов и кодовой работы по красным PR: `PR-MAINTENANCE-PLAN-2026-11-21.md`
 (волна 1 — механические ребейзы, волна 2 — #12442/#12198, волна 3 — #12426/#12371).
+
+**ВОЛНА 1 ИСПОЛНЕНА 21.11 (виза Ram):** #12549 → `91edc29463`, #12550 →
+`3caa483ab3`, #12070 → `5ff374109b` (repl 111/0, prompt_cap 6/0), #12346 →
+`df887e45c5` (channels 2045/5, все 5 — link_enricher-сеть), #11935 →
+`8ce8780ea7` (cron 333/0, root bin compiles). Все пуши `--force-with-lease` с
+комментариями; верификации и fmt/hygiene чистые. CI-трек у демиурга снят
+(джоб a13ad43f удалён), наблюдение — крон сессии.
 
 ## Политика контура (виза Ram 16.11)
 
