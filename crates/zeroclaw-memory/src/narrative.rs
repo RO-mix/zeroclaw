@@ -47,7 +47,10 @@ impl std::fmt::Display for NarrativeReject {
 pub fn validate_cap(content: &str, cap_chars: usize) -> Result<(), NarrativeReject> {
     let len = content.chars().count();
     if len > cap_chars {
-        return Err(NarrativeReject::OverCap { len, cap: cap_chars });
+        return Err(NarrativeReject::OverCap {
+            len,
+            cap: cap_chars,
+        });
     }
     Ok(())
 }
@@ -58,15 +61,21 @@ pub fn validate_cap(content: &str, cap_chars: usize) -> Result<(), NarrativeReje
 pub fn sync_soul_section(soul_path: &Path, content: &str) -> std::io::Result<bool> {
     let raw = std::fs::read_to_string(soul_path).unwrap_or_default();
     let section = format!("{SECTION_BEGIN}\n{content}\n{SECTION_END}");
-    let new_raw = match (
-        raw.find(SECTION_BEGIN),
-        raw.find(SECTION_END),
-    ) {
+    let new_raw = match (raw.find(SECTION_BEGIN), raw.find(SECTION_END)) {
         (Some(begin), Some(end)) if begin <= end => {
-            format!("{}{}{}", &raw[..begin], section, &raw[end + SECTION_END.len()..])
+            format!(
+                "{}{}{}",
+                &raw[..begin],
+                section,
+                &raw[end + SECTION_END.len()..]
+            )
         }
         _ => {
-            let sep = if raw.is_empty() || raw.ends_with('\n') { "" } else { "\n" };
+            let sep = if raw.is_empty() || raw.ends_with('\n') {
+                ""
+            } else {
+                "\n"
+            };
             format!("{raw}{sep}\n## Дистиллят образа (генерируется, не править)\n\n{section}\n")
         }
     };
