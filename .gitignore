@@ -144,3 +144,4 @@ HANDOFF-*.md
 RustDesk*.toml
 RustDesk_ab
 peers.toml
+dist/deploy-backups/
