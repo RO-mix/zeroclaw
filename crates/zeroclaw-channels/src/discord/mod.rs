@@ -4552,6 +4552,77 @@ mod tests {
         );
     }
 
+    /// 9-13: a Discord video upload is channel-owned as a `MarkerKind::Video`
+    /// marker. `defers_enrichment` covers Video for every channel, so the
+    /// shared pipeline must not add a second `[Video: ... attached]`
+    /// annotation next to the rendered `[VIDEO:...]` marker.
+    #[tokio::test]
+    async fn video_upload_is_owned_by_channel_marker_through_the_pipeline() {
+        use crate::orchestrator::media_pipeline::MediaPipeline;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/attachments/1/clip.mov"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0x00u8; 64]))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        // `.mov` keeps the marker decision on the video branch: Discord
+        // deliberately treats `.mp4`/`.webm` as audio-carrying extensions
+        // (voice transcription), which is a separate, pre-existing verdict.
+        let attachments = vec![serde_json::json!({
+            "filename": "clip.mov",
+            "content_type": "video/quicktime",
+            "url": format!("{}/attachments/1/clip.mov", server.uri()),
+        })];
+
+        let (text, media) = process_attachments(
+            &attachments,
+            &reqwest::Client::new(),
+            Some(workspace.path()),
+            None,
+        )
+        .await;
+
+        assert_eq!(media.len(), 1, "one attachment in, one envelope out");
+        let target = media[0]
+            .marker_target()
+            .expect("a saved attachment must record the target it rendered")
+            .to_string();
+        assert_eq!(
+            media[0].marker.as_ref().map(|m| m.kind),
+            Some(MarkerKind::Video),
+            "a video upload must be owned as a video marker"
+        );
+        assert!(
+            text.contains(&format!("[VIDEO:{target}]")),
+            "the rendered text must carry the video marker: {text}"
+        );
+
+        let config = zeroclaw_config::schema::MediaPipelineConfig {
+            enabled: true,
+            transcribe_audio: true,
+            describe_images: true,
+            summarize_video: true,
+        };
+        let enriched = MediaPipeline::new(&config, None, false)
+            .process(&text, &media)
+            .await;
+
+        assert_eq!(
+            enriched, text,
+            "a channel-owned video must not gain a second pipeline annotation"
+        );
+        assert!(
+            !enriched.contains("[Video:"),
+            "no second video annotation may sit next to the channel marker: {enriched}"
+        );
+    }
+
     /// With no workspace configured (or a failed save) the rendered target is
     /// the attachment URL, which the default no-remote-image path will not
     /// fetch. The typed envelope records that fallback as non-owned, so the

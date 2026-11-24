@@ -3304,6 +3304,43 @@ mod tests {
         assert!(downloads[0].get("groupId").is_none());
     }
 
+    /// 9-13: an inbound video is owned as a `MarkerKind::Video` marker. The
+    /// shared media pipeline defers to that verdict for every channel
+    /// (`defers_enrichment` covers Video), so no second `[Video: ...]`
+    /// annotation may appear next to the rendered `[VIDEO:...]` marker.
+    #[tokio::test]
+    async fn inbound_video_is_saved_and_marked() {
+        let server = attachment_server(attachment_data(b"fake-mp4-bytes"), 1).await;
+        let workspace = tempfile::tempdir().unwrap();
+        let ch = media_channel(&server.uri(), false).with_workspace_dir(workspace.path().into());
+        let env = attachment_envelope(
+            Some("watch"),
+            None,
+            vec![serde_json::json!({
+                "id": "att1",
+                "contentType": "video/mp4",
+                "filename": "clip.mp4",
+                "size": 14,
+            })],
+        );
+
+        let msg = receive(&ch, &env).await.expect("delivered");
+
+        assert_eq!(msg.attachments.len(), 1);
+        let attachment = &msg.attachments[0];
+        assert_eq!(attachment.data, b"fake-mp4-bytes");
+        let marker = attachment.marker.as_ref().expect("rendered marker");
+        assert_eq!(marker.kind, MarkerKind::Video);
+        assert!(
+            attachment.channel_rendered_owned_disposition(),
+            "the channel-owned video verdict must defer pipeline enrichment"
+        );
+        let saved = Path::new(&marker.target);
+        assert!(saved.starts_with(workspace.path().join(SIGNAL_ATTACHMENT_SAVE_SUBDIR)));
+        assert_eq!(std::fs::read(saved).unwrap(), b"fake-mp4-bytes");
+        assert_eq!(msg.content, format!("watch\n[VIDEO:{}]", marker.target));
+    }
+
     #[tokio::test]
     async fn inbound_attachment_only_group_document_is_delivered() {
         let server = attachment_server(attachment_data(b"%PDF-1.4"), 1).await;

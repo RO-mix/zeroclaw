@@ -62,8 +62,9 @@ impl<'a> MediaPipeline<'a> {
             // A channel that saved these bytes and rendered a marker for them
             // has already classified this attachment, with more to go on than
             // the pipeline has: the payload, the sender's declared type, and
-            // the transport's own notion of what was sent. When it committed to
-            // an image or a document disposition, that verdict wins outright.
+            // the transport's own notion of what was sent. When it committed
+            // to an image, video, or document disposition, that verdict wins
+            // outright.
             //
             // Skipping the whole attachment — not just its image branch — is
             // what keeps the two classifiers from contradicting each other.
@@ -726,6 +727,39 @@ mod tests {
         assert!(
             result.contains("[Video: clip.mp4 attached]"),
             "expected video annotation, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn video_already_marked_by_channel_is_not_double_annotated() {
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, false);
+
+        // A channel (Telegram, Discord, Signal) that saved the video to disk
+        // renders the `[VIDEO:<path>]` marker itself and records the Video
+        // disposition on the envelope. The pipeline must defer to that
+        // verdict instead of adding a second `[Video: ... attached]` note.
+        let saved = "/ws/telegram_files/video_1_2.mp4";
+        let attachment = MediaAttachment {
+            file_name: "video_1_2.mp4".to_string(),
+            data: vec![0u8; 64],
+            mime_type: Some("video/mp4".to_string()),
+            marker: Some(RenderedMarker {
+                target: saved.to_string(),
+                kind: MarkerKind::Video,
+            }),
+        };
+        let original = format!("[VIDEO:{saved}]\n\nчто в ролике?");
+
+        let result = pipeline.process(&original, &[attachment]).await;
+
+        assert_eq!(
+            result, original,
+            "a channel-marked video must pass through unchanged"
+        );
+        assert!(
+            !result.contains("[Video:"),
+            "no second video annotation may sit next to the channel marker: {result}"
         );
     }
 

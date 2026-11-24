@@ -60,14 +60,20 @@ impl MarkerKind {
     /// Whether a later enrichment stage must defer to this rendered marker
     /// rather than re-deciding the attachment's kind from its payload.
     ///
-    /// True for the two visual dispositions a channel resolves against the
-    /// provider's loadability contract. Re-running payload classification on a
-    /// channel-rendered image or document produces a contradictory second
-    /// annotation, and for a non-loadable image document an `[IMAGE:data:...]`
-    /// copy the provider then rejects. Audio and video carry no such
-    /// image/document ambiguity, so they keep the existing per-kind enrichment.
+    /// True for the dispositions a channel resolves when it renders the
+    /// marker. Re-running payload classification on a channel-rendered image
+    /// or document produces a contradictory second annotation, and for a
+    /// non-loadable image document an `[IMAGE:data:...]` copy the provider
+    /// then rejects. A channel-rendered video marker owns the same verdict:
+    /// annotating it again would put a `[Video: ... attached]` note next to
+    /// the channel's own `[VIDEO:...]` marker for the same bytes. Audio keeps
+    /// the existing per-kind enrichment: channels do not render audio markers
+    /// on the inbound path, so there is no channel verdict to defer to.
     pub fn defers_enrichment(self) -> bool {
-        matches!(self, MarkerKind::Image | MarkerKind::Document)
+        matches!(
+            self,
+            MarkerKind::Image | MarkerKind::Video | MarkerKind::Document
+        )
     }
 }
 
@@ -186,9 +192,10 @@ impl MediaAttachment {
     ///
     /// See [`MarkerKind::defers_enrichment`]. The channel saw the payload, the
     /// sender's declared type, and the transport's own notion of what was
-    /// sent, so its image-or-document verdict wins over a second, payload-only
-    /// classification downstream. A remote URL image fallback is excluded:
-    /// its typed bytes can replace the URL when remote fetching is disabled.
+    /// sent, so its rendered verdict (image, video, or document) wins over a
+    /// second, payload-only classification downstream. A remote URL image
+    /// fallback is excluded: its typed bytes can replace the URL when remote
+    /// fetching is disabled.
     pub fn channel_rendered_owned_disposition(&self) -> bool {
         self.marker
             .as_ref()
@@ -399,6 +406,19 @@ mod tests {
     fn kind_prefers_mime_type_over_extension() {
         // A known media MIME type wins even when the extension says otherwise.
         assert_eq!(att("photo.jpg", Some("audio/ogg")).kind(), MediaKind::Audio);
+    }
+
+    #[test]
+    fn marker_kind_dispositions_defer_enrichment() {
+        // Image and document dispositions defer because a second, payload-only
+        // classification would contradict the channel verdict; video joins
+        // them so a channel-rendered `[VIDEO:...]` marker never gains a second
+        // pipeline annotation. Audio keeps per-kind enrichment: no channel
+        // renders an inbound audio marker, so there is no verdict to defer to.
+        assert!(MarkerKind::Image.defers_enrichment());
+        assert!(MarkerKind::Video.defers_enrichment());
+        assert!(MarkerKind::Document.defers_enrichment());
+        assert!(!MarkerKind::Audio.defers_enrichment());
     }
 
     #[test]

@@ -199,13 +199,6 @@ type MediaGroupKey = (i64, String);
 #[derive(Debug)]
 struct PendingMediaGroup {
     updates: Vec<serde_json::Value>,
-    /// Caption/mention context from album members we will never materialize
-    /// (for example a video in a photo/video album). These are deliberately
-    /// kept out of `updates` so they cannot drive downloads or image markers,
-    /// but their captions still participate in aggregation and the mention
-    /// gate -- otherwise an album can lose the user's only caption, or be
-    /// silently rejected under `mention_only`.
-    unsupported: Vec<UnsupportedMember>,
     last_seen: Instant,
     last_seen_poll_generation: u64,
     /// Set while `getUpdates` returned a full page and an older update is still
@@ -213,22 +206,6 @@ struct PendingMediaGroup {
     /// member of this album cannot be observed yet. Settling here would split
     /// the album into two turns.
     saturated_page_blocked: bool,
-}
-
-/// The text-only residue of an album member that will never be downloaded.
-///
-/// Only what caption aggregation, the mention gate, and album scope validation
-/// need is retained; the full `message` object is intentionally dropped so
-/// this can never reach `parse_attachment_metadata()` or `getFile`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct UnsupportedMember {
-    /// Telegram update identity used to preserve acknowledgement ordering.
-    update_id: i64,
-    /// Kept so unsupported captions interleave with supported ones in the
-    /// album's real `message_id` order rather than being appended at the end.
-    message_id: i64,
-    caption: Option<String>,
-    scope: MediaGroupScope,
 }
 
 /// Security-relevant scope shared by every member of one Telegram album.
@@ -243,13 +220,11 @@ struct MediaGroupScope {
     sender: Option<String>,
 }
 
-/// One settled album ready for dispatch: the materializable updates plus the
-/// text-only context of its unsupported members.
+/// One settled album ready for dispatch.
 #[derive(Debug, Clone)]
 struct MediaGroupBatch {
     key: MediaGroupKey,
     updates: Vec<serde_json::Value>,
-    unsupported: Vec<UnsupportedMember>,
     last_seen: Instant,
     last_seen_poll_generation: u64,
     /// Carried through dispatch so a transient failure restores the album with
@@ -275,7 +250,7 @@ enum QueuedTelegramUpdatePayload {
     MediaGroup(MediaGroupKey),
 }
 
-/// Metadata for an incoming document or photo attachment.
+/// Metadata for an incoming document, photo, or video attachment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IncomingAttachment {
     file_id: String,
@@ -287,11 +262,12 @@ struct IncomingAttachment {
     kind: IncomingAttachmentKind,
 }
 
-/// The kind of incoming attachment (document vs photo).
+/// The kind of incoming attachment (document, photo, or video).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IncomingAttachmentKind {
     Document,
     Photo,
+    Video,
 }
 const TELEGRAM_BIND_COMMAND: &str = "/bind";
 /// Telegram Bot API allows at most 100 commands via setMyCommands.
@@ -923,16 +899,18 @@ fn telegram_audio_send_spec(
 /// The disposition Telegram commits to for an inbound attachment, resolved once
 /// against the provider's loadability contract.
 ///
-/// `parse_attachment_metadata` only yields documents and photos, so an
-/// attachment is either a loadable image the provider will accept or a
-/// document. The rendered text and the typed envelope both read this one
-/// verdict, so a document the loader would reject cannot be re-decided as an
-/// image by a later payload-only classifier.
+/// `parse_attachment_metadata` yields documents, photos, and videos, so an
+/// attachment is a loadable image, a video (declared `video/*` MIME or a video
+/// extension), or a document. The rendered text and the typed envelope both
+/// read this one verdict, so an attachment the channel rendered cannot be
+/// re-decided by a later payload-only classifier.
 fn attachment_marker_kind(
     attachment: &zeroclaw_api::media::MediaAttachment,
 ) -> zeroclaw_api::media::MarkerKind {
     if attachment.provider_loadable_image_mime().is_some() {
         zeroclaw_api::media::MarkerKind::Image
+    } else if attachment.kind() == zeroclaw_api::media::MediaKind::Video {
+        zeroclaw_api::media::MarkerKind::Video
     } else {
         zeroclaw_api::media::MarkerKind::Document
     }
@@ -944,11 +922,16 @@ fn format_attachment_content(
 ) -> String {
     match attachment_marker_kind(attachment) {
         zeroclaw_api::media::MarkerKind::Image => format!("[IMAGE:{}]", local_path.display()),
-        _ => format!(
-            "[Document: {}] {}",
-            attachment.file_name,
-            local_path.display()
-        ),
+        zeroclaw_api::media::MarkerKind::Video => format!("[VIDEO:{}]", local_path.display()),
+        // Audio and any non-visual kind keep the document rendering: channels
+        // do not produce owned audio markers on the inbound path.
+        zeroclaw_api::media::MarkerKind::Audio | zeroclaw_api::media::MarkerKind::Document => {
+            format!(
+                "[Document: {}] {}",
+                attachment.file_name,
+                local_path.display()
+            )
+        }
     }
 }
 
@@ -967,6 +950,13 @@ fn media_group_document_storage_filename(
     message_id: i64,
 ) -> String {
     format!("document_{chat_id}_{message_id}_{display_filename}")
+}
+
+/// Telegram order of the earliest update in a member list, shared by the
+/// pending-group and settled-batch helpers so "first update id" semantics
+/// live in exactly one place.
+fn first_update_id(updates: &[serde_json::Value]) -> Option<i64> {
+    updates.iter().filter_map(TelegramChannel::update_id).min()
 }
 
 fn is_http_url(target: &str) -> bool {
@@ -3700,13 +3690,6 @@ impl TelegramChannel {
             .is_some()
     }
 
-    fn is_context_only_media_group_update(update: &serde_json::Value) -> bool {
-        update
-            .get("message")
-            .and_then(|message| message.get("video"))
-            .is_some()
-    }
-
     fn should_defer_media_group_update(
         pending: &std::collections::HashMap<MediaGroupKey, PendingMediaGroup>,
         update: &serde_json::Value,
@@ -3730,53 +3713,9 @@ impl TelegramChannel {
         same_update_id || same_message_id
     }
 
-    /// Record the caption and security scope of an album member that will
-    /// never be downloaded. Deduplicated by `message_id` so a member repeated
-    /// across polls cannot duplicate its context in the aggregate.
-    fn retain_unsupported_member(
-        group: &mut PendingMediaGroup,
-        update: &serde_json::Value,
-    ) -> bool {
-        let Some(update_id) = Self::update_id(update) else {
-            return false;
-        };
-        let Some(message_id) = Self::update_message_id(update) else {
-            return false;
-        };
-        if group
-            .unsupported
-            .iter()
-            .any(|member| member.message_id == message_id)
-        {
-            return false;
-        }
-        // A member already retained as materializable must never be
-        // double-counted as text-only.
-        if group
-            .updates
-            .iter()
-            .any(|existing| Self::is_duplicate_media_group_member(existing, update))
-        {
-            return false;
-        }
-        let caption = update
-            .get("message")
-            .and_then(|message| message.get("caption"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        let scope = update
-            .get("message")
-            .map(Self::media_group_scope)
-            .unwrap_or_default();
-        group.unsupported.push(UnsupportedMember {
-            update_id,
-            message_id,
-            caption,
-            scope,
-        });
-        true
-    }
-
+    /// Buffer one supported album member; a member the parser does not handle
+    /// is acknowledged without album state. The existing listener-local map
+    /// remains the single owner of transient album state.
     fn buffer_media_group_update(
         pending: &mut std::collections::HashMap<MediaGroupKey, PendingMediaGroup>,
         update: &serde_json::Value,
@@ -3787,32 +3726,17 @@ impl TelegramChannel {
             return false;
         };
 
-        // Videos are context-only members of photo/video albums: retain them
-        // even when one arrives before the first materializable sibling. The
-        // existing listener-local map remains the single owner of transient
-        // album state. Grouped audio keeps its independent parser behavior.
+        // Every album member type the parser handles (photo, video, document,
+        // voice, audio) is materializable, so an unsupported member is
+        // acknowledged without dispatch; the existing listener-local map
+        // remains the single owner of transient album state. Grouped audio
+        // keeps its independent parser behavior.
         if !Self::is_supported_media_group_update(update) {
-            if !Self::is_context_only_media_group_update(update) {
-                return true;
-            }
-
-            let group = pending.entry(key).or_insert_with(|| PendingMediaGroup {
-                updates: Vec::new(),
-                unsupported: Vec::new(),
-                last_seen: now,
-                last_seen_poll_generation: poll_generation,
-                saturated_page_blocked: false,
-            });
-            if Self::retain_unsupported_member(group, update) {
-                group.last_seen = now;
-                group.last_seen_poll_generation = poll_generation;
-            }
             return true;
         }
 
         let group = pending.entry(key).or_insert_with(|| PendingMediaGroup {
             updates: Vec::new(),
-            unsupported: Vec::new(),
             last_seen: now,
             last_seen_poll_generation: poll_generation,
             saturated_page_blocked: false,
@@ -3881,13 +3805,6 @@ impl TelegramChannel {
                     Self::update_id(member).is_some_and(|id| id < update_id)
                         && Self::update_message_id(member).is_some_and(|id| id < message_id)
                 })
-                // Retained text-only members carry their own ordering identity,
-                // so a later unsupported sibling must hold the group pending
-                // just like a later materializable one.
-                && group
-                    .unsupported
-                    .iter()
-                    .all(|member| member.update_id < update_id && member.message_id < message_id)
         })
     }
 
@@ -3903,7 +3820,6 @@ impl TelegramChannel {
                     .updates
                     .iter()
                     .filter_map(Self::update_id)
-                    .chain(group.unsupported.iter().map(|member| member.update_id))
                     .min()
                     .unwrap_or(i64::MAX);
                 (key.clone(), earliest_update_id)
@@ -3923,7 +3839,6 @@ impl TelegramChannel {
                 MediaGroupBatch {
                     key,
                     updates: group.updates,
-                    unsupported: group.unsupported,
                     last_seen: group.last_seen,
                     last_seen_poll_generation: group.last_seen_poll_generation,
                     saturated_page_blocked: group.saturated_page_blocked,
@@ -5119,8 +5034,8 @@ impl TelegramChannel {
         self.workspace_dir.is_some() && Self::parse_attachment_metadata(message).is_some()
     }
 
-    /// True when `message` is a voice/audio or document/photo update that
-    /// one of the update parsers would permanently bail on for size or
+    /// True when `message` is a voice/audio, document/photo, or video update
+    /// that one of the update parsers would permanently bail on for size or
     /// duration alone, independent of authorization — mirroring
     /// `try_parse_voice_message`'s over-`max_duration_secs` bail (using
     /// the same `self.transcription` config the parser reads) and
@@ -5647,8 +5562,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         out
     }
 
-    /// Extract attachment metadata from an incoming Telegram message (document or photo).
-    /// Returns `None` for text-only, voice, and other unsupported message types.
+    /// Extract attachment metadata from an incoming Telegram message
+    /// (document, voice, audio, photo, video, or video note). Returns `None`
+    /// for text-only and other unsupported message types.
     fn parse_attachment_metadata(message: &serde_json::Value) -> Option<IncomingAttachment> {
         let caption = message
             .get("caption")
@@ -5723,6 +5639,45 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 caption,
                 mime_type: None,
                 kind: IncomingAttachmentKind::Photo,
+            });
+        }
+
+        // Video and round video notes materialize through the same pipeline as
+        // documents: the agent works the saved path (transcribe/digest) instead
+        // of a channel-specific handler.
+        if let Some(video) = message.get("video") {
+            let file_id = video.get("file_id")?.as_str()?.to_string();
+            let file_name = video
+                .get("file_name")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from);
+            let file_size = video.get("file_size").and_then(serde_json::Value::as_u64);
+            let mime_type = video
+                .get("mime_type")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from);
+            return Some(IncomingAttachment {
+                file_id,
+                file_name,
+                file_size,
+                caption,
+                mime_type,
+                kind: IncomingAttachmentKind::Video,
+            });
+        }
+
+        if let Some(video_note) = message.get("video_note") {
+            let file_id = video_note.get("file_id")?.as_str()?.to_string();
+            let file_size = video_note
+                .get("file_size")
+                .and_then(serde_json::Value::as_u64);
+            return Some(IncomingAttachment {
+                file_id,
+                file_name: None,
+                file_size,
+                caption,
+                mime_type: None,
+                kind: IncomingAttachmentKind::Video,
             });
         }
 
@@ -5831,15 +5786,22 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 (local_filename, display_filename)
             }
             None => {
-                // Voice notes are documents without a file name; photos keep
-                // their own prefix. Derive the extension from the Telegram
-                // file path.
-                let filename = if attachment.kind == IncomingAttachmentKind::Document {
-                    let ext = tg_file_path.rsplit('.').next().unwrap_or("ogg");
-                    format!("voice_{chat_id}_{message_id}.{ext}")
-                } else {
-                    let ext = tg_file_path.rsplit('.').next().unwrap_or("jpg");
-                    format!("photo_{chat_id}_{message_id}.{ext}")
+                // Voice notes are documents without a file name; photos and
+                // videos keep their own prefixes. Derive the extension from
+                // the Telegram file path.
+                let filename = match attachment.kind {
+                    IncomingAttachmentKind::Document => {
+                        let ext = tg_file_path.rsplit('.').next().unwrap_or("ogg");
+                        format!("voice_{chat_id}_{message_id}.{ext}")
+                    }
+                    IncomingAttachmentKind::Video => {
+                        let ext = tg_file_path.rsplit('.').next().unwrap_or("mp4");
+                        format!("video_{chat_id}_{message_id}.{ext}")
+                    }
+                    IncomingAttachmentKind::Photo => {
+                        let ext = tg_file_path.rsplit('.').next().unwrap_or("jpg");
+                        format!("photo_{chat_id}_{message_id}.{ext}")
+                    }
                 };
                 (filename.clone(), filename)
             }
@@ -5949,7 +5911,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         })
     }
 
-    /// Attempt to parse a Telegram update as a document/photo attachment.
+    /// Attempt to parse a Telegram update as a document/photo/video
+    /// attachment.
     ///
     /// Downloads the file to `{workspace_dir}/telegram_files/` and returns a
     /// parsed message with matching rendered content and typed attachment
@@ -6023,38 +5986,24 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// Group scope, authorization, and mention gating are validated before
     /// any file download. Individual attachment failures do not discard
     /// successfully materialized siblings.
-    /// Album parsing with the text-only context of unsupported members.
-    ///
-    /// `unsupported` never reaches `parse_attachment_metadata()` or `getFile`;
-    /// it only widens caption aggregation and the mention gate so a caption or
-    /// mention carried by a member we cannot download is not silently dropped.
-    async fn try_parse_media_group_with_unsupported(
-        &self,
-        updates: &[serde_json::Value],
-        unsupported: &[UnsupportedMember],
-    ) -> UpdateDisposition {
+    async fn try_parse_media_group(&self, updates: &[serde_json::Value]) -> UpdateDisposition {
         let mut ordered: Vec<&serde_json::Value> = updates.iter().collect();
         ordered.sort_by_key(|update| Self::update_message_id(update).unwrap_or(i64::MAX));
 
         // An album with no materializable members must dispatch nothing and
-        // download nothing, exactly as before -- unsupported context alone can
-        // never produce a turn.
+        // download nothing.
         let Some(anchor_update) = ordered.first().copied() else {
             return UpdateDisposition::SkipPermanent;
         };
         let Some(anchor_message) = anchor_update.get("message") else {
             return UpdateDisposition::SkipPermanent;
         };
-        let anchor_scope = Self::media_group_scope(anchor_message);
-        let supported_share_scope = ordered.iter().all(|update| {
+        let members_share_scope = ordered.iter().all(|update| {
             update.get("message").is_some_and(|message| {
                 Self::media_group_members_share_scope(anchor_message, message)
             })
         });
-        let unsupported_share_scope = unsupported
-            .iter()
-            .all(|member| Self::media_group_scopes_match(&anchor_scope, &member.scope));
-        if !supported_share_scope || !unsupported_share_scope {
+        if !members_share_scope {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -6068,8 +6017,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return UpdateDisposition::SkipPermanent;
         };
 
-        // Caption aggregation spans the whole album -- materialized members and
-        // text-only ones -- merged in `message_id` order before dedup + join.
+        // Caption aggregation spans the whole album, merged in `message_id`
+        // order before dedup + join.
         let mut captioned: Vec<(i64, &str)> = ordered
             .iter()
             .filter_map(|update| {
@@ -6081,11 +6030,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 Some((message_id, caption))
             })
             .collect();
-        captioned.extend(
-            unsupported
-                .iter()
-                .filter_map(|member| Some((member.message_id, member.caption.as_deref()?))),
-        );
         captioned.sort_by_key(|(message_id, _)| *message_id);
 
         let mut seen_captions = std::collections::HashSet::new();
@@ -9085,15 +9029,9 @@ impl TelegramChannel {
         }
     }
 
-    /// Telegram order of the earliest member held for this album, counting the
-    /// text-only members that carry their own acknowledgement identity.
+    /// Telegram order of the earliest member held for this album.
     fn pending_media_group_first_update_id(group: &PendingMediaGroup) -> Option<i64> {
-        group
-            .updates
-            .iter()
-            .filter_map(Self::update_id)
-            .chain(group.unsupported.iter().map(|member| member.update_id))
-            .min()
+        first_update_id(&group.updates)
     }
 
     /// Whether an update older than `update_id` is still unacknowledged, which
@@ -9120,7 +9058,6 @@ impl TelegramChannel {
             batch.key,
             PendingMediaGroup {
                 updates: batch.updates,
-                unsupported: batch.unsupported,
                 last_seen: batch.last_seen,
                 last_seen_poll_generation: batch.last_seen_poll_generation,
                 saturated_page_blocked: batch.saturated_page_blocked,
@@ -9129,12 +9066,7 @@ impl TelegramChannel {
     }
 
     fn media_group_batch_first_update_id(batch: &MediaGroupBatch) -> Option<i64> {
-        batch
-            .updates
-            .iter()
-            .filter_map(Self::update_id)
-            .chain(batch.unsupported.iter().map(|member| member.update_id))
-            .min()
+        first_update_id(&batch.updates)
     }
 
     async fn dispatch_media_group_batch(
@@ -9142,9 +9074,7 @@ impl TelegramChannel {
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
         batch: MediaGroupBatch,
     ) -> MediaGroupDispatchOutcome {
-        let disposition = self
-            .try_parse_media_group_with_unsupported(&batch.updates, &batch.unsupported)
-            .await;
+        let disposition = self.try_parse_media_group(&batch.updates).await;
         match disposition {
             UpdateDisposition::Parsed(message) => {
                 let Some(anchor_update) = batch.updates.first() else {
@@ -11987,7 +11917,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_media_group_member_starts_or_refreshes_context_without_download_state() {
+    fn media_group_video_member_buffers_as_materializable_album_state() {
         let mut pending = std::collections::HashMap::new();
         let started = Instant::now();
         let photo = media_group_update(1, 10, 100, "album");
@@ -11998,7 +11928,7 @@ mod tests {
                 "media_group_id": "album",
                 "from": { "id": 7, "username": "alice" },
                 "chat": { "id": 100, "type": "private" },
-                "video": { "file_id": "unsupported-video" }
+                "video": { "file_id": "album-video" }
             }
         });
 
@@ -12014,7 +11944,12 @@ mod tests {
             started + Duration::from_millis(600),
             2
         ));
-        assert_eq!(pending.values().next().unwrap().updates.len(), 1);
+        let group = pending.values().next().unwrap();
+        assert_eq!(
+            group.updates.len(),
+            2,
+            "photo and video are both materializable album members"
+        );
         assert!(TelegramChannel::should_defer_media_group_update(
             &pending, &video
         ));
@@ -12025,7 +11960,7 @@ mod tests {
                 3
             )
             .is_empty(),
-            "an unsupported sibling is still album activity"
+            "a distinct member resets last_seen across poll responses"
         );
         assert_eq!(
             TelegramChannel::take_settled_media_groups(
@@ -12037,30 +11972,41 @@ mod tests {
             1
         );
 
+        // A member the parser cannot handle (a service message) is
+        // acknowledged without album state: no pending entry, no deferral.
         let mut unsupported_only = std::collections::HashMap::new();
+        let service = serde_json::json!({
+            "update_id": 3,
+            "message": {
+                "message_id": 12,
+                "media_group_id": "service-album",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": 100, "type": "private" },
+                "new_chat_members": [{ "id": 8 }]
+            }
+        });
         assert!(TelegramChannel::buffer_media_group_update(
             &mut unsupported_only,
-            &video,
+            &service,
             started,
             1
         ));
-        let context_only = unsupported_only.values().next().unwrap();
-        assert!(context_only.updates.is_empty());
-        assert_eq!(context_only.unsupported.len(), 1);
-        assert_eq!(
-            TelegramChannel::media_group_poll_timeout_secs(&unsupported_only),
-            TELEGRAM_PENDING_MEDIA_GROUP_POLL_TIMEOUT_SECS
+        assert!(
+            unsupported_only.is_empty(),
+            "an unsupported member creates no pending album state"
+        );
+        assert!(
+            !TelegramChannel::should_defer_media_group_update(&unsupported_only, &service),
+            "an unsupported member must not defer updates for its group"
         );
 
         // The local voice patch makes voice/audio materializable document
         // attachments (`parse_attachment_metadata`), so an audio album member
-        // defers like a photo or document - unlike upstream, where audio was
-        // an unsupported type and this assertion expected no deferral. A type
-        // the parser still does not handle (e.g. video) stays non-deferring.
+        // defers like a photo, video, or document.
         let grouped_audio = serde_json::json!({
-            "update_id": 3,
+            "update_id": 4,
             "message": {
-                "message_id": 12,
+                "message_id": 13,
                 "media_group_id": "audio-album",
                 "from": { "id": 7, "username": "alice" },
                 "chat": { "id": 100, "type": "private" },
@@ -24506,6 +24452,93 @@ mod tests {
     }
 
     #[test]
+    fn parse_attachment_metadata_detects_video() {
+        let message = serde_json::json!({
+            "video": {
+                "file_id": "video_id",
+                "file_size": 98765,
+                "mime_type": "video/mp4"
+            }
+        });
+        let att = TelegramChannel::parse_attachment_metadata(&message).unwrap();
+        assert_eq!(att.kind, IncomingAttachmentKind::Video);
+        assert_eq!(att.file_id, "video_id");
+        assert_eq!(att.file_size, Some(98765));
+        assert_eq!(att.mime_type.as_deref(), Some("video/mp4"));
+        assert!(att.file_name.is_none());
+        assert!(att.caption.is_none());
+    }
+
+    #[test]
+    fn parse_attachment_metadata_detects_named_video() {
+        // Telegram video objects may carry a sender file name; it is kept for
+        // the display name, exactly like a document's.
+        let message = serde_json::json!({
+            "video": {
+                "file_id": "video_id",
+                "file_name": "birthday.mp4",
+                "mime_type": "video/quicktime"
+            },
+            "caption": "look"
+        });
+        let att = TelegramChannel::parse_attachment_metadata(&message).unwrap();
+        assert_eq!(att.kind, IncomingAttachmentKind::Video);
+        assert_eq!(att.file_name.as_deref(), Some("birthday.mp4"));
+        assert_eq!(att.caption.as_deref(), Some("look"));
+    }
+
+    #[test]
+    fn parse_attachment_metadata_detects_video_note() {
+        // Round video notes (кружки) take the same branch: no file name, no
+        // declared MIME, same materialization path as videos.
+        let message = serde_json::json!({
+            "video_note": {
+                "file_id": "circle_id",
+                "file_size": 4321,
+                "length": 240
+            }
+        });
+        let att = TelegramChannel::parse_attachment_metadata(&message).unwrap();
+        assert_eq!(att.kind, IncomingAttachmentKind::Video);
+        assert_eq!(att.file_id, "circle_id");
+        assert_eq!(att.file_size, Some(4321));
+        assert!(att.file_name.is_none());
+        assert!(att.mime_type.is_none());
+    }
+
+    #[test]
+    fn oversized_video_exceeds_parser_limits_like_documents() {
+        // Matrix 9-13 over-limit row: an oversized video is refused through
+        // the same predicate as documents, without downloading.
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        let oversized = serde_json::json!({
+            "video": {
+                "file_id": "huge_video",
+                "file_size": TELEGRAM_MAX_FILE_DOWNLOAD_BYTES + 1
+            }
+        });
+        let fitting = serde_json::json!({
+            "video": {
+                "file_id": "ok_video",
+                "file_size": TELEGRAM_MAX_FILE_DOWNLOAD_BYTES
+            }
+        });
+        assert!(
+            ch.message_exceeds_parser_limits(&oversized),
+            "an oversized video must hit the same download limit as documents"
+        );
+        assert!(
+            !ch.message_exceeds_parser_limits(&fitting),
+            "a video at the limit is still processable"
+        );
+    }
+
+    #[test]
     fn parse_attachment_metadata_extracts_caption() {
         // Document with caption
         let doc_msg = serde_json::json!({
@@ -24596,21 +24629,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn media_group_listener_retains_video_context_before_photos_across_polls() {
+    async fn media_group_video_member_materializes_with_photos_across_polls() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
         let server = MockServer::start().await;
         let first = media_group_update(11, 101, 100, "album");
-        let unsupported_video = serde_json::json!({
+        let video = serde_json::json!({
             "update_id": 10,
             "message": {
                 "message_id": 100,
                 "media_group_id": "album",
                 "from": { "id": 7, "username": "alice" },
                 "chat": { "id": 100, "type": "private" },
-                "video": { "file_id": "unsupported-video" },
+                "video": { "file_id": "album-video", "mime_type": "video/mp4" },
                 "caption": "compare these"
             }
         });
@@ -24636,7 +24669,7 @@ mod tests {
                 }
 
                 let result = match responder_index.fetch_add(1, Ordering::SeqCst) {
-                    0 => vec![unsupported_video.clone()],
+                    0 => vec![video.clone()],
                     1 => vec![first.clone()],
                     2 => vec![second.clone()],
                     3 => vec![follow_up.clone()],
@@ -24676,9 +24709,10 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        for (file_id, file_path) in [
-            ("file-101", "photos/first.jpg"),
-            ("file-102", "photos/second.jpg"),
+        for (file_id, file_path, bytes) in [
+            ("file-101", "photos/first.jpg", b"image".as_slice()),
+            ("file-102", "photos/second.jpg", b"image".as_slice()),
+            ("album-video", "videos/clip.mp4", b"video".as_slice()),
         ] {
             Mock::given(method("GET"))
                 .and(path("/botfake-token/getFile"))
@@ -24692,7 +24726,7 @@ mod tests {
                 .await;
             Mock::given(method("GET"))
                 .and(path(format!("/file/botfake-token/{file_path}")))
-                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"image"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
                 .expect(1)
                 .mount(&server)
                 .await;
@@ -24722,8 +24756,18 @@ mod tests {
             .await
             .expect("follow-up should dispatch")
             .expect("listener should remain connected");
-        assert_eq!(album.id, "telegram_100_101");
+        assert_eq!(album.id, "telegram_100_100");
         assert_eq!(album.content.matches("[IMAGE:").count(), 2);
+        assert!(
+            album.content.contains("[VIDEO:"),
+            "the video member must materialize with its photos: {}",
+            album.content
+        );
+        assert!(
+            album.content.contains("video_100_100.mp4"),
+            "the video member must keep the family naming: {}",
+            album.content
+        );
         assert!(album.content.contains("compare these"));
         assert_eq!(follow_up.content, "after album");
         assert!(rx.try_recv().is_err(), "album must dispatch exactly once");
@@ -24763,7 +24807,7 @@ mod tests {
             .collect();
         assert_eq!(
             reaction_message_ids,
-            std::collections::HashSet::from([101, 103])
+            std::collections::HashSet::from([100, 103])
         );
         let poll_timeouts: Vec<u64> = requests
             .iter()
@@ -25244,15 +25288,14 @@ mod tests {
         listener.abort();
     }
 
-    /// An ordinary same-chat message that arrives between a buffered photo and
-    /// a later retained (text-only) album member must not flush the album: the
-    /// unsupported member has its own ordering identity, so the group is not
-    /// wholly prior to the ordinary update. The ordinary message is delivered
-    /// first, the album stays pending, and both photos are delivered together
-    /// exactly once when the later sibling arrives.
+    /// An ordinary same-chat message that arrives between buffered album
+    /// members must not flush the album: the video member is materializable
+    /// like the photos, and every member after the ordinary update keeps the
+    /// group pending. The ordinary message is delivered first, the album stays
+    /// pending, and all three members are delivered together exactly once
+    /// when the later sibling arrives.
     #[tokio::test]
-    async fn media_group_stays_pending_when_a_later_unsupported_member_follows_an_ordinary_update()
-    {
+    async fn media_group_stays_pending_when_a_later_video_member_follows_an_ordinary_update() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -25260,8 +25303,8 @@ mod tests {
         let server = MockServer::start().await;
         // Poll 0: supported photo A for the album.
         let photo_a = media_group_update(10, 100, 100, "album");
-        // Poll 1: ordinary same-chat message B. Poll 2 carries unsupported
-        // video C, whose own update_id/message_id are LATER than B's.
+        // Poll 1: ordinary same-chat message B. Poll 2 carries video C, whose
+        // own update_id/message_id are LATER than B's.
         let ordinary = serde_json::json!({
             "update_id": 11,
             "message": {
@@ -25271,14 +25314,14 @@ mod tests {
                 "chat": { "id": 100, "type": "private" }
             }
         });
-        let unsupported_video = serde_json::json!({
+        let video = serde_json::json!({
             "update_id": 12,
             "message": {
                 "message_id": 102,
                 "media_group_id": "album",
                 "from": { "id": 7, "username": "alice" },
                 "chat": { "id": 100, "type": "private" },
-                "video": { "file_id": "unsupported-video" },
+                "video": { "file_id": "album-video", "mime_type": "video/mp4" },
                 "caption": "compare these"
             }
         });
@@ -25299,7 +25342,7 @@ mod tests {
                 let result = match responder_index.fetch_add(1, Ordering::SeqCst) {
                     0 => vec![photo_a.clone()],
                     1 => vec![ordinary.clone()],
-                    2 => vec![unsupported_video.clone()],
+                    2 => vec![video.clone()],
                     3 => vec![photo_d.clone()],
                     _ => Vec::new(),
                 };
@@ -25327,9 +25370,10 @@ mod tests {
                 .mount(&server)
                 .await;
         }
-        for (file_id, file_path) in [
-            ("file-100", "photos/first.jpg"),
-            ("file-103", "photos/second.jpg"),
+        for (file_id, file_path, bytes) in [
+            ("file-100", "photos/first.jpg", b"image".as_slice()),
+            ("file-103", "photos/second.jpg", b"image".as_slice()),
+            ("album-video", "videos/clip.mp4", b"video".as_slice()),
         ] {
             Mock::given(method("GET"))
                 .and(path("/botfake-token/getFile"))
@@ -25343,19 +25387,11 @@ mod tests {
                 .await;
             Mock::given(method("GET"))
                 .and(path(format!("/file/botfake-token/{file_path}")))
-                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"image"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
                 .expect(1)
                 .mount(&server)
                 .await;
         }
-        // The retained video must never be downloaded.
-        Mock::given(method("GET"))
-            .and(path("/botfake-token/getFile"))
-            .and(query_param("file_id", "unsupported-video"))
-            .respond_with(ResponseTemplate::new(500))
-            .expect(0)
-            .mount(&server)
-            .await;
 
         let workspace = tempfile::tempdir().unwrap();
         let channel = Arc::new(
@@ -25392,6 +25428,11 @@ mod tests {
             "both supported photos must arrive in one turn: {}",
             album.content
         );
+        assert!(
+            album.content.contains("[VIDEO:"),
+            "the video member must materialize in the same turn: {}",
+            album.content
+        );
         assert!(album.content.contains("compare these"));
         assert!(
             rx.try_recv().is_err(),
@@ -25425,11 +25466,11 @@ mod tests {
         let _ = listener.await;
     }
 
-    /// B1: a caption carried by an album member we never download (a video)
-    /// must still reach the model, and must not trigger a download for that
-    /// member's file.
+    /// A caption carried by a video member must reach the model exactly once,
+    /// and the video itself must materialize between the photos in
+    /// message_id order.
     #[tokio::test]
-    async fn media_group_unsupported_member_caption_participates_in_group() {
+    async fn media_group_video_member_caption_participates_in_group() {
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -25437,6 +25478,7 @@ mod tests {
         for (file_id, file_path, bytes) in [
             ("photo-a", "photos/a.jpg", b"aaa".as_slice()),
             ("photo-b", "photos/b.jpg", b"bbb".as_slice()),
+            ("video-file", "videos/clip.mp4", b"vvv".as_slice()),
         ] {
             Mock::given(method("GET"))
                 .and(path("/botfake-token/getFile"))
@@ -25494,8 +25536,8 @@ mod tests {
 
         let mut pending = std::collections::HashMap::new();
         let now = Instant::now();
-        // Match one getUpdates response whose first album member is the
-        // unsupported video. Context must survive until the photos are seen.
+        // Buffer the video before its photo siblings; it must wait for them
+        // instead of dispatching alone.
         assert!(TelegramChannel::buffer_media_group_update(
             &mut pending,
             &video,
@@ -25518,23 +25560,8 @@ mod tests {
         let group = pending.values().next().unwrap();
         assert_eq!(
             group.updates.len(),
-            2,
-            "only the two photos are materializable"
-        );
-        assert_eq!(
-            group.unsupported,
-            vec![UnsupportedMember {
-                update_id: 11,
-                message_id: 11,
-                caption: Some("@mybot compare these".to_string()),
-                scope: MediaGroupScope {
-                    chat_id: Some(-100),
-                    media_group_id: Some("album-mixed".to_string()),
-                    thread_id: None,
-                    sender: Some("user:7".to_string()),
-                },
-            }],
-            "the video's caption must be retained as text-only context"
+            3,
+            "the video is a materializable member like the two photos"
         );
 
         let batches = TelegramChannel::take_settled_media_groups(
@@ -25546,10 +25573,8 @@ mod tests {
         let batch = &batches[0];
 
         let msg = expect_parsed_media_group(
-            channel
-                .try_parse_media_group_with_unsupported(&batch.updates, &batch.unsupported)
-                .await,
-            "album with a captioned unsupported member must be admitted",
+            channel.try_parse_media_group(&batch.updates).await,
+            "album with a captioned video member must be admitted",
         );
 
         assert_eq!(
@@ -25557,39 +25582,57 @@ mod tests {
             2,
             "both supported image markers must be present"
         );
+        assert_eq!(
+            msg.content.matches("[VIDEO:").count(),
+            1,
+            "the video marker must be present exactly once"
+        );
         let first_marker = msg
             .content
             .find("photo_-100_10")
             .expect("first photo marker");
+        let video_marker = msg.content.find("video_-100_11").expect("video marker");
         let second_marker = msg
             .content
             .find("photo_-100_12")
             .expect("second photo marker");
         assert!(
-            first_marker < second_marker,
-            "image markers must stay in message_id order"
+            first_marker < video_marker && video_marker < second_marker,
+            "markers must stay in message_id order"
         );
         assert_eq!(
             msg.content.matches("@mybot compare these").count(),
             1,
             "the video's caption must appear exactly once in dispatched content"
         );
+        assert_eq!(
+            msg.attachments.len(),
+            3,
+            "each materialized member keeps its typed attachment envelope"
+        );
 
-        // The unsupported member must never have been downloaded.
+        // The video must have been downloaded next to the photos.
         let requests = server.received_requests().await.unwrap();
         assert!(
-            !requests
+            requests
                 .iter()
                 .any(|request| request.url.as_str().contains("video-file")),
-            "no getFile/download request may be issued for the unsupported member"
+            "a getFile request must be issued for the video member"
+        );
+        let saved_video = workspace.path().join("telegram_files/video_-100_11.mp4");
+        assert_eq!(
+            std::fs::read(&saved_video).unwrap(),
+            b"vvv",
+            "the video member must be saved under the family naming"
         );
     }
 
-    /// B1: under `mention_only`, a mention carried only by an unsupported
-    /// member must still admit the album. Before the fix the whole turn was
-    /// silently dropped.
+    /// B1: under `mention_only`, a mention carried only by the video member
+    /// must still admit the album — the mention gate reads the aggregated
+    /// caption of every materializable member, and the video itself is
+    /// materialized next to the photo.
     #[tokio::test]
-    async fn media_group_mention_only_admits_on_unsupported_member_mention() {
+    async fn media_group_mention_only_admits_on_video_member_mention() {
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -25606,6 +25649,20 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/file/botfake-token/photos/only.jpg"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"only".as_slice()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/botfake-token/getFile"))
+            .and(query_param("file_id", "video-file"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "videos/clip.mp4" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/file/botfake-token/videos/clip.mp4"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"video".as_slice()))
             .mount(&server)
             .await;
 
@@ -25658,25 +25715,52 @@ mod tests {
         let batch = &batches[0];
 
         let msg = expect_parsed_media_group(
-            channel
-                .try_parse_media_group_with_unsupported(&batch.updates, &batch.unsupported)
-                .await,
-            "mention_only album whose only mention is on an unsupported member must still be admitted",
+            channel.try_parse_media_group(&batch.updates).await,
+            "mention_only album whose only mention is on the video member must still be admitted",
         );
         assert!(
             msg.content.contains("[IMAGE:"),
             "the supported sibling must still be dispatched"
         );
+        assert!(
+            msg.content.contains("[VIDEO:"),
+            "the video member carrying the mention must be dispatched too: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains("look at this"),
+            "the normalized mention caption must be delivered: {}",
+            msg.content
+        );
     }
 
-    /// B1 guard (item 4): an album with zero materializable members must still
-    /// produce no dispatch and download nothing, even though its captions are
-    /// now retained.
+    /// 9-13 behavior delta: a video-only album is a fully materializable
+    /// album (uniform family: video behaves like a photo), so it produces one
+    /// turn with every member's marker. An album whose members all fail
+    /// materialization (here: over the size limit) still dispatches nothing.
     #[tokio::test]
-    async fn media_group_unsupported_only_group_still_produces_no_dispatch() {
-        use wiremock::MockServer;
+    async fn media_group_video_only_album_materializes_as_one_turn() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/botfake-token/getFile"))
+            .and(query_param("file_id", "video-file"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "videos/clip.mp4" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/file/botfake-token/videos/clip.mp4"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"video".as_slice()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
         let workspace = tempfile::tempdir().unwrap();
         let channel = TelegramChannel::new(
             "fake-token".into(),
@@ -25694,7 +25778,7 @@ mod tests {
                 "media_group_id": "album-video-only",
                 "from": { "id": 7, "username": "alice" },
                 "chat": { "id": 100, "type": "private" },
-                "video": { "file_id": "video-file" },
+                "video": { "file_id": "video-file", "mime_type": "video/mp4" },
                 "caption": "just a video"
             }
         });
@@ -25702,39 +25786,56 @@ mod tests {
         let mut pending = std::collections::HashMap::new();
         let now = Instant::now();
         TelegramChannel::buffer_media_group_update(&mut pending, &video, now, 1);
-        assert_eq!(pending.len(), 1, "context waits for a supported sibling");
+        assert_eq!(pending.len(), 1, "the video member buffers the album");
         let batches = TelegramChannel::take_settled_media_groups(
             &mut pending,
             now + TELEGRAM_MEDIA_GROUP_SETTLE_DELAY,
             2,
         );
         assert_eq!(batches.len(), 1);
-        assert!(batches[0].updates.is_empty());
+        assert_eq!(batches[0].updates.len(), 1);
 
-        // Even if such a batch is constructed directly, it must dispatch nothing.
-        let unsupported = vec![UnsupportedMember {
-            update_id: 10,
-            message_id: 10,
-            caption: Some("just a video".to_string()),
-            scope: MediaGroupScope {
-                chat_id: Some(100),
-                media_group_id: Some("album-video-only".to_string()),
-                thread_id: None,
-                sender: Some("user:7".to_string()),
-            },
-        }];
+        let msg = expect_parsed_media_group(
+            channel.try_parse_media_group(&batches[0].updates).await,
+            "a video-only album must materialize as one turn",
+        );
+        assert_eq!(
+            msg.content.matches("[VIDEO:").count(),
+            1,
+            "the video marker must be present exactly once: {}",
+            msg.content
+        );
+        assert!(msg.content.contains("video_100_10.mp4"));
+        assert!(msg.content.contains("just a video"));
+        assert_eq!(msg.attachments.len(), 1);
+        assert_eq!(
+            msg.attachments[0].marker.as_ref().map(|m| m.kind),
+            Some(zeroclaw_api::media::MarkerKind::Video)
+        );
+
+        // Guard: an album whose only member is over the download limit must
+        // still dispatch nothing (empty contents -> SkipPermanent).
+        let oversized = serde_json::json!({
+            "update_id": 20,
+            "message": {
+                "message_id": 20,
+                "media_group_id": "album-oversized",
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": 100, "type": "private" },
+                "video": {
+                    "file_id": "oversized-video",
+                    "mime_type": "video/mp4",
+                    "file_size": TELEGRAM_MAX_FILE_DOWNLOAD_BYTES + 1
+                },
+                "caption": "too big"
+            }
+        });
         assert!(
             matches!(
-                channel
-                    .try_parse_media_group_with_unsupported(&[], &unsupported)
-                    .await,
+                channel.try_parse_media_group(&[oversized]).await,
                 UpdateDisposition::SkipPermanent
             ),
-            "unsupported-only album must produce no dispatch"
-        );
-        assert!(
-            server.received_requests().await.unwrap().is_empty(),
-            "unsupported-only album must not download anything"
+            "an album with no materializable member must produce no dispatch"
         );
     }
 
@@ -25830,10 +25931,7 @@ mod tests {
 
         let msg = expect_parsed_media_group(
             channel
-                .try_parse_media_group_with_unsupported(
-                    &[oversized.clone(), second.clone(), first.clone()],
-                    &[],
-                )
+                .try_parse_media_group(&[oversized.clone(), second.clone(), first.clone()])
                 .await,
             "valid siblings should survive one failed member",
         );
@@ -25882,9 +25980,7 @@ mod tests {
                 .remove("is_topic_message");
         }
         let ordinary = expect_parsed_media_group(
-            channel
-                .try_parse_media_group_with_unsupported(&ordinary_reply_group, &[])
-                .await,
+            channel.try_parse_media_group(&ordinary_reply_group).await,
             "ordinary reply-thread album should parse",
         );
         assert_eq!(ordinary.reply_target, "-100");
@@ -25946,13 +26042,10 @@ mod tests {
 
         let msg = expect_parsed_media_group(
             channel
-                .try_parse_media_group_with_unsupported(
-                    &[
-                        document_update(10, "doc-one"),
-                        document_update(11, "doc-two"),
-                    ],
-                    &[],
-                )
+                .try_parse_media_group(&[
+                    document_update(10, "doc-one"),
+                    document_update(11, "doc-two"),
+                ])
                 .await,
             "both documents should materialize",
         );
@@ -25994,9 +26087,7 @@ mod tests {
 
         assert!(
             matches!(
-                channel
-                    .try_parse_media_group_with_unsupported(&[first, second], &[])
-                    .await,
+                channel.try_parse_media_group(&[first, second]).await,
                 UpdateDisposition::SkipPermanent
             ),
             "mixed sender album must fail closed"
@@ -26030,7 +26121,7 @@ mod tests {
                     "media_group_id": "album",
                     "from": { "id": 7, "username": "alice" },
                     "chat": { "id": 100, "type": "private" },
-                    "video": { "file_id": "unsupported-video" }
+                    "video": { "file_id": "album-video" }
                 }
             });
             let mut photo = media_group_update(2, 2, 100, "album");
@@ -26053,19 +26144,14 @@ mod tests {
                 2,
             );
             assert_eq!(batches.len(), 1);
-            assert_eq!(batches[0].unsupported.len(), 1);
             assert_eq!(
-                batches[0].unsupported[0].caption, None,
-                "captionless context must still be retained for scope validation"
+                batches[0].updates.len(),
+                2,
+                "the video buffers as a materializable member like the photo"
             );
             assert!(
                 matches!(
-                    channel
-                        .try_parse_media_group_with_unsupported(
-                            &batches[0].updates,
-                            &batches[0].unsupported,
-                        )
-                        .await,
+                    channel.try_parse_media_group(&batches[0].updates).await,
                     UpdateDisposition::SkipPermanent
                 ),
                 "mixed {mismatch} album must fail closed"
@@ -26074,7 +26160,7 @@ mod tests {
 
         assert!(
             server.received_requests().await.unwrap().is_empty(),
-            "unsupported scope validation must happen before any file request"
+            "scope validation must happen before any file request"
         );
     }
 
@@ -26131,6 +26217,66 @@ mod tests {
 
         assert_eq!(content, "[Document: report.pdf] /tmp/workspace/report.pdf");
         assert!(!content.contains("[IMAGE:"));
+    }
+
+    /// A video earns exactly one `[VIDEO:]` marker. Voice notes and audio
+    /// files keep the document label — only the video kind changes.
+    #[test]
+    fn attachment_video_content_uses_video_marker() {
+        let local_path = std::path::Path::new("/tmp/workspace/video_123_45.mp4");
+
+        let content = format_attachment_content(
+            &envelope("video_123_45.mp4", Some("video/mp4"), &[]),
+            local_path,
+        );
+
+        assert_eq!(content, "[VIDEO:/tmp/workspace/video_123_45.mp4]");
+        assert!(!content.contains("[Document:"));
+        assert!(!content.contains("[IMAGE:"));
+    }
+
+    /// A video extension without a declared MIME classifies the same way.
+    #[test]
+    fn video_extension_without_mime_uses_video_marker() {
+        let local_path = std::path::Path::new("/tmp/workspace/video_123_45.mkv");
+
+        let content = format_attachment_content(
+            &envelope("video_123_45.mkv", None, b"not image bytes"),
+            local_path,
+        );
+
+        assert_eq!(content, "[VIDEO:/tmp/workspace/video_123_45.mkv]");
+    }
+
+    /// An mp4 sent "as file" (a document object) is classified by its
+    /// mime/extension, so the marker is `[VIDEO:...]`, not `[Document:...]`.
+    #[test]
+    fn mp4_document_content_uses_video_marker() {
+        let local_path = std::path::Path::new("/tmp/workspace/telegram_files/report.mp4");
+
+        let content = format_attachment_content(
+            &envelope("report.mp4", Some("video/mp4"), b"not image bytes"),
+            local_path,
+        );
+
+        assert_eq!(content, "[VIDEO:/tmp/workspace/telegram_files/report.mp4]");
+        assert!(!content.starts_with("[Document:"));
+    }
+
+    /// Voice notes and audio files are documents by disposition even though
+    /// their extensions classify as audio — the video branch must not catch
+    /// them.
+    #[test]
+    fn audio_content_stays_document_label() {
+        for (filename, mime) in [("voice_123_45.ogg", None), ("song.mp3", Some("audio/mpeg"))] {
+            let path_str = format!("/tmp/ws/{filename}");
+            let path = std::path::Path::new(&path_str);
+            let content = format_attachment_content(&envelope(filename, mime, b"bytes"), path);
+            assert!(
+                content.starts_with("[Document:"),
+                "{filename}: audio must keep the document label, got: {content}"
+            );
+        }
     }
 
     /// An image sent "as file" must get the `[IMAGE:]` marker even without an
@@ -27200,6 +27346,201 @@ mod tests {
             msg.content.contains("[IMAGE:"),
             "content marker must still be emitted for the multimodal pipeline: {}",
             msg.content
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_video_populates_typed_video_attachment_envelope() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::media::{MarkerKind, MediaKind};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "videos/file_2.mp4" }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/videos/file_2\.mp4$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-mp4".to_vec()))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 42,
+                "chat": { "id": 123 },
+                "from": { "username": "alice", "id": 99 },
+                "video": {
+                    "file_id": "best-video",
+                    "file_size": 9,
+                    "mime_type": "video/mp4"
+                },
+                "caption": "log this automatically"
+            }
+        });
+
+        let msg = ch
+            .try_parse_attachment_message(&update)
+            .await
+            .expect_parsed("video update should parse into a channel message");
+
+        assert_eq!(msg.attachments.len(), 1);
+        assert_eq!(msg.attachments[0].kind(), MediaKind::Video);
+        assert_eq!(msg.attachments[0].data, b"fake-mp4");
+        let marker = msg.attachments[0].marker.as_ref().expect("rendered marker");
+        assert_eq!(marker.kind, MarkerKind::Video);
+        assert!(
+            msg.attachments[0].channel_rendered_owned_disposition(),
+            "the channel-owned video verdict must defer pipeline enrichment"
+        );
+        assert!(
+            msg.content.contains("[VIDEO:"),
+            "the single channel marker must reference the saved path: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains("video_123_42.mp4"),
+            "video must keep the family naming: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains("log this automatically"),
+            "caption must be delivered: {}",
+            msg.content
+        );
+        assert!(!msg.passive_context);
+    }
+
+    #[tokio::test]
+    async fn inbound_video_note_uses_family_naming() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::media::MediaKind;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "video_notes/file_3.mp4" }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/video_notes/file_3\.mp4$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-circle".to_vec()))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 43,
+                "chat": { "id": 123 },
+                "from": { "username": "alice", "id": 99 },
+                "video_note": {
+                    "file_id": "circle-video",
+                    "file_size": 12,
+                    "length": 30
+                }
+            }
+        });
+
+        let msg = ch
+            .try_parse_attachment_message(&update)
+            .await
+            .expect_parsed("video note update should parse into a channel message");
+
+        assert_eq!(msg.attachments.len(), 1);
+        assert_eq!(msg.attachments[0].kind(), MediaKind::Video);
+        assert!(
+            msg.content.contains("[VIDEO:"),
+            "a video note earns the same single marker: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains("video_123_43.mp4"),
+            "a video note keeps the family naming: {}",
+            msg.content
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_oversized_video_is_skipped_without_download() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 42,
+                "chat": { "id": 123 },
+                "from": { "username": "alice", "id": 99 },
+                "video": {
+                    "file_id": "huge-video",
+                    "file_size": TELEGRAM_MAX_FILE_DOWNLOAD_BYTES + 1,
+                    "mime_type": "video/mp4"
+                }
+            }
+        });
+
+        assert!(
+            matches!(
+                ch.try_parse_attachment_message(&update).await,
+                UpdateDisposition::SkipPermanent
+            ),
+            "an oversized video must be a permanent skip, like a document"
+        );
+        assert!(
+            mock_server.received_requests().await.unwrap().is_empty(),
+            "an oversized video must never reach getFile"
         );
     }
 
@@ -30541,6 +30882,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn golden_participation_video_addressed_in_mention_only_group_replies() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "videos/file_1.mp4" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/videos/file_1\.mp4$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 64]))
+            .mount(&mock_server)
+            .await;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let ch = golden_participation_channel(true)
+            .with_mock_api_base(mock_server.uri())
+            .with_workspace_dir(workspace.path().to_path_buf());
+
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 92,
+                "video": { "file_id": "video_file", "mime_type": "video/mp4" },
+                "caption": "  @mybot посмотри  ",
+                "from": { "id": 123, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "supergroup" }
+            }
+        });
+
+        let UpdateDisposition::Parsed(message) = ch.try_parse_attachment_message(&update).await
+        else {
+            panic!("addressed video in a mention_only group should parse");
+        };
+        assert!(
+            message.content.contains("[VIDEO:"),
+            "addressed video must materialize with the channel marker: {}",
+            message.content
+        );
+        assert!(
+            message.content.contains("@mybot посмотри"),
+            "the trimmed caption must be delivered (the media gate keeps it verbatim): {}",
+            message.content
+        );
+        assert!(!message.passive_context);
+    }
+
+    #[tokio::test]
+    async fn golden_participation_video_passive_recorded_when_listened() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "videos/file_1.mp4" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/videos/file_1\.mp4$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 64]))
+            .mount(&mock_server)
+            .await;
+
+        let workspace = tempfile::tempdir().unwrap();
+        // B3: with passive listening on, an unmentioned video in a
+        // mention_only group is materialized into the passive context,
+        // exactly like a document.
+        let ch = golden_participation_channel(true)
+            .with_passive_group_context(true)
+            .with_mock_api_base(mock_server.uri())
+            .with_workspace_dir(workspace.path().to_path_buf());
+
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 93,
+                "video": { "file_id": "video_file", "mime_type": "video/mp4" },
+                "caption": "nice clip",
+                "from": { "id": 123, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "supergroup" }
+            }
+        });
+
+        let UpdateDisposition::Parsed(message) = ch.try_parse_attachment_message(&update).await
+        else {
+            panic!("passively admitted video in a mention_only group should parse");
+        };
+        assert!(
+            message.content.contains("[VIDEO:"),
+            "passive video must still materialize with the channel marker: {}",
+            message.content
+        );
+        assert!(message.passive_context);
+    }
+
+    #[tokio::test]
+    async fn golden_participation_unaddressed_video_dropped_when_not_listened() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let ch = golden_participation_channel(true)
+            .with_mock_api_base(mock_server.uri())
+            .with_workspace_dir(workspace.path().to_path_buf());
+
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 94,
+                "video": { "file_id": "video_file", "mime_type": "video/mp4" },
+                "caption": "nice clip",
+                "from": { "id": 123, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "supergroup" }
+            }
+        });
+
+        assert!(
+            matches!(
+                ch.try_parse_attachment_message(&update).await,
+                UpdateDisposition::SkipPermanent
+            ),
+            "unaddressed video in a non-listened mention_only group must drop"
+        );
+        assert!(
+            mock_server.received_requests().await.unwrap().is_empty(),
+            "a dropped video must never reach getFile"
+        );
+    }
+
+    #[tokio::test]
     async fn golden_participation_album_mention_in_member_caption_admits_whole_album() {
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -30624,9 +31109,7 @@ mod tests {
         let batch = &batches[0];
 
         let msg = expect_parsed_media_group(
-            channel
-                .try_parse_media_group_with_unsupported(&batch.updates, &batch.unsupported)
-                .await,
+            channel.try_parse_media_group(&batch.updates).await,
             "an album whose mention sits in the last member's caption must reply as a whole",
         );
         assert!(
@@ -31231,8 +31714,7 @@ mod tests {
         let batch = &batches[0];
 
         let msg = expect_parsed_media_group(
-            ch.try_parse_media_group_with_unsupported(&batch.updates, &batch.unsupported)
-                .await,
+            ch.try_parse_media_group(&batch.updates).await,
             "an unaddressed album in a listened-to group must record passively as a whole",
         );
         assert!(
