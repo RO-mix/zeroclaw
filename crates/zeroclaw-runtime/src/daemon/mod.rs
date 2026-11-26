@@ -4530,6 +4530,7 @@ mod tests {
         config.channels.telegram.insert(
             "default".to_string(),
             zeroclaw_config::schema::TelegramConfig {
+                edited_messages: false,
                 enabled: true,
                 bot_token: "token".into(),
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
@@ -4842,6 +4843,7 @@ mod tests {
         config.channels.telegram.insert(
             "default".to_string(),
             zeroclaw_config::schema::TelegramConfig {
+                edited_messages: false,
                 enabled: true,
                 bot_token: "bot-token".into(),
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
@@ -4880,6 +4882,7 @@ mod tests {
         config.channels.telegram.insert(
             "default".to_string(),
             zeroclaw_config::schema::TelegramConfig {
+                edited_messages: false,
                 enabled: true,
                 bot_token: "bot-token".into(),
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
@@ -4942,6 +4945,7 @@ mod tests {
         config.channels.telegram.insert(
             "default".to_string(),
             zeroclaw_config::schema::TelegramConfig {
+                edited_messages: false,
                 enabled: true,
                 bot_token: "bot-token".into(),
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
