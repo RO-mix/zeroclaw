@@ -280,6 +280,7 @@ mod tests {
                 reply_queue_depth_max: 0,
                 debounce_ms: None,
                 edited_messages: false,
+                rich_messages: false,
             },
         );
         let entries = all_integrations(&config);

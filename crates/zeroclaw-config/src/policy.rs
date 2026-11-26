@@ -11776,6 +11776,7 @@ mod tests {
                 !policy.is_resolved_path_allowed(&alias),
                 "{name:?} alias to {target:?} must not be writable"
             );
+            std::fs::remove_file(alias).unwrap();
         }
 
         // A bare foreign spelling gains nothing from its name: it is resolved
