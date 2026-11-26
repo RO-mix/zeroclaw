@@ -1204,7 +1204,6 @@ const MAX_CONCURRENT_STOP_REPLIES: usize = 8;
 /// edit never announces a turn the runtime will not run.
 pub(crate) const EDIT_FRESHNESS_SECS: u64 = 600;
 
-
 /// Bound on distinct pending edits retained for latest-wins coalescing, so a
 /// flood of edits across many messages cannot pin unbounded content behind
 /// the dispatcher.
@@ -1217,7 +1216,6 @@ const EDITED_CONTENT_PREFIX: &str = "[edited] ";
 /// Marker for a stale edit recorded as passive history: the model sees an
 /// out-of-order line that revises an earlier message, not a new instruction.
 const EDITED_STALE_PREFIX: &str = "[edited earlier message] ";
-
 
 /// Key of one pending edit: the edited message's reply target, sender, and
 /// channel message id.
@@ -4028,7 +4026,6 @@ fn channel_delivery_tail_start(prompt: &str) -> Option<usize> {
         .then_some(start)
 }
 
-
 fn finalize_channel_system_prompt(ctx: &ChannelRuntimeContext, prompt: String) -> String {
     cap_channel_system_prompt(
         prompt,
@@ -4115,7 +4112,6 @@ fn build_post_builder_additions(
     let mut additions = String::new();
     if expose_text_tool_protocol {
         additions.push_str(&build_tool_instructions_for_names(
-
             tools_registry,
             effective_tool_names,
         ));
@@ -20925,7 +20921,6 @@ fn channel_trim_resync_preserves_a_concurrent_workers_later_turn_across_eviction
 pub(crate) mod tests {
     use super::*;
 
-
     #[tokio::test(flavor = "current_thread")]
     async fn ingress_task_tracker_reaps_completed_tasks_before_spawning() {
         let tracker = IngressTaskTracker::new();
@@ -30050,7 +30045,6 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             !user_content.contains("[edited] old clarification"),
             "a recorded stale edit is passive context, never a dispatch marker"
-
         );
     }
 

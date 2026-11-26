@@ -2372,8 +2372,6 @@ pub(crate) enum UpdateDisposition {
     RetryTransient,
 }
 
-
-
 /// Result of preparing the replied-to attachment before reply-context
 /// extraction, classified so callers can keep the update unacknowledged
 /// when the document is retrievable but the preparation failed transiently.
@@ -4077,7 +4075,6 @@ impl TelegramChannel {
     /// Participation table (pure function, reads only its arguments): outside
     /// a group, or without mention_only, or when addressed — Reply; otherwise
     /// PassiveContext when passive_group_context is on, Drop.
-
 
     /// Addressability predicate: a bot mention in the text/caption, or a
     /// reply to one of the bot's own messages. `None` — the bot identity is
@@ -7304,7 +7301,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// any file download. Individual attachment failures do not discard
     /// successfully materialized siblings.
     async fn try_parse_media_group(&self, updates: &[serde_json::Value]) -> UpdateDisposition {
-        self.try_parse_media_group_with_unsupported(updates, &[]).await
+        self.try_parse_media_group_with_unsupported(updates, &[])
+            .await
     }
 
     /// Album parsing with the text-only context of unsupported members.
@@ -8391,7 +8389,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
     }
 
-
     /// Pre-download a replied-to document message so `extract_reply_context`
     /// can reference it even when the original message was dropped by the
     /// mention-only gate. A quote of a document must hand the agent the
@@ -8575,27 +8572,26 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             format!("{filename_stem}.{ext}")
         };
 
-        let local_path = match Self::write_attachment_file(&save_dir, &local_filename, &media_data)
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "error_key": "telegram.reply_prep.save_failed",
-                            "error": zeroclaw_runtime::security::scrub(&format!("{}", e)),
-                        })),
-                    &format!(
-                        "Failed to save replied-to attachment to {}",
-                        save_dir.join(&local_filename).display()
-                    )
-                );
-                return ReplyPrepOutcome::RetryTransient;
-            }
-        };
+        let local_path =
+            match Self::write_attachment_file(&save_dir, &local_filename, &media_data).await {
+                Ok(p) => p,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "error_key": "telegram.reply_prep.save_failed",
+                                "error": zeroclaw_runtime::security::scrub(&format!("{}", e)),
+                            })),
+                        &format!(
+                            "Failed to save replied-to attachment to {}",
+                            save_dir.join(&local_filename).display()
+                        )
+                    );
+                    return ReplyPrepOutcome::RetryTransient;
+                }
+            };
         let path_str = local_path.to_string_lossy().into_owned();
 
         // Prefer built-in transcription when configured. Documents, photos,
@@ -24235,8 +24231,6 @@ mod tests {
         );
     }
 
-    
-    
     #[test]
     fn extract_reply_context_photo_without_cache_stays_marker() {
         let ch = TelegramChannel::new(
@@ -24940,7 +24934,7 @@ mod tests {
         assert!(ch.voice_transcriptions.lock().is_empty());
     }
 
-#[tokio::test]
+    #[tokio::test]
     async fn try_parse_voice_message_unavailable_provider_skips_permanently_and_notifies() {
         use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
