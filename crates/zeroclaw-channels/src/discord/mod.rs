@@ -7186,7 +7186,7 @@ mod tests {
             "url": audio_url,
         })];
         let transcription =
-            TranscriptionManager::new(&local_whisper_transcription_config(&whisper_server))
+            TranscriptionManager::new(&local_whisper_transcription_config(&whisper_server), None)
                 .expect("transcription manager")
                 .with_agent_transcription_provider("local_whisper");
 
@@ -7233,7 +7233,7 @@ mod tests {
             "url": audio_url,
         })];
         let transcription =
-            TranscriptionManager::new(&local_whisper_transcription_config(&whisper_server))
+            TranscriptionManager::new(&local_whisper_transcription_config(&whisper_server), None)
                 .expect("transcription manager")
                 .with_agent_transcription_provider("local_whisper");
 

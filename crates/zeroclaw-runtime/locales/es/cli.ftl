@@ -1387,6 +1387,9 @@ channel-telegram-voice-drop-file-unavailable = ⚠️ Mensaje de audio omitido: 
 channel-telegram-voice-drop-empty-transcript = ⚠️ Mensaje de audio omitido: no se pudo reconocer nada en la grabación. Inténtalo de nuevo con una grabación más clara.
 channel-telegram-voice-drop-transcription-rejected = ⚠️ Mensaje de audio omitido: el servicio de transcripción no pudo procesar esta grabación - puede ser demasiado larga o tener un formato no compatible. Prueba con una grabación más corta u otro formato.
 channel-telegram-voice-drop-retries-exhausted = ⚠️ Mensaje de audio omitido: el servicio de transcripción siguió fallando y no se pudo procesar esta grabación. Inténtalo de nuevo en un momento.
+channel-telegram-voice-drop-provider-unavailable = ⚠️ Mensaje de audio omitido: el servicio de transcripción que usa este bot no está disponible. Ponte en contacto con el operador.
+channel-telegram-voice-drop-no-provider = ⚠️ Mensaje de audio omitido: este bot no tiene configurado ningún servicio de transcripción. Ponte en contacto con el operador.
+
 channel-discord-approval-btn-allow-once = Permitir una vez
 channel-discord-approval-btn-allow-session = Permitir esta sesión
 channel-discord-approval-btn-allow-always = Permitir siempre

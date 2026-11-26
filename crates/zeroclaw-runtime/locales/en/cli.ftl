@@ -1801,6 +1801,9 @@ channel-telegram-voice-drop-file-unavailable = ⚠️ Audio message skipped: the
 channel-telegram-voice-drop-empty-transcript = ⚠️ Audio message skipped: nothing could be recognized in the recording. Please try again with a clearer recording.
 channel-telegram-voice-drop-transcription-rejected = ⚠️ Audio message skipped: the transcription service could not process this recording - it may be too long or in an unsupported format. Please try a shorter recording or a different format.
 channel-telegram-voice-drop-retries-exhausted = ⚠️ Audio message skipped: the transcription service kept failing, so this recording could not be processed. Please try sending it again in a moment.
+channel-telegram-voice-drop-provider-unavailable = ⚠️ Audio message skipped: the transcription service this bot uses is not available. Please contact the operator.
+channel-telegram-voice-drop-no-provider = ⚠️ Audio message skipped: no transcription service is configured for this bot. Please contact the operator.
+
 channel-discord-approval-btn-allow-once = Allow once
 channel-discord-approval-btn-allow-session = Allow this session
 channel-discord-approval-btn-allow-always = Always allow

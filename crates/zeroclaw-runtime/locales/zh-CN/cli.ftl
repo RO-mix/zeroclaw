@@ -1386,6 +1386,9 @@ channel-telegram-voice-drop-file-unavailable = ⚠️ 已跳过音频消息：�
 channel-telegram-voice-drop-empty-transcript = ⚠️ 已跳过音频消息：未能从录音中识别出任何内容。请用更清晰的录音重试。
 channel-telegram-voice-drop-transcription-rejected = ⚠️ 已跳过音频消息：转写服务无法处理这段录音，可能过长或格式不受支持。请尝试更短的录音或其他格式。
 channel-telegram-voice-drop-retries-exhausted = ⚠️ 已跳过音频消息：转写服务持续出错，这段录音未能处理。请稍后重发一次。
+channel-telegram-voice-drop-provider-unavailable = ⚠️ 已跳过音频消息：此机器人使用的转写服务不可用。请联系管理员。
+channel-telegram-voice-drop-no-provider = ⚠️ 已跳过音频消息：此机器人未配置转写服务。请联系管理员。
+
 channel-discord-approval-btn-allow-once = 仅本次允许
 channel-discord-approval-btn-allow-session = 本会话允许
 channel-discord-approval-btn-allow-always = 始终允许
