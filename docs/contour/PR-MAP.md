@@ -69,6 +69,16 @@
 комментариями; верификации и fmt/hygiene чистые. CI-трек у демиурга снят
 (джоб a13ad43f удалён), наблюдение — крон сессии.
 
+## Деплой fork-main в прод (26.11 ~21:57)
+
+Прод переведён с бинарника «strata + локальный патч» на «fork-main целиком»
+(head `458f3d9b78`, сборка 27м37с). Бэкапы `*.bak-20261126-215648`
+(config.toml, zeroclaw.exe, brain.db). Проверки: gateway 42621 → 200;
+cron list = 19; memory stats healthy, Total 2849, Proposals 90 (pending 70,
+expired 20 — первые истечения TTL, штатно); watchdog чист (benign skill .git).
+Локальный патч telegram-reply-mention.patch деплое не требуется — его
+функциональность в коде fork-main; apply-patches.sh не применялся.
+
 ## Политика контура (виза Ram 16.11)
 
 Форк ведём в соответствии с `origin/master`: регулярная синхронизация
