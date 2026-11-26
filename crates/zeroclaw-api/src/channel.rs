@@ -448,9 +448,10 @@ pub struct ChannelMessage {
     /// or unknown.
     pub voice_origin: bool,
     /// Set by the receiving channel when the platform delivered this message
-    /// as an edit of a previously sent message (Telegram `edited_message`).
-    /// This field creates that fact for the runtime — nothing else on the
-    /// inbound side records it. `false` means an ordinary new message.
+    /// as an edit of an earlier message (Matrix: an `m.replace` replacement
+    /// event; Telegram: an `edited_message` update). This field creates that
+    /// fact for the runtime — nothing else on the inbound side records it.
+    /// Never derived from message text. `false` means an original message.
     pub edited: bool,
 }
 
