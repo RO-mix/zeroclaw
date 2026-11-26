@@ -48,6 +48,13 @@ const VOICE_DROP_NOTICE_TIMEOUT: Duration = Duration::from_secs(10);
 /// (including its error-body read). A stalled Telegram must not pin the turn.
 const REACTION_CLEAR_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Ceiling on one replied-to attachment prep download (`getFile` plus the
+/// CDN fetch). The prep runs inline while the update queue is being
+/// processed, and the HTTP client sets no request timeout — unbounded, a
+/// stalled Telegram answer would head-of-line block every later message.
+/// The prep is best-effort, so on timeout the file is simply not cached.
+const REPLY_PREP_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+
 static ORPHAN_THINK_TAG_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(r"</?(?:redacted_)?think(?:ing)?>").expect("ORPHAN_THINK_TAG_RE must compile")
 });
@@ -271,6 +278,15 @@ type MediaGroupKey = (i64, String);
 #[derive(Debug)]
 struct PendingMediaGroup {
     updates: Vec<serde_json::Value>,
+    /// Caption/mention context from album members we will never materialize
+    /// (a member type the parser does not handle). Deliberately kept out of
+    /// `updates` so they cannot drive downloads or media markers, but their
+    /// captions still participate in aggregation and the mention gate --
+    /// otherwise an album can lose the user's only caption, or be silently
+    /// rejected under `mention_only`. Video members are NOT context-only
+    /// here: stage 9-13 made video a first-class materializable family, so
+    /// a video member goes through `updates` like photo/document.
+    unsupported: Vec<UnsupportedMember>,
     last_seen: Instant,
     last_seen_poll_generation: u64,
     /// Set while `getUpdates` returned a full page and an older update is still
@@ -278,6 +294,22 @@ struct PendingMediaGroup {
     /// member of this album cannot be observed yet. Settling here would split
     /// the album into two turns.
     saturated_page_blocked: bool,
+}
+
+/// The text-only residue of an album member that will never be downloaded.
+///
+/// Only what caption aggregation, the mention gate, and album scope validation
+/// need is retained; the full `message` object is intentionally dropped so
+/// this can never reach `parse_attachment_metadata()` or `getFile`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnsupportedMember {
+    /// Telegram update identity used to preserve acknowledgement ordering.
+    update_id: i64,
+    /// Kept so unsupported captions interleave with supported ones in the
+    /// album's real `message_id` order rather than being appended at the end.
+    message_id: i64,
+    caption: Option<String>,
+    scope: MediaGroupScope,
 }
 
 /// Security-relevant scope shared by every member of one Telegram album.
@@ -297,6 +329,9 @@ struct MediaGroupScope {
 struct MediaGroupBatch {
     key: MediaGroupKey,
     updates: Vec<serde_json::Value>,
+    /// Text-only context of members the parser does not materialize; carried
+    /// into caption aggregation and the mention gate at parse time.
+    unsupported: Vec<UnsupportedMember>,
     last_seen: Instant,
     last_seen_poll_generation: u64,
     /// Carried through dispatch so a transient failure restores the album with
@@ -2245,7 +2280,7 @@ pub struct TelegramChannel {
     /// Cache of local file paths for voice/audio messages that were downloaded
     /// on-demand so reply context can reference them even when the original
     /// message was dropped by the mention-only gate.
-    voice_file_paths: Mutex<std::collections::HashMap<String, String>>,
+    reply_file_paths: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
     ack_reactions: bool,
     tts_manager: Option<Arc<super::tts::TtsManager>>,
@@ -2338,6 +2373,25 @@ pub(crate) enum UpdateDisposition {
 }
 
 
+
+/// Result of preparing the replied-to attachment before reply-context
+/// extraction, classified so callers can keep the update unacknowledged
+/// when the document is retrievable but the preparation failed transiently.
+///
+/// For a reply such as "summarize this document" the file is the task's
+/// input: acknowledging the update with only a bare `[Document]` marker
+/// would confirm delivery of a request the agent cannot serve.
+enum ReplyPrepOutcome {
+    /// File cached (or already cached); the reply context can reference it.
+    Ready,
+    /// Nothing to prepare, or the attachment can never be retrieved
+    /// (oversize, missing file id, terminal vendor rejection, unauthorized
+    /// sender). The update proceeds without the file, as before.
+    SkipPermanent,
+    /// Lookup, download, or write failed transiently. The update must be
+    /// retried from the same offset so the file can still reach the agent.
+    RetryTransient,
+}
 
 enum AttachmentMaterialization {
     Ready {
@@ -3923,7 +3977,7 @@ impl TelegramChannel {
             transcription: None,
             transcription_manager: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
-            voice_file_paths: Mutex::new(std::collections::HashMap::new()),
+            reply_file_paths: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
             ack_reactions: true,
             tts_manager: None,
@@ -4828,9 +4882,68 @@ impl TelegramChannel {
         same_update_id || same_message_id
     }
 
+    /// A video member the attachment parser rejected: never downloaded, but
+    /// its caption is still context (see [`Self::retain_unsupported_member`]).
+    /// Ordinary video members are materializable since stage 9-13 and take
+    /// the `updates` path instead.
+    fn is_context_only_media_group_update(update: &serde_json::Value) -> bool {
+        update
+            .get("message")
+            .and_then(|message| message.get("video"))
+            .is_some()
+    }
+
+    /// Record the caption and security scope of an album member that will
+    /// never be downloaded. Deduplicated by `message_id` so a member repeated
+    /// across polls cannot duplicate its context in the aggregate.
+    fn retain_unsupported_member(
+        group: &mut PendingMediaGroup,
+        update: &serde_json::Value,
+    ) -> bool {
+        let Some(update_id) = Self::update_id(update) else {
+            return false;
+        };
+        let Some(message_id) = Self::update_message_id(update) else {
+            return false;
+        };
+        if group
+            .unsupported
+            .iter()
+            .any(|member| member.message_id == message_id)
+        {
+            return false;
+        }
+        // A member already retained as materializable must never be
+        // double-counted as text-only.
+        if group
+            .updates
+            .iter()
+            .any(|existing| Self::is_duplicate_media_group_member(existing, update))
+        {
+            return false;
+        }
+        let caption = update
+            .get("message")
+            .and_then(|message| message.get("caption"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let scope = update
+            .get("message")
+            .map(Self::media_group_scope)
+            .unwrap_or_default();
+        group.unsupported.push(UnsupportedMember {
+            update_id,
+            message_id,
+            caption,
+            scope,
+        });
+        true
+    }
+
     /// Buffer one supported album member; a member the parser does not handle
-    /// is acknowledged without album state. The existing listener-local map
-    /// remains the single owner of transient album state.
+    /// is retained as text-only context (see [`Self::retain_unsupported_member`]).
+    /// The existing listener-local map remains the single owner of transient
+    /// album state.
     fn buffer_media_group_update(
         pending: &mut std::collections::HashMap<MediaGroupKey, PendingMediaGroup>,
         update: &serde_json::Value,
@@ -4841,17 +4954,35 @@ impl TelegramChannel {
             return false;
         };
 
-        // Every album member type the parser handles (photo, video, document,
-        // voice, audio) is materializable, so an unsupported member is
-        // acknowledged without dispatch; the existing listener-local map
-        // remains the single owner of transient album state. Grouped audio
-        // keeps its independent parser behavior.
+        // A member the parser does not handle is acknowledged; only a
+        // context-only member (a video the attachment parser rejects — stage
+        // 9-13 made ordinary video materializable, so this row is narrow) is
+        // retained as text-only context: its caption still participates in
+        // aggregation and the mention gate. Anything else — service
+        // messages, unknown types — creates no album state at all. The
+        // existing listener-local map remains the single owner of transient
+        // album state. Grouped audio keeps its independent parser behavior.
         if !Self::is_supported_media_group_update(update) {
+            if !Self::is_context_only_media_group_update(update) {
+                return true;
+            }
+            let group = pending.entry(key).or_insert_with(|| PendingMediaGroup {
+                updates: Vec::new(),
+                unsupported: Vec::new(),
+                last_seen: now,
+                last_seen_poll_generation: poll_generation,
+                saturated_page_blocked: false,
+            });
+            if Self::retain_unsupported_member(group, update) {
+                group.last_seen = now;
+                group.last_seen_poll_generation = poll_generation;
+            }
             return true;
         }
 
         let group = pending.entry(key).or_insert_with(|| PendingMediaGroup {
             updates: Vec::new(),
+            unsupported: Vec::new(),
             last_seen: now,
             last_seen_poll_generation: poll_generation,
             saturated_page_blocked: false,
@@ -4920,6 +5051,13 @@ impl TelegramChannel {
                     Self::update_id(member).is_some_and(|id| id < update_id)
                         && Self::update_message_id(member).is_some_and(|id| id < message_id)
                 })
+                // Retained text-only members carry their own ordering
+                // identity, so a later unsupported sibling must hold the
+                // group pending just like a later materializable one.
+                && group
+                    .unsupported
+                    .iter()
+                    .all(|member| member.update_id < update_id && member.message_id < message_id)
         })
     }
 
@@ -4935,6 +5073,7 @@ impl TelegramChannel {
                     .updates
                     .iter()
                     .filter_map(Self::update_id)
+                    .chain(group.unsupported.iter().map(|member| member.update_id))
                     .min()
                     .unwrap_or(i64::MAX);
                 (key.clone(), earliest_update_id)
@@ -4954,6 +5093,7 @@ impl TelegramChannel {
                 MediaGroupBatch {
                     key,
                     updates: group.updates,
+                    unsupported: group.unsupported,
                     last_seen: group.last_seen,
                     last_seen_poll_generation: group.last_seen_poll_generation,
                     saturated_page_blocked: group.saturated_page_blocked,
@@ -7150,23 +7290,42 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// any file download. Individual attachment failures do not discard
     /// successfully materialized siblings.
     async fn try_parse_media_group(&self, updates: &[serde_json::Value]) -> UpdateDisposition {
+        self.try_parse_media_group_with_unsupported(updates, &[]).await
+    }
+
+    /// Album parsing with the text-only context of unsupported members.
+    ///
+    /// `unsupported` never reaches `parse_attachment_metadata()` or `getFile`;
+    /// it only widens caption aggregation and the mention gate so a caption or
+    /// mention carried by a member we cannot materialize is not silently
+    /// dropped.
+    async fn try_parse_media_group_with_unsupported(
+        &self,
+        updates: &[serde_json::Value],
+        unsupported: &[UnsupportedMember],
+    ) -> UpdateDisposition {
         let mut ordered: Vec<&serde_json::Value> = updates.iter().collect();
         ordered.sort_by_key(|update| Self::update_message_id(update).unwrap_or(i64::MAX));
 
         // An album with no materializable members must dispatch nothing and
-        // download nothing.
+        // download nothing -- unsupported context alone can never produce a
+        // turn.
         let Some(anchor_update) = ordered.first().copied() else {
             return UpdateDisposition::SkipPermanent;
         };
         let Some(anchor_message) = anchor_update.get("message") else {
             return UpdateDisposition::SkipPermanent;
         };
-        let members_share_scope = ordered.iter().all(|update| {
+        let anchor_scope = Self::media_group_scope(anchor_message);
+        let supported_share_scope = ordered.iter().all(|update| {
             update.get("message").is_some_and(|message| {
                 Self::media_group_members_share_scope(anchor_message, message)
             })
         });
-        if !members_share_scope {
+        let unsupported_share_scope = unsupported
+            .iter()
+            .all(|member| Self::media_group_scopes_match(&anchor_scope, &member.scope));
+        if !supported_share_scope || !unsupported_share_scope {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -7193,6 +7352,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 Some((message_id, caption))
             })
             .collect();
+        // Caption aggregation spans the whole album -- materialized members
+        // and text-only ones -- merged in `message_id` order before dedup.
+        captioned.extend(
+            unsupported
+                .iter()
+                .filter_map(|member| Some((member.message_id, member.caption.as_deref()?))),
+        );
         captioned.sort_by_key(|(message_id, _)| *message_id);
 
         let mut seen_captions = std::collections::HashSet::new();
@@ -7877,7 +8043,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 let key = format!("{cid}:{mid}");
                 if let Some(text) = self.voice_transcriptions.lock().get(&key) {
                     format!("[Voice] {text}")
-                } else if let Some(path) = self.voice_file_paths.lock().get(&key) {
+                } else if let Some(path) = self.reply_file_paths.lock().get(&key) {
                     let file_name = std::path::Path::new(path)
                         .file_name()
                         .and_then(|s| s.to_str())
@@ -7902,7 +8068,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .and_then(serde_json::Value::as_i64);
             let body = if let (Some(mid), Some(cid)) = (reply_mid, chat_id) {
                 let key = format!("{cid}:{mid}");
-                if let Some(path) = self.voice_file_paths.lock().get(&key) {
+                if let Some(path) = self.reply_file_paths.lock().get(&key) {
                     let file_name = std::path::Path::new(path)
                         .file_name()
                         .and_then(|s| s.to_str())
@@ -7927,7 +8093,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .and_then(serde_json::Value::as_i64);
             let body = if let (Some(mid), Some(cid)) = (reply_mid, chat_id) {
                 let key = format!("{cid}:{mid}");
-                if let Some(path) = self.voice_file_paths.lock().get(&key) {
+                if let Some(path) = self.reply_file_paths.lock().get(&key) {
                     let file_name = std::path::Path::new(path)
                         .file_name()
                         .and_then(|s| s.to_str())
@@ -7952,7 +8118,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .and_then(serde_json::Value::as_i64);
             let body = if let (Some(mid), Some(cid)) = (reply_mid, chat_id) {
                 let key = format!("{cid}:{mid}");
-                if let Some(path) = self.voice_file_paths.lock().get(&key) {
+                if let Some(path) = self.reply_file_paths.lock().get(&key) {
                     let file_name = std::path::Path::new(path)
                         .file_name()
                         .and_then(|s| s.to_str())
@@ -8182,21 +8348,26 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
     }
 
+
+    /// Pre-download a replied-to document message so `extract_reply_context`
+    /// can reference it even when the original message was dropped by the
+    /// mention-only gate. A quote of a document must hand the agent the
+    /// file, not a bare "[Document]" marker.
     /// Pre-download a replied-to voice/audio/document/photo/video message so
     /// `extract_reply_context` can reference it even when the original
-    /// message was dropped by the mention-only gate. If built-in
-    /// transcription is enabled, the audio is also transcribed and cached;
-    /// otherwise only the local file path is kept so the agent can call
-    /// `transcriber__transcribe_audio` itself. Replied-to documents,
-    /// photos, and videos are downloaded and path-cached the same way — a
-    /// quote of an attachment must hand the agent the file, not a bare
-    /// "[Document]"/"[Photo]"/"[Video]" marker.
-    async fn prepopulate_reply_attachment_context(&self, update: &serde_json::Value) {
+    /// message was dropped by the mention-only gate. A quote of an
+    /// attachment must hand the agent the file, not a bare marker. The
+    /// outcome is classified so callers can hold the update unacknowledged
+    /// when the file is retrievable but the preparation failed transiently.
+    async fn prepopulate_reply_attachment_context(
+        &self,
+        update: &serde_json::Value,
+    ) -> ReplyPrepOutcome {
         let Some(message) = update.get("message") else {
-            return;
+            return ReplyPrepOutcome::SkipPermanent;
         };
         let Some(reply) = message.get("reply_to_message") else {
-            return;
+            return ReplyPrepOutcome::SkipPermanent;
         };
         let is_document = reply.get("document").is_some();
         let is_audio = reply.get("voice").is_some() || reply.get("audio").is_some();
@@ -8212,29 +8383,28 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let is_photo = photo_file_id.is_some();
         let is_video = reply.get("video").is_some();
         if !is_audio && !is_document && !is_photo && !is_video {
-            return;
+            return ReplyPrepOutcome::SkipPermanent;
         }
-
-        let (username, sender_id, _) = Self::extract_sender_info(message);
-        let mut identities = vec![username.as_str()];
-        if let Some(id) = sender_id.as_deref() {
-            identities.push(id);
-        }
-        if !self.is_any_user_allowed(identities.iter().copied()) {
-            return;
+        // Same allowlist source as the message parsers: never the
+        // `"unknown"` display placeholder, only genuine identities.
+        if !self.is_any_user_allowed(
+            Self::authorization_identities(message)
+                .iter()
+                .map(String::as_str),
+        ) {
+            return ReplyPrepOutcome::SkipPermanent;
         }
         // FR4 (ADR Channel Layering): admission before materialization.
         // When this update itself would be dropped by the participation
         // gate, the replied-to attachment can never surface in any delivered
-        // context — do not download it. Fire-and-forget: `false` means
-        // "skip the prefetch", nothing else.
+        // context -- do not download it.
         if !self.reply_update_admitted(message) {
-            return;
+            return ReplyPrepOutcome::SkipPermanent;
         }
 
         let reply_mid = match reply.get("message_id").and_then(serde_json::Value::as_i64) {
             Some(m) => m,
-            None => return,
+            None => return ReplyPrepOutcome::SkipPermanent,
         };
         let chat_id = match message
             .get("chat")
@@ -8242,41 +8412,63 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .and_then(serde_json::Value::as_i64)
         {
             Some(c) => c,
-            None => return,
+            None => return ReplyPrepOutcome::SkipPermanent,
         };
         let key = format!("{chat_id}:{reply_mid}");
         {
-            let paths = self.voice_file_paths.lock();
+            let paths = self.reply_file_paths.lock();
             let texts = self.voice_transcriptions.lock();
             if paths.contains_key(&key) || texts.contains_key(&key) {
-                return;
+                return ReplyPrepOutcome::Ready;
             }
         }
 
-        let save_dir = match self.attachment_save_dir().await {
-            Ok(dir) => dir,
-            Err(e) => {
-                // Fire-and-forget stays silent to the user, but a persistent
-                // disk failure must leave a trace — otherwise "the agent
-                // never sees the replied-to file" is undiagnosable.
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{e:?}")})),
-                    "Reply attachment prefetch skipped: telegram_files unavailable"
-                );
-                return;
-            }
+        let workspace = match self.workspace_dir.as_ref() {
+            Some(w) => w,
+            None => return ReplyPrepOutcome::SkipPermanent,
         };
+        let save_dir = workspace.join("telegram_files");
+        if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "error_key": "telegram.reply_prep.save_dir_failed",
+                        "error": zeroclaw_runtime::security::scrub(&format!("{}", e)),
+                    })),
+                "Failed to create telegram_files directory for replied-to attachment"
+            );
+            return ReplyPrepOutcome::RetryTransient;
+        }
+
+        // Declared size comes from the update JSON before any download --
+        // the same ceiling the ordinary attachment path applies.
+        let declared_size = reply
+            .get("document")
+            .and_then(|doc| doc.get("file_size"))
+            .and_then(serde_json::Value::as_u64);
+        if let Some(size) = declared_size
+            && size > TELEGRAM_MAX_FILE_DOWNLOAD_BYTES
+        {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!(
+                    "Skipping replied-to attachment: file size {size} bytes exceeds {} MB limit",
+                    TELEGRAM_MAX_FILE_DOWNLOAD_BYTES / (1024 * 1024)
+                )
+            );
+            return ReplyPrepOutcome::SkipPermanent;
+        }
 
         let (file_id, duration, filename_stem) = if is_document {
             let Some(doc) = reply.get("document") else {
-                return;
+                return ReplyPrepOutcome::SkipPermanent;
             };
             let file_id = match doc.get("file_id").and_then(serde_json::Value::as_str) {
                 Some(f) => f.to_string(),
-                None => return,
+                None => return ReplyPrepOutcome::SkipPermanent,
             };
             let file_name = doc
                 .get("file_name")
@@ -8288,17 +8480,17 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             (file_id, 0, format!("photo_{chat_id}_{reply_mid}"))
         } else if is_video {
             let Some(video) = reply.get("video") else {
-                return;
+                return ReplyPrepOutcome::SkipPermanent;
             };
             let file_id = match video.get("file_id").and_then(serde_json::Value::as_str) {
                 Some(f) => f.to_string(),
-                None => return,
+                None => return ReplyPrepOutcome::SkipPermanent,
             };
             (file_id, 0, format!("video_{chat_id}_{reply_mid}"))
         } else {
             let (file_id, duration) = match Self::parse_voice_metadata(reply) {
                 Some(v) => v,
-                None => return,
+                None => return ReplyPrepOutcome::SkipPermanent,
             };
             let stem = if reply.get("voice").is_some() {
                 format!("voice_{chat_id}_{reply_mid}")
@@ -8308,8 +8500,20 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             (file_id, duration, stem)
         };
 
-        let Ok((tg_file_path, media_data)) = self.fetch_media(&file_id).await else {
-            return;
+        let (tg_file_path, media_data) = match self.fetch_media(&file_id).await {
+            Ok(v) => v,
+            Err(MediaFetchError::Lookup(err)) => match err.kind {
+                FileLookupFailure::Permanent => {
+                    return ReplyPrepOutcome::SkipPermanent;
+                }
+                FileLookupFailure::Transient => {
+                    return ReplyPrepOutcome::RetryTransient;
+                }
+            },
+            // CDN download failure is always retryable.
+            Err(MediaFetchError::Download(_)) => {
+                return ReplyPrepOutcome::RetryTransient;
+            }
         };
 
         let local_filename = if is_document {
@@ -8328,10 +8532,26 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             format!("{filename_stem}.{ext}")
         };
 
-        let Ok(local_path) =
-            Self::write_attachment_file(&save_dir, &local_filename, &media_data).await
-        else {
-            return;
+        let local_path = match Self::write_attachment_file(&save_dir, &local_filename, &media_data)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error_key": "telegram.reply_prep.save_failed",
+                            "error": zeroclaw_runtime::security::scrub(&format!("{}", e)),
+                        })),
+                    &format!(
+                        "Failed to save replied-to attachment to {}",
+                        save_dir.join(&local_filename).display()
+                    )
+                );
+                return ReplyPrepOutcome::RetryTransient;
+            }
         };
         let path_str = local_path.to_string_lossy().into_owned();
 
@@ -8358,18 +8578,19 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     cache.clear();
                 }
                 cache.insert(key, text);
-                return;
+                return ReplyPrepOutcome::Ready;
             }
         }
 
         // Fall back to caching the local path so the agent can transcribe itself.
         {
-            let mut cache = self.voice_file_paths.lock();
+            let mut cache = self.reply_file_paths.lock();
             if cache.len() >= 100 {
                 cache.clear();
             }
             cache.insert(key, path_str);
         }
+        ReplyPrepOutcome::Ready
     }
 
     /// Forum-topic thread id for history keying and reply routing, if this
@@ -10014,6 +10235,15 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// The attempt count is diagnostic only until it reaches
     /// [`Self::MAX_TRANSIENT_UPDATE_ATTEMPTS`].
     const TRANSIENT_RETRY_DELAY_SECS: u64 = 2;
+    /// How many times reply-document preparation may hold the offset for one
+    /// update (greptile P1, review of 17.11): past the cap a transient prep
+    /// failure stops blocking the queue. Parsing then decides — a message
+    /// the parsers would skip (mention-only gate, no bot mention) can never
+    /// stall later updates behind a failing file server, and a deliverable
+    /// reply degrades to the bare `[Document]` marker, the pre-feature
+    /// behavior for replies. The counter is the shared `transient_retry`
+    /// slot — no new state.
+    const REPLY_PREP_MAX_ATTEMPTS: u32 = 3;
 
     /// Consecutive transient attempts after which a single update is
     /// acknowledged as undeliverable instead of retried forever.
@@ -10151,6 +10381,29 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 *transient_retry = None;
             }
             return UpdateOutcome::Advanced;
+        }
+
+        // Download and cache the replied-to document before parsing, so the
+        // reply context can reference it even when the original message was
+        // dropped by the mention-only gate. A transient preparation failure
+        // holds the update unacknowledged only up to REPLY_PREP_MAX_ATTEMPTS
+        // times (greptile P1, 17.11): past the cap the update falls through
+        // to parsing, so a message the parsers would skip can never keep
+        // later updates waiting behind a failing file server. The document
+        // is the task's input, and acking the reply with only a bare
+        // `[Document]` marker would confirm delivery of a request the agent
+        // cannot serve — that trade-off stands only while the hold is
+        // bounded.
+        if let ReplyPrepOutcome::RetryTransient =
+            self.prepopulate_reply_attachment_context(update).await
+        {
+            let held = match transient_retry {
+                Some((tracked_uid, n)) if Some(*tracked_uid) == uid => *n,
+                _ => 0,
+            };
+            if held < Self::REPLY_PREP_MAX_ATTEMPTS {
+                return self.pause_for_transient_update(uid, transient_retry).await;
+            }
         }
 
         // `parse_update_message` handles text messages and has no fallible
@@ -10409,6 +10662,7 @@ impl TelegramChannel {
             batch.key,
             PendingMediaGroup {
                 updates: batch.updates,
+                unsupported: batch.unsupported,
                 last_seen: batch.last_seen,
                 last_seen_poll_generation: batch.last_seen_poll_generation,
                 saturated_page_blocked: batch.saturated_page_blocked,
@@ -10424,8 +10678,39 @@ impl TelegramChannel {
         &self,
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
         batch: MediaGroupBatch,
+        hold_on_prep_failure: bool,
     ) -> MediaGroupDispatchOutcome {
-        let disposition = self.try_parse_media_group(&batch.updates).await;
+        // Cache replied-to attachments of album members before parsing, so
+        // the anchor's reply context can reference them exactly like an
+        // ordinary update does in `process_update`. Best-effort and
+        // idempotent: members without a reply return immediately, and an
+        // already-cached file is not re-downloaded. One transient member
+        // failure requeues the whole batch — but only while
+        // `hold_on_prep_failure` stands (the shared REPLY_PREP_MAX_ATTEMPTS
+        // budget, same greptile P1 as `process_update`): past the cap the
+        // batch falls through to parsing, so a skipped album cannot stall
+        // the queue behind a failing file server.
+        let mut prep_outcome = ReplyPrepOutcome::Ready;
+        for update in &batch.updates {
+            match self.prepopulate_reply_attachment_context(update).await {
+                ReplyPrepOutcome::RetryTransient if hold_on_prep_failure => {
+                    prep_outcome = ReplyPrepOutcome::RetryTransient;
+                }
+                ReplyPrepOutcome::SkipPermanent
+                    if matches!(prep_outcome, ReplyPrepOutcome::Ready) =>
+                {
+                    prep_outcome = ReplyPrepOutcome::SkipPermanent;
+                }
+                _ => {}
+            }
+        }
+        if matches!(prep_outcome, ReplyPrepOutcome::RetryTransient) {
+            return MediaGroupDispatchOutcome::Retry(batch);
+        }
+        let disposition = self
+            .try_parse_media_group_with_unsupported(&batch.updates, &batch.unsupported)
+            .await;
+
         match disposition {
             UpdateDisposition::Parsed(message) => {
                 let Some(anchor_update) = batch.updates.first() else {
@@ -10493,7 +10778,23 @@ impl TelegramChannel {
     ) -> UpdateOutcome {
         let mut batches = batches.into_iter();
         while let Some(batch) = batches.next() {
-            match self.dispatch_media_group_batch(tx, batch).await {
+            // Shared REPLY_PREP_MAX_ATTEMPTS budget (greptile P1): the batch
+            // may hold the offset for reply-prep only while the tracked
+            // attempt count for its first update is below the cap.
+            let hold_on_prep_failure = match (
+                Self::media_group_batch_first_update_id(&batch),
+                *transient_retry,
+            ) {
+                (Some(tracked_uid), Some((uid, n))) => {
+                    uid == tracked_uid && n < Self::REPLY_PREP_MAX_ATTEMPTS
+                }
+                (Some(_), None) => true,
+                (None, _) => true,
+            };
+            match self
+                .dispatch_media_group_batch(tx, batch, hold_on_prep_failure)
+                .await
+            {
                 MediaGroupDispatchOutcome::Delivered(key) => {
                     Self::mark_media_group_delivered(queue, &key);
                     *transient_retry = None;
@@ -23689,51 +23990,12 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn extract_reply_context_text_message() {
-        let mention_only = false;
-        let ch = TelegramChannel::new(
-            "t".into(),
-            "telegram_test_alias",
-            Arc::new(|| vec!["*".into()]),
-            mention_only,
-        );
-        let msg = serde_json::json!({
-            "reply_to_message": {
-                "from": { "username": "alice" },
-                "text": "Hello world"
-            }
-        });
-        let ctx = ch.extract_reply_context(&msg).unwrap();
-        assert_eq!(ctx, "> @alice:\n> Hello world");
-    }
-
-    #[test]
-    fn extract_reply_context_voice_message() {
-        let mention_only = false;
-        let ch = TelegramChannel::new(
-            "t".into(),
-            "telegram_test_alias",
-            Arc::new(|| vec!["*".into()]),
-            mention_only,
-        );
-        let msg = serde_json::json!({
-            "reply_to_message": {
-                "from": { "username": "bob" },
-                "voice": { "file_id": "abc", "duration": 5 }
-            }
-        });
-        let ctx = ch.extract_reply_context(&msg).unwrap();
-        assert_eq!(ctx, "> @bob:\n> [Voice message]");
-    }
-
-    #[test]
     fn extract_reply_context_document_without_cache_stays_marker() {
-        let mention_only = false;
         let ch = TelegramChannel::new(
             "t".into(),
             "telegram_test_alias",
             Arc::new(|| vec!["*".into()]),
-            mention_only,
+            false,
         );
         let msg = serde_json::json!({
             "reply_to_message": {
@@ -23780,16 +24042,16 @@ mod tests {
                 "message_id": 44,
                 "chat": { "id": -100_200_300, "type": "supergroup" },
                 "from": { "username": "alice", "id": 99 },
-                "text": "а что в этом документе?",
+                "text": "what is in this document?",
                 "reply_to_message": {
                     "message_id": 40,
                     "from": { "username": "bob", "id": 77 },
                     "document": {
                         "file_id": "doc-file-id",
-                        "file_name": "Отчёт Q3 final.pdf",
+                        "file_name": "Q3 report final.pdf",
                         "mime_type": "application/pdf"
                     },
-                    "caption": "Эксклюзивно и конфиденциально"
+                    "caption": "Confidential"
                 }
             }
         });
@@ -23800,7 +24062,7 @@ mod tests {
             .extract_reply_context(&update["message"])
             .expect("reply context should be present");
         assert!(
-            ctx.contains("[Document: doc_-100200300_40_") && ctx.contains("Q3_final.pdf"),
+            ctx.contains("[Document: doc_-100200300_40_") && ctx.contains("Q3_report_final.pdf"),
             "quoted document must expose the downloaded path, got: {ctx}"
         );
         assert!(
@@ -23808,7 +24070,7 @@ mod tests {
             "the path must point into the workspace, got: {ctx}"
         );
         assert!(
-            ctx.contains("Эксклюзивно и конфиденциально"),
+            ctx.contains("Confidential"),
             "the caption must follow the document path, got: {ctx}"
         );
         let saved = std::fs::read_dir(workspace.path().join("telegram_files"))
@@ -23817,6 +24079,111 @@ mod tests {
         assert_eq!(saved, 1, "the replied-to document must be downloaded once");
     }
 
+    #[tokio::test]
+    async fn transient_getfile_failure_holds_update_until_document_arrives() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+
+        // First getFile call fails transiently (a bare 5xx with no
+        // structured terminal envelope), the next one succeeds.
+        let get_file_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&get_file_calls);
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(move |_req: &wiremock::Request| {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    ResponseTemplate::new(500)
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "ok": true,
+                        "result": { "file_path": "documents/report.pdf" }
+                    }))
+                }
+            })
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/documents/report\.pdf$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"%PDF-1.7 fake".to_vec()))
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(4);
+        let mut transient_retry = None;
+        let update = serde_json::json!({
+            "update_id": 55,
+            "message": {
+                "message_id": 45,
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "from": { "username": "alice", "id": 99 },
+                "text": "summarize this document",
+                "reply_to_message": {
+                    "message_id": 40,
+                    "from": { "username": "bob", "id": 77 },
+                    "document": {
+                        "file_id": "doc-file-id",
+                        "file_name": "Q3 report final.pdf"
+                    }
+                }
+            }
+        });
+
+        // First pass: getFile fails transiently. The update must not be
+        // acknowledged or delivered — the document is the task's input, and
+        // acking the reply with only a bare `[Document]` marker would
+        // confirm delivery of a request the agent cannot serve.
+        let outcome = ch.process_update(&update, &tx, &mut transient_retry).await;
+        assert!(
+            matches!(outcome, UpdateOutcome::StopBatch),
+            "a transient prep failure must stop the batch so the offset stays put"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "document-dependent message must not be delivered without its file"
+        );
+        assert_eq!(transient_retry, Some((55, 1)));
+
+        // Second pass: getFile succeeds, the file downloads, and the
+        // message is delivered with the document path in the reply context.
+        let outcome = ch.process_update(&update, &tx, &mut transient_retry).await;
+        assert!(
+            matches!(outcome, UpdateOutcome::Advanced),
+            "retry after a transient getFile failure must deliver"
+        );
+        assert_eq!(transient_retry, None);
+        let msg = rx
+            .try_recv()
+            .expect("document-dependent message must be delivered once its file arrives");
+        assert!(
+            msg.content.contains("[Document: doc_-100200300_40_")
+                && msg.content.contains("Q3_report_final.pdf"),
+            "reply context must reference the downloaded file, got: {}",
+            msg.content
+        );
+        assert!(
+            msg.content
+                .contains(&workspace.path().to_string_lossy().to_string()),
+            "the path must point into the workspace, got: {}",
+            msg.content
+        );
+    }
+
+    
+    
     #[test]
     fn extract_reply_context_photo_without_cache_stays_marker() {
         let ch = TelegramChannel::new(
@@ -34694,7 +35061,7 @@ mod tests {
             .await;
 
         assert!(
-            ch.voice_file_paths.lock().is_empty(),
+            ch.reply_file_paths.lock().is_empty(),
             "a gated reply must not prefetch the replied-to document"
         );
         assert!(ch.voice_transcriptions.lock().is_empty());
@@ -34738,7 +35105,7 @@ mod tests {
         ch.prepopulate_reply_attachment_context(&update).await;
 
         assert!(
-            ch.voice_file_paths.lock().contains_key("-100200300:30"),
+            ch.reply_file_paths.lock().contains_key("-100200300:30"),
             "an addressed reply must prefetch the replied-to document"
         );
     }
@@ -34820,7 +35187,7 @@ mod tests {
 
         ch.prepopulate_reply_attachment_context(&update).await;
 
-        assert!(ch.voice_file_paths.lock().is_empty());
+        assert!(ch.reply_file_paths.lock().is_empty());
         assert!(ch.voice_transcriptions.lock().is_empty());
     }
 
@@ -34873,7 +35240,7 @@ mod tests {
         ch.prepopulate_reply_attachment_context(&update).await;
 
         assert!(
-            ch.voice_file_paths.lock().contains_key("-100200300:40"),
+            ch.reply_file_paths.lock().contains_key("-100200300:40"),
             "passively admitted media will reach the shared context — the replied-to document must prefetch"
         );
     }
@@ -34916,7 +35283,7 @@ mod tests {
         ch.prepopulate_reply_attachment_context(&update).await;
 
         assert!(
-            ch.voice_file_paths.lock().is_empty(),
+            ch.reply_file_paths.lock().is_empty(),
             "a captionless media update is never admitted — no prefetch"
         );
     }
@@ -34968,7 +35335,7 @@ mod tests {
         ch.prepopulate_reply_attachment_context(&update).await;
 
         assert!(
-            ch.voice_file_paths.lock().contains_key("-100200300:70"),
+            ch.reply_file_paths.lock().contains_key("-100200300:70"),
             "a passively admitted captionless media update prefetches the replied-to document"
         );
     }
@@ -35006,7 +35373,7 @@ mod tests {
         ch.prepopulate_reply_attachment_context(&update).await;
 
         assert!(
-            ch.voice_file_paths.lock().contains_key("555:30"),
+            ch.reply_file_paths.lock().contains_key("555:30"),
             "a DM reply prefetches regardless of mention state"
         );
     }
@@ -35066,7 +35433,7 @@ mod tests {
         ch.prepopulate_reply_attachment_context(&update).await;
 
         assert!(
-            ch.voice_file_paths.lock().contains_key("-100200300:60"),
+            ch.reply_file_paths.lock().contains_key("-100200300:60"),
             "a passively admitted voice reply must prefetch the replied-to document"
         );
     }
