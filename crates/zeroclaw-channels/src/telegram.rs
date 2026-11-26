@@ -2337,37 +2337,7 @@ pub(crate) enum UpdateDisposition {
     RetryTransient,
 }
 
-/// Decision of the participation table for an inbound message (ADR Channel
-/// Layering, step 3): the single source of the "reply / record passively /
-/// drop" rules for every telegram channel parser.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Participation {
-    /// Addressed to the bot — hand to the agent with a reply.
-    Reply,
-    /// Unaddressed, but the group is listened to — into the chat context
-    /// without a reply.
-    PassiveContext,
-    /// Unaddressed — do not process.
-    Drop,
-}
 
-/// Outcome of the shared media mention gate for one update (stage 9-12,
-/// B3): the participation matrix rendered for the media parsers. The gate
-/// is the single source of media participation decisions — parsers carry
-/// no rules of their own.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum MediaAdmission {
-    /// Addressed to the bot — hand to the agent with a reply. The payload
-    /// is the caption to deliver: normalized after a group mention, verbatim
-    /// on the DM / mention_only-off paths (`None` = admitted without a
-    /// caption).
-    Admit(Option<String>),
-    /// Unaddressed, but the group is listened to — record as passive
-    /// context. The caption (if any) is kept verbatim by the caller.
-    Passive,
-    /// Unaddressed — do not process.
-    Drop,
-}
 
 enum AttachmentMaterialization {
     Ready {
@@ -4039,21 +4009,7 @@ impl TelegramChannel {
     /// Participation table (pure function, reads only its arguments): outside
     /// a group, or without mention_only, or when addressed — Reply; otherwise
     /// PassiveContext when passive_group_context is on, Drop.
-    fn participation_decision(
-        is_group: bool,
-        addressed: bool,
-        mention_only: bool,
-        passive_group_context: bool,
-    ) -> Participation {
-        if !is_group || !mention_only || addressed {
-            return Participation::Reply;
-        }
-        if Self::should_record_passive_group_context(passive_group_context, is_group, addressed) {
-            Participation::PassiveContext
-        } else {
-            Participation::Drop
-        }
-    }
+
 
     /// Addressability predicate: a bot mention in the text/caption, or a
     /// reply to one of the bot's own messages. `None` — the bot identity is
@@ -6030,6 +5986,58 @@ impl TelegramChannel {
             .and_then(|i| i.as_i64())
             .is_some_and(|id| id == bot_id)
     }
+}
+
+/// Outcome of the shared media mention gate for one update: the participation
+/// decision rendered for the media parsers. The gate is the single source of
+/// media participation decisions — parsers carry no admission rules of their
+/// own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MediaAdmission {
+    /// Addressed to the bot — hand to the agent with a reply. The payload is
+    /// the caption to deliver: normalized after a group mention, verbatim on
+    /// the DM / mention_only-off paths (`None` = admitted without a caption).
+    Admit(Option<String>),
+    /// Unaddressed, but the group is listened to — record as passive context.
+    /// The caption (if any) is kept verbatim by the caller.
+    Passive,
+    /// Unaddressed — do not process.
+    Drop,
+}
+
+/// How one update participates in the conversation. The same matrix the text
+/// parser in `parse_update_message` applies through
+/// `should_record_passive_group_context`, extracted so the media gate renders
+/// identical decisions for updates the text-only gate can never see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Participation {
+    /// Addressed (or no gating applies) — the agent answers.
+    Reply,
+    /// Unaddressed in a listened-to group — record as passive context.
+    PassiveContext,
+    /// Unaddressed — do not process.
+    Drop,
+}
+
+impl TelegramChannel {
+    /// Pure participation matrix: one row per (group?, mention_only?,
+    /// addressed?, listened?). Mirrors the text parser's gate so media and
+    /// text updates with the same addressing render the same decision.
+    fn participation_decision(
+        is_group: bool,
+        addressed: bool,
+        mention_only: bool,
+        passive_group_context: bool,
+    ) -> Participation {
+        if !is_group || !mention_only || addressed {
+            return Participation::Reply;
+        }
+        if Self::should_record_passive_group_context(passive_group_context, is_group, addressed) {
+            Participation::PassiveContext
+        } else {
+            Participation::Drop
+        }
+    }
 
     /// Shared media mention gate: the participation matrix for updates the
     /// text-only gate in `parse_update_message` can never see (photo /
@@ -6046,52 +6054,47 @@ impl TelegramChannel {
         if !self.mention_only || !is_group {
             return MediaAdmission::Admit(caption.map(String::from));
         }
-        // Photo / document updates carry no `text` field, so the text-only
-        // gate in `parse_update_message` can never see them and they used
-        // to slip through unconditionally. Media without a caption is not
-        // addressable through its text — there is nothing the mention
-        // predicate can work on — but it still participates in the matrix
-        // as unaddressed content: in a listened-to group the attachment
-        // itself is the observation (uniform passive, B3 — a voice note,
-        // personal address by format, is the same case, since it never
-        // carries a caption). Outside a listened-to group a captionless
-        // attachment drops, as before the passive branch.
-        let Some(caption) = caption else {
-            return match Self::participation_decision(
-                is_group,
-                false,
-                self.mention_only,
-                self.passive_group_context,
-            ) {
-                Participation::PassiveContext => MediaAdmission::Passive,
-                Participation::Reply | Participation::Drop => MediaAdmission::Drop,
-            };
-        };
-        let Some(addressed) = self.addressed_to_bot(caption, message) else {
-            // Bot identity unresolved — same fail-closed drop as the
-            // pre-matrix `?` on bot_username.
-            return MediaAdmission::Drop;
-        };
-        match Self::participation_decision(
+
+        // Media without a caption is not addressable through its text —
+        // there is nothing the mention predicate can work on — and its
+        // participation decision is identity-independent: the matrix only
+        // needs the group/listen flags. A voice note never carries a
+        // caption, so for voice this is the row that decides. Computing it
+        // before the bot identity is resolved also keeps passive listening
+        // working while the username cache is still warming up.
+        let unaddressed = match Self::participation_decision(
             is_group,
-            addressed,
+            false,
             self.mention_only,
             self.passive_group_context,
         ) {
-            Participation::Reply => {
-                // The username was Some when addressed_to_bot ran; if the
-                // cache were cleared in between, the (unused) username
-                // parameter of normalize_incoming_content just degrades — an
-                // already-addressed message must not drop on this path.
-                let bot_username = self.bot_username.lock();
-                MediaAdmission::Admit(Self::normalize_incoming_content(
-                    caption,
-                    bot_username.as_deref().unwrap_or(""),
-                ))
-            }
             Participation::PassiveContext => MediaAdmission::Passive,
-            Participation::Drop => MediaAdmission::Drop,
+            // Reply cannot occur for an unaddressed update; fail closed.
+            Participation::Reply | Participation::Drop => MediaAdmission::Drop,
+        };
+        let Some(caption) = caption else {
+            return unaddressed;
+        };
+
+        let bot_username_guard = self.bot_username.lock();
+        let Some(bot_username) = bot_username_guard.as_ref() else {
+            // Captioned media could still be addressed, but the mention
+            // predicate cannot run without the identity — fail closed, as
+            // before.
+            return MediaAdmission::Drop;
+        };
+
+        // If the user is replying directly to the bot's message, bypass the
+        // mention check — replies are an unambiguous signal of intent.
+        if let Some(bot_id) = *self.bot_id.lock()
+            && Self::is_reply_to_bot(message, bot_id)
+        {
+            return MediaAdmission::Admit(Self::normalize_incoming_content(caption, bot_username));
         }
+        if !Self::contains_bot_mention(caption, bot_username) {
+            return unaddressed;
+        }
+        MediaAdmission::Admit(Self::normalize_incoming_content(caption, bot_username))
     }
 
     /// Single-identifier convenience kept for the unit tests; the polling
@@ -7657,6 +7660,16 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         };
         // A passive caption (rare on a voice note, but the gate works on
         // it) is kept verbatim, mirroring the passive text path.
+        let content = if passive_context
+            && let Some(caption) = voice_caption.filter(|caption| !caption.is_empty())
+        {
+            format!("{content}\n\n{caption}")
+        } else {
+            content
+        };
+
+        // A passive caption (rare on a voice note, but the gate works on it)
+        // is kept verbatim, mirroring the passive text path.
         let content = if passive_context
             && let Some(caption) = voice_caption.filter(|caption| !caption.is_empty())
         {
@@ -23071,7 +23084,7 @@ mod tests {
         assert_eq!(
             result,
             MediaAdmission::Admit(Some("enhance this".to_string())),
-            "reply-to-bot caption should admit through the mention_only gate"
+            "reply-to-bot caption should bypass mention_only gate"
         );
     }
 
@@ -23200,19 +23213,19 @@ mod tests {
         assert_eq!(
             ch.check_media_mention_gate(&no_caption, None),
             MediaAdmission::Drop,
-            "no caption + mention_only group + not listened to ⇒ drop"
+            "no caption + mention_only group ⇒ reject"
         );
         let unrelated_caption = group_message_with_caption(Some("nice photo"));
         assert_eq!(
             ch.check_media_mention_gate(&unrelated_caption, Some("nice photo")),
             MediaAdmission::Drop,
-            "caption without bot mention + mention_only group + not listened to ⇒ drop"
+            "caption without bot mention + mention_only group ⇒ reject"
         );
         let other_bot_caption = group_message_with_caption(Some("hey @otherbot look"));
         assert_eq!(
             ch.check_media_mention_gate(&other_bot_caption, Some("hey @otherbot look")),
             MediaAdmission::Drop,
-            "caption mentioning a different bot ⇒ drop"
+            "caption mentioning a different bot ⇒ reject"
         );
     }
 
