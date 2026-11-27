@@ -174,3 +174,14 @@ docs/contour/MEMORY-DEBUG-DECISIONS.md.
 (2) кроны Демиурга — п.2в ночного обхода (ежедневный лёгкий чек) + новый
 еженедельный memory review (zc-cron-ops). Без них acceptance 6-7 живьём не
 подтвердить. Push в форк — с визы.
+
+## Деплой 9-17 в прод (28.11 ~01:00 МСК)
+
+Прод на fork-main head 52f5f87a4f (+реестр 69f845b41a). Release-сборка 27м44с.
+Бэкапы *.bak-20261128-005916. Конфиг: [memory] debug_decisions = true
+(канон схемы подтвердил: config get → true). Живая верификация слоя:
+memory.recall_selection (pipeline+backend) зафиксирован в трейсе по ping-джобу
+(demiurge, path=hybrid, candidates=20, returned=14, rejected_superseded=6).
+Кроны: ночной обход 58825a5e дополнен п.2в (memory-decisions сводка);
+новый еженедельный memory review 30a946f0 (пн 09:23 МСК). Джобов: 21.
+Откат: bak-20261128-005916 + debug_decisions=false.
