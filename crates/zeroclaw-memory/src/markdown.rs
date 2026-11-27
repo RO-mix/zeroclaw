@@ -1,6 +1,8 @@
-use super::traits::{Memory, MemoryCategory, MemoryEntry, is_recent_recall_query};
+use super::traits::{
+    Memory, MemoryCategory, MemoryEntry, MemoryKind, StoreOptions, is_recent_recall_query,
+};
 use async_trait::async_trait;
-use chrono::{DateTime, FixedOffset, Local, NaiveDate};
+use chrono::{DateTime, FixedOffset, Local, NaiveDate, Utc};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
@@ -63,6 +65,44 @@ impl MarkdownMemory {
     fn daily_path(&self) -> PathBuf {
         let date = Local::now().format("%Y-%m-%d").to_string();
         self.memory_dir().join(format!("{date}.md"))
+    }
+
+    /// Epic 9-1: markdown has no typed row surface, so the narrative
+    /// distillate (the single pinned `MemoryKind::Narrative` record) persists
+    /// as a dedicated overwrite-semantics file in the workspace. This is the
+    /// same contract sqlite implements as a typed row, in flat-file shape.
+    fn narrative_path(&self) -> PathBuf {
+        self.workspace_dir.join("NARRATIVE.md")
+    }
+
+    /// Shared body of `store_with_options` / `store_with_options_and_agent`.
+    async fn store_options_inner(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+    ) -> anyhow::Result<()> {
+        if options.kind == Some(MemoryKind::Narrative) {
+            fs::write(self.narrative_path(), content).await?;
+            return Ok(());
+        }
+        if options.requires_full_options_storage() {
+            anyhow::bail!(
+                "memory backend 'markdown' cannot persist StoreOptions kind/pinned/tenant_id; \
+                 only the narrative distillate (kind=narrative) supports pinned storage"
+            );
+        }
+        self.store_with_metadata(
+            key,
+            content,
+            category,
+            session_id,
+            options.namespace.as_deref(),
+            options.importance,
+        )
+        .await
     }
 
     async fn ensure_dirs(&self) -> anyhow::Result<()> {
@@ -166,6 +206,37 @@ impl MarkdownMemory {
                     ));
                 }
             }
+        }
+
+        // Epic 9-1: expose the narrative distillate file under NARRATIVE_KEY
+        // with kind/pinned so `get`, recall, and deploy treat it like the
+        // sqlite typed row.
+        let narrative_path = self.narrative_path();
+        if narrative_path.exists() {
+            let content = fs::read_to_string(&narrative_path).await?;
+            let timestamp = fs::metadata(&narrative_path)
+                .await
+                .and_then(|m| m.modified())
+                .map(|t| DateTime::<Utc>::from(t).to_rfc3339())
+                .unwrap_or_default();
+            entries.push(MemoryEntry {
+                principal_id: None,
+                id: crate::narrative::NARRATIVE_KEY.to_string(),
+                key: crate::narrative::NARRATIVE_KEY.to_string(),
+                content,
+                category: MemoryCategory::Core,
+                timestamp,
+                session_id: None,
+                score: None,
+                namespace: "default".into(),
+                importance: None,
+                superseded_by: None,
+                kind: Some(MemoryKind::Narrative),
+                pinned: true,
+                tenant_id: None,
+                agent_alias: None,
+                agent_id: None,
+            });
         }
 
         entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
@@ -337,6 +408,33 @@ impl Memory for MarkdownMemory {
         _agent_id: Option<&str>,
     ) -> anyhow::Result<()> {
         self.store(key, content, category, session_id).await
+    }
+
+    async fn store_with_options(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+    ) -> anyhow::Result<()> {
+        self.store_options_inner(key, content, category, session_id, options)
+            .await
+    }
+
+    async fn store_with_options_and_agent(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+        _agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        // Markdown attribution lives on the on-disk path; the caller-supplied
+        // agent_id is intentionally ignored (same contract as store_with_agent).
+        self.store_options_inner(key, content, category, session_id, options)
+            .await
     }
 
     async fn recall_for_agents(
@@ -591,5 +689,92 @@ mod tests {
             recent.iter().any(|e| e.content.contains("standup")),
             "today's daily entry must be included when since is in the past"
         );
+    }
+
+    #[tokio::test]
+    async fn store_with_options_narrative_round_trips_as_file() {
+        let (_tmp, mem) = temp_workspace();
+
+        mem.store_with_options(
+            crate::narrative::NARRATIVE_KEY,
+            "distilled persona narrative",
+            MemoryCategory::Core,
+            None,
+            StoreOptions {
+                kind: Some(MemoryKind::Narrative),
+                pinned: true,
+                ..StoreOptions::default()
+            },
+        )
+        .await
+        .expect("narrative store must succeed on markdown");
+
+        let entry = mem
+            .get(crate::narrative::NARRATIVE_KEY)
+            .await
+            .unwrap()
+            .expect("narrative entry must be readable back under NARRATIVE_KEY");
+        assert_eq!(entry.content, "distilled persona narrative");
+        assert_eq!(entry.kind, Some(MemoryKind::Narrative));
+        assert!(entry.pinned);
+
+        // Second store overwrites: the distillate is a single record.
+        mem.store_with_options(
+            crate::narrative::NARRATIVE_KEY,
+            "consolidated persona narrative",
+            MemoryCategory::Core,
+            None,
+            StoreOptions {
+                kind: Some(MemoryKind::Narrative),
+                pinned: true,
+                ..StoreOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let entry = mem
+            .get(crate::narrative::NARRATIVE_KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.content, "consolidated persona narrative");
+    }
+
+    #[tokio::test]
+    async fn store_with_options_full_non_narrative_bails() {
+        let (_tmp, mem) = temp_workspace();
+        let err = mem
+            .store_with_options(
+                "k",
+                "v",
+                MemoryCategory::Core,
+                None,
+                StoreOptions::default().pinned(true),
+            )
+            .await
+            .expect_err("pinned non-narrative store must bail on markdown");
+        assert!(
+            err.to_string().contains("cannot persist StoreOptions"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_with_options_partial_falls_back_to_append() {
+        let (_tmp, mem) = temp_workspace();
+        mem.store_with_options(
+            "pref",
+            "namespace-only write",
+            MemoryCategory::Core,
+            None,
+            StoreOptions {
+                namespace: Some("ops".into()),
+                ..StoreOptions::default()
+            },
+        )
+        .await
+        .expect("namespace-only options must keep the append-only behavior");
+        let content = fs::read_to_string(mem.core_path()).await.unwrap();
+        assert!(content.contains("namespace-only write"));
     }
 }

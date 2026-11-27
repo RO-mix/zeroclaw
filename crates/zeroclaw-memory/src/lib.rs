@@ -3257,4 +3257,56 @@ url = "http://localhost:6333"
         assert!(entry.pinned);
         assert_eq!(entry.kind, Some(MemoryKind::Narrative));
     }
+
+    #[tokio::test]
+    async fn markdown_stack_store_with_options_deploys_narrative_to_soul() {
+        use crate::agent_scoped_markdown::{AgentScopedMarkdownMemory, MarkdownPeer};
+        use crate::retrieval::{RetrievalConfig, RetrievalPipeline};
+        use crate::scanned::ScannedMemory;
+        use crate::traits::{MemoryKind, StoreOptions};
+        use zeroclaw_config::schema::MemoryPolicyConfig;
+
+        let tmp = TempDir::new().unwrap();
+        let own_dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&own_dir).unwrap();
+
+        // Exact production markdown chain (create_memory_for_agent_inner):
+        // RetrievalPipeline -> AgentScopedMarkdownMemory(own=ScannedMemory(MarkdownMemory)).
+        let own: Arc<dyn Memory> = Arc::new(ScannedMemory::new(
+            crate::markdown::MarkdownMemory::new("markdown", &own_dir),
+            &MemoryPolicyConfig::default(),
+        ));
+        let scoped = AgentScopedMarkdownMemory::new("alpha", own, Vec::<MarkdownPeer>::new());
+        let stack: Arc<dyn Memory> = Arc::new(RetrievalPipeline::new(
+            Arc::new(scoped),
+            RetrievalConfig::default(),
+        ));
+
+        stack
+            .store_with_options(
+                crate::narrative::NARRATIVE_KEY,
+                "distilled persona narrative",
+                MemoryCategory::Core,
+                None,
+                StoreOptions {
+                    kind: Some(MemoryKind::Narrative),
+                    pinned: true,
+                    ..StoreOptions::default()
+                },
+            )
+            .await
+            .expect("narrative store must traverse the markdown wrapper stack");
+
+        crate::narrative::deploy(
+            stack.as_ref(),
+            &own_dir,
+            crate::narrative::DEFAULT_NARRATIVE_CAP_CHARS,
+        )
+        .await
+        .expect("deploy must publish the markdown narrative record to SOUL.md");
+
+        let soul = std::fs::read_to_string(own_dir.join("SOUL.md")).unwrap();
+        assert!(soul.contains(crate::narrative::SECTION_BEGIN));
+        assert!(soul.contains("distilled persona narrative"));
+    }
 }

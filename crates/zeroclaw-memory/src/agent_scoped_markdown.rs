@@ -1,6 +1,6 @@
 //! Cross-agent path-walk variant for Markdown-backed agents.
 
-use super::traits::{Memory, MemoryCategory, MemoryEntry};
+use super::traits::{Memory, MemoryCategory, MemoryEntry, StoreOptions};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashSet;
@@ -161,6 +161,40 @@ impl Memory for AgentScopedMarkdownMemory {
         // caller-supplied agent_id is intentionally ignored here.
         self.own
             .store_with_metadata(key, content, category, session_id, namespace, importance)
+            .await
+    }
+
+    async fn store_with_options(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+    ) -> Result<()> {
+        // Stores write only to the bound agent's own backend; peers are
+        // read-only by design. The full options surface (including the
+        // Epic 9-1 narrative distillate) delegates as-is; markdown bails
+        // clearly on options it cannot persist.
+        self.own
+            .store_with_options(key, content, category, session_id, options)
+            .await
+    }
+
+    async fn store_with_options_and_agent(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+        agent_id: Option<&str>,
+    ) -> Result<()> {
+        // Caller-supplied agent_id is intentionally ignored: markdown
+        // attribution lives on the on-disk path (same contract as
+        // store_with_agent above).
+        self.own
+            .store_with_options_and_agent(key, content, category, session_id, options, agent_id)
             .await
     }
 
