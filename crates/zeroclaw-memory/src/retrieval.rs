@@ -650,6 +650,23 @@ impl Memory for RetrievalPipeline {
         result
     }
 
+    async fn store_with_options_and_agent(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let result = self
+            .memory
+            .store_with_options_and_agent(key, content, category, session_id, options, agent_id)
+            .await;
+        self.invalidate_cache();
+        result
+    }
+
     async fn store_with_agent(
         &self,
         key: &str,

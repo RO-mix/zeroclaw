@@ -628,6 +628,23 @@ impl<M: Memory> Memory for ScannedMemory<M> {
             .await
     }
 
+    async fn store_with_options_and_agent(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let content = self.process_content(key, content, options.namespace.as_deref())?;
+        self.enforce_policy(key, options.namespace.as_deref(), &category)
+            .await?;
+        self.inner
+            .store_with_options_and_agent(key, &content, category, session_id, options, agent_id)
+            .await
+    }
+
     async fn store_with_agent(
         &self,
         key: &str,

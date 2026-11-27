@@ -3204,4 +3204,57 @@ url = "http://localhost:6333"
             "a handle must see its own writes even with the cache on"
         );
     }
+
+    #[tokio::test]
+    async fn full_stack_store_with_options_routes_agent_attributed_options() {
+        use crate::agent_scoped::AgentScopedMemory;
+        use crate::retrieval::{RetrievalConfig, RetrievalPipeline};
+        use crate::scanned::ScannedMemory;
+        use crate::sqlite::SqliteMemory;
+        use crate::traits::{Memory, MemoryKind, StoreOptions};
+        use zeroclaw_config::schema::MemoryPolicyConfig;
+
+        let tmp = TempDir::new().unwrap();
+        let inner = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        let alpha = inner.ensure_agent_uuid("alpha").await.unwrap();
+
+        // Exact production stack for sqlite agents (create_memory_for_agent_inner):
+        // RetrievalPipeline -> AgentScopedMemory -> ScannedMemory -> SqliteMemory.
+        let scanned = ScannedMemory::new(inner.clone(), &MemoryPolicyConfig::default());
+        let scoped = AgentScopedMemory::new(Arc::new(scanned), &alpha, Vec::<String>::new());
+        let stack: Arc<dyn Memory> = Arc::new(RetrievalPipeline::new(
+            Arc::new(scoped),
+            RetrievalConfig::default(),
+        ));
+
+        // Narrative-distillate write (Epic 9-1): kind + pinned require full
+        // options storage plus agent attribution — the request shape that
+        // previously bailed in the default trait impls of ScannedMemory and
+        // RetrievalPipeline (alarm R1 legalplat 27.11: every memory_store
+        // kind=narrative call failed with "memory backend 'sqlite' does not
+        // support agent-attributed StoreOptions").
+        stack
+            .store_with_options(
+                crate::narrative::NARRATIVE_KEY,
+                "distilled persona narrative",
+                MemoryCategory::Core,
+                None,
+                StoreOptions {
+                    kind: Some(MemoryKind::Narrative),
+                    pinned: true,
+                    ..StoreOptions::default()
+                },
+            )
+            .await
+            .expect("full-options store must traverse the whole wrapper stack");
+
+        let entry = inner
+            .get_for_agent(crate::narrative::NARRATIVE_KEY, &alpha)
+            .await
+            .unwrap()
+            .expect("narrative row must persist with the bound agent attribution");
+        assert_eq!(entry.agent_id.as_deref(), Some(alpha.as_str()));
+        assert!(entry.pinned);
+        assert_eq!(entry.kind, Some(MemoryKind::Narrative));
+    }
 }
