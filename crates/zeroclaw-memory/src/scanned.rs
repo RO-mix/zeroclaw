@@ -62,6 +62,10 @@ enum OnHit {
 pub struct ScannedMemory<M: Memory> {
     inner: M,
     policy: MemoryPolicyConfig,
+    /// Наблюдаемость решений памяти (9-17): эмит `memory.gate_disposition`
+    /// после каждого вердикта policy-гейта. Default off — при выключенном
+    /// флаге ноль добавки к трейсу и hot path.
+    debug_decisions: bool,
 }
 
 impl<M: Memory> ::zeroclaw_api::attribution::Attributable for ScannedMemory<M> {
@@ -75,10 +79,11 @@ impl<M: Memory> ::zeroclaw_api::attribution::Attributable for ScannedMemory<M> {
 }
 
 impl<M: Memory> ScannedMemory<M> {
-    pub fn new(inner: M, policy: &MemoryPolicyConfig) -> Self {
+    pub fn new(inner: M, policy: &MemoryPolicyConfig, debug_decisions: bool) -> Self {
         Self {
             inner,
             policy: policy.clone(),
+            debug_decisions,
         }
     }
 
@@ -228,21 +233,56 @@ impl<M: Memory> ScannedMemory<M> {
     ) -> anyhow::Result<()> {
         let namespace = namespace.unwrap_or("default");
         let enforcer = PolicyEnforcer::new(&self.policy);
-        if let Err(error) =
-            crate::policy_gate::validate_store(&self.inner, &enforcer, namespace, category).await
+        match crate::policy_gate::validate_store(&self.inner, &enforcer, namespace, category).await
         {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "key": key,
-                        "namespace": namespace,
-                        "error": error.to_string(),
-                    })),
-                "memory write denied by policy"
-            );
-            anyhow::bail!("memory write denied by policy: {error}");
+            Ok(()) => {
+                if self.debug_decisions {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "error_key": "memory.gate_disposition",
+                                "subsystem": "policy_gate",
+                                "decision": "allow",
+                                "namespace": namespace,
+                                "key": key,
+                            })),
+                        "memory gate disposition: allow"
+                    );
+                }
+            }
+            Err(error) => {
+                if self.debug_decisions {
+                    // Событие решения (9-17) — поверх always-on WARN-маркера
+                    // ниже, который не трогаем (security-маркер).
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "error_key": "memory.gate_disposition",
+                                "subsystem": "policy_gate",
+                                "decision": "deny",
+                                "violation_kind": error.kind_str(),
+                                "namespace": namespace,
+                                "key": key,
+                            })),
+                        "memory gate disposition: deny"
+                    );
+                }
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "key": key,
+                            "namespace": namespace,
+                            "error": error.to_string(),
+                        })),
+                    "memory write denied by policy"
+                );
+                anyhow::bail!("memory write denied by policy: {error}");
+            }
         }
         Ok(())
     }
@@ -711,7 +751,89 @@ mod tests {
     }
 
     fn scanned(tmp: &TempDir, policy: &MemoryPolicyConfig) -> ScannedMemory<SqliteMemory> {
-        ScannedMemory::new(SqliteMemory::new("sqlite", tmp.path()).unwrap(), policy)
+        ScannedMemory::new(
+            SqliteMemory::new("sqlite", tmp.path()).unwrap(),
+            policy,
+            false,
+        )
+    }
+
+    // ── epic 9-17: наблюдаемость решений (gate_disposition) ──
+
+    fn locked_policy() -> MemoryPolicyConfig {
+        MemoryPolicyConfig {
+            read_only_namespaces: vec!["locked".into()],
+            ..MemoryPolicyConfig::default()
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn gate_disposition_events_flag_gated() {
+        let (_obs_guard, _writer_guard, _hook_guard, mut rx) = crate::log_capture::install();
+        let tmp = TempDir::new().unwrap();
+
+        // Флаг выкл: allow и deny проходят молча (только always-on WARN deny).
+        let off = ScannedMemory::new(
+            SqliteMemory::new("sqlite", tmp.path()).unwrap(),
+            &locked_policy(),
+            false,
+        );
+        off.store("k_allow", "v", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let denied = off
+            .store_with_options(
+                "k_deny",
+                "v",
+                MemoryCategory::Core,
+                None,
+                StoreOptions::default().with_namespace("locked"),
+            )
+            .await;
+        assert!(denied.is_err(), "read-only namespace must deny the write");
+        let events = crate::log_capture::collect(&mut rx, "memory.gate_disposition");
+        assert!(
+            events.is_empty(),
+            "debug_decisions off: zero gate_disposition events (always-on WARN deny has no error_key), got {events:?}"
+        );
+
+        // Флаг вкл: allow и deny — оба structured-события.
+        let on = ScannedMemory::new(
+            SqliteMemory::new("sqlite", tmp.path()).unwrap(),
+            &locked_policy(),
+            true,
+        );
+        on.store("k_allow", "v", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let denied = on
+            .store_with_options(
+                "k_deny",
+                "v",
+                MemoryCategory::Core,
+                None,
+                StoreOptions::default().with_namespace("locked"),
+            )
+            .await;
+        assert!(denied.is_err(), "read-only namespace must still deny");
+
+        let events = crate::log_capture::collect(&mut rx, "memory.gate_disposition");
+        assert_eq!(events.len(), 2, "allow + deny expected, got {events:?}");
+        let allow = events
+            .iter()
+            .find(|e| e["attributes"]["decision"] == "allow")
+            .expect("allow event");
+        assert_eq!(allow["attributes"]["namespace"], "default");
+        assert_eq!(allow["attributes"]["key"], "k_allow");
+        let deny = events
+            .iter()
+            .find(|e| e["attributes"]["decision"] == "deny")
+            .expect("deny event");
+        assert_eq!(deny["attributes"]["violation_kind"], "read_only_namespace");
+        assert_eq!(deny["attributes"]["namespace"], "locked");
+        assert_eq!(deny["attributes"]["key"], "k_deny");
+        crate::log_capture::assert_scalar_only(&events);
     }
 
     #[tokio::test]
@@ -1128,7 +1250,7 @@ mod tests {
             ],
             limits: limits.clone(),
         };
-        let mem = ScannedMemory::new(inner, &policy("on", "block-on-read"));
+        let mem = ScannedMemory::new(inner, &policy("on", "block-on-read"), false);
 
         let hits = mem.recall("gadget", 1, None, None, None).await.unwrap();
 

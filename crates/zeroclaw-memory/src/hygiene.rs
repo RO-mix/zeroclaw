@@ -67,6 +67,26 @@ struct HygieneState {
     last_report: HygieneReport,
 }
 
+/// Наблюдаемость решений памяти (9-17): событие решения гигиены. Эмитятся
+/// только вызывающим под `debug_decisions`, строго после персистента
+/// действия; атрибуты — скаляры.
+fn record_hygiene_decision(action: &str, category: &str, rows_affected: u64, reason: &str) {
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "error_key": "memory.hygiene_decision",
+                "subsystem": "hygiene",
+                "action": action,
+                "category": category,
+                "rows_affected": rows_affected,
+                "reason": reason,
+            })
+        ),
+        "memory hygiene decision"
+    );
+}
+
 /// Run memory/session hygiene if the cadence window has elapsed.
 /// This function is intentionally best-effort: callers should log and continue on failure.
 pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
@@ -134,10 +154,87 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
     // Бюджетная компактификация физически DELETE-ит строки — только в
     // delete-режиме: в archive-режиме долговременные строки не удаляются
     // никаким путём (ревью 9-2: budget overflow не обходит затухание).
+    let mut budget_rows = BudgetRows::default();
     if !archive_mode {
-        let budget_report = compact_budget_rows(workspace_dir, config)?;
-        report.pruned_daily_rows += budget_report.daily_rows;
-        report.pruned_core_rows += budget_report.core_rows;
+        budget_rows = compact_budget_rows(workspace_dir, config)?;
+        report.pruned_daily_rows += budget_rows.daily_rows;
+        report.pruned_core_rows += budget_rows.core_rows;
+    }
+
+    // Наблюдаемость решений (9-17): одно событие на retention-ветку, ПОСЛЕ
+    // персистента. action=skip — ветка отключена конфигом (retention 0 /
+    // бюджеты не заданы), rows_affected=0. Бюджетная компактификация
+    // (reason=cap) эмитится отдельно от retention-веток (reason=retention).
+    if config.debug_decisions {
+        if archive_mode {
+            if config.physical_purge_days == 0 {
+                record_hygiene_decision("skip", "conversation", 0, "retention");
+            } else {
+                record_hygiene_decision(
+                    "prune",
+                    "conversation",
+                    report.pruned_conversation_rows,
+                    "retention",
+                );
+            }
+            if daily_retention == 0 {
+                record_hygiene_decision("skip", "daily", 0, "retention");
+            } else {
+                record_hygiene_decision(
+                    "archive",
+                    "daily",
+                    report.archived_daily_rows,
+                    "retention",
+                );
+            }
+            if core_retention == 0 {
+                record_hygiene_decision("skip", "core", 0, "retention");
+            } else {
+                record_hygiene_decision("archive", "core", report.archived_core_rows, "retention");
+            }
+        } else {
+            if conversation_retention == 0 {
+                record_hygiene_decision("skip", "conversation", 0, "retention");
+            } else {
+                record_hygiene_decision(
+                    "prune",
+                    "conversation",
+                    report.pruned_conversation_rows,
+                    "retention",
+                );
+            }
+            if daily_retention == 0 {
+                record_hygiene_decision("skip", "daily", 0, "retention");
+            } else {
+                // pruned_*_rows уже включает строки бюджетной компактификации
+                // (compact_budget_rows прибавлен в report выше) — вычитаем,
+                // чтобы retention-событие не задваивало их.
+                record_hygiene_decision(
+                    "prune",
+                    "daily",
+                    report.pruned_daily_rows - budget_rows.daily_rows,
+                    "retention",
+                );
+            }
+            if core_retention == 0 {
+                record_hygiene_decision("skip", "core", 0, "retention");
+            } else {
+                record_hygiene_decision(
+                    "prune",
+                    "core",
+                    report.pruned_core_rows - budget_rows.core_rows,
+                    "retention",
+                );
+            }
+            let budgets_set =
+                config.core_max_rows > 0 || config.core_max_bytes > 0 || config.daily_max_rows > 0;
+            if !budgets_set {
+                record_hygiene_decision("skip", "budget", 0, "cap");
+            } else {
+                record_hygiene_decision("compact", "daily", budget_rows.daily_rows, "cap");
+                record_hygiene_decision("compact", "core", budget_rows.core_rows, "cap");
+            }
+        }
     }
 
     // Retention cleanup is independent from new audit collection: disabling
@@ -1036,6 +1133,74 @@ mod tests {
             mem2.get("core_keep").await.unwrap().is_some(),
             "core memory should remain"
         );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn hygiene_decision_events_flag_gated() {
+        let (_obs_guard, _writer_guard, _hook_guard, mut rx) = crate::log_capture::install();
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+
+        let mem = SqliteMemory::new("sqlite", workspace).unwrap();
+        mem.store("daily_old", "stale", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+        drop(mem);
+        let conn = Connection::open(workspace.join("memory").join("brain.db")).unwrap();
+        let old_cutoff = (Local::now() - Duration::days(60)).to_rfc3339();
+        conn.execute(
+            "UPDATE memories SET created_at = ?1, updated_at = ?1 WHERE key = 'daily_old'",
+            params![old_cutoff],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Флаг выкл: прогон полностью молчит на слое memory.* (retention не
+        // трогаем — строка нужна следующему прогону).
+        let mut cfg = default_cfg();
+        cfg.archive_after_days = 0;
+        cfg.purge_after_days = 0;
+        run_if_due(&cfg, workspace).unwrap();
+        let events = crate::log_capture::collect(&mut rx, "memory.hygiene_decision");
+        assert!(
+            events.is_empty(),
+            "debug_decisions off: zero hygiene_decision events, got {events:?}"
+        );
+
+        // Сброс cadence-стейта, чтобы второй прогон реально выполнился.
+        let _ = fs::remove_file(state_path(workspace));
+
+        // Флаг вкл (archive-режим): события по каждой retention-ветке —
+        // archive на daily (строка состарена), skip на conversation/core
+        // (ветки отключены конфигом: physical_purge_days=0 / core=0).
+        let mut cfg = default_cfg();
+        cfg.archive_after_days = 0;
+        cfg.purge_after_days = 0;
+        cfg.retention_mode = "archive".into();
+        cfg.physical_purge_days = 0;
+        cfg.daily_retention_days = 30;
+        cfg.core_retention_days = 0;
+        cfg.debug_decisions = true;
+        run_if_due(&cfg, workspace).unwrap();
+
+        let events = crate::log_capture::collect(&mut rx, "memory.hygiene_decision");
+        let action_of = |category: &str| {
+            events
+                .iter()
+                .find(|e| e["attributes"]["category"] == category)
+                .map(|e| e["attributes"]["action"].as_str().unwrap().to_string())
+        };
+        assert_eq!(action_of("daily").as_deref(), Some("archive"));
+        assert_eq!(action_of("conversation").as_deref(), Some("skip"));
+        assert_eq!(action_of("core").as_deref(), Some("skip"));
+        let daily = events
+            .iter()
+            .find(|e| e["attributes"]["category"] == "daily")
+            .unwrap();
+        assert_eq!(daily["attributes"]["rows_affected"], 1);
+        assert_eq!(daily["attributes"]["reason"], "retention");
+        crate::log_capture::assert_scalar_only(&events);
     }
 
     #[tokio::test]

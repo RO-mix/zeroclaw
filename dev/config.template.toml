@@ -35,6 +35,14 @@ optional = ["*"]
 
 # Cost tracking and budget enforcement configuration
 # Enable to track API usage costs and enforce spending limits
+[memory]
+# Observability of memory decisions (contour RAM, story 9-17): when true,
+# memory subsystems emit INFO record! events with stable error_key
+# memory.proposal_verdict / memory.gate_disposition / memory.recall_selection
+# / memory.hygiene_decision / memory.consolidation_decision (scalar attrs
+# only, no record content). Default false — zero trace/hot-path overhead.
+debug_decisions = false
+
 [cost]
 enabled = false
 daily_limit_usd = 10.0

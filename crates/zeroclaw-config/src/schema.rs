@@ -13259,6 +13259,18 @@ pub struct MemoryConfig {
     /// поведение без флага не меняется.
     #[serde(default)]
     pub narrative_enabled: bool,
+    /// Наблюдаемость решений памяти (контур RAM, 9-17): при включении слой
+    /// памяти эмитит `record!`-события с stable error_key `memory.*`
+    /// (proposal_verdict / gate_disposition / recall_selection /
+    /// hygiene_decision / consolidation_decision) на INFO с фиксированными
+    /// скалярными атрибутами (без контента записей). События эмитятся строго
+    /// после принятия и персистента решения и не влияют на вердикты.
+    /// Default off — при выключенном флаге поведение байт-в-байт прежнее;
+    /// единственное всегда-активное изменение трейса этой истории —
+    /// privacy-скраб полного текста запроса в DEBUG cache-hit событии
+    /// retrieval (текст → число терминов).
+    #[serde(default)]
+    pub debug_decisions: bool,
     /// Жёсткий cap дистиллята образа, символов. Публикация контента сверх cap
     /// отклоняется (раздел не переписывается) и журналируется как задача
     /// консолидации. Default 2200.
@@ -14217,6 +14229,7 @@ impl Default for MemoryConfig {
             consolidation_extract_facts: false,
             narrative_enabled: false,
             narrative_cap_chars: default_narrative_cap_chars(),
+            debug_decisions: false,
             archive_after_days: default_archive_after_days(),
             purge_after_days: default_purge_after_days(),
             conversation_retention_days: default_conversation_retention_days(),
@@ -57195,6 +57208,27 @@ model_provider = \"ollama.default\"
 
         // Фича выключена дефолтом и на весь Config тоже.
         assert!(!Config::default().memory.permissions.enabled);
+    }
+
+    #[::core::prelude::v1::test]
+    fn memory_debug_decisions_defaults_off_and_roundtrips() {
+        // Флаг 9-17: дефолт выкл — поведение без флага байт-в-байт прежнее.
+        assert!(!MemoryConfig::default().debug_decisions);
+        assert!(!Config::default().memory.debug_decisions);
+
+        // Пустая таблица [memory] — дефолт на месте (serde default).
+        let partial: MemoryConfig = toml::from_str("").unwrap();
+        assert!(!partial.debug_decisions);
+
+        let full: MemoryConfig = toml::from_str("debug_decisions = true").unwrap();
+        assert!(full.debug_decisions);
+
+        let mut nested: Config = toml::from_str("[memory]\ndebug_decisions = true\n").unwrap();
+        assert!(nested.memory.debug_decisions);
+        nested
+            .set_prop("memory.debug_decisions", "false")
+            .expect("set_prop on memory.debug_decisions");
+        assert!(!nested.memory.debug_decisions);
     }
 
     #[::core::prelude::v1::test]

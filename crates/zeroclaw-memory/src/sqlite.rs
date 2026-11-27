@@ -42,6 +42,9 @@ pub struct SqliteMemory {
     search_mode: SearchMode,
     /// Prepended to a recall query, never to stored content, before embedding.
     query_prefix: Option<String>,
+    /// Наблюдаемость решений памяти (9-17): эмит `memory.recall_selection`
+    /// (layer=backend) с path/candidates/rejected-счётчиками. Default off.
+    debug_decisions: bool,
 }
 
 impl SqliteMemory {
@@ -71,6 +74,7 @@ impl SqliteMemory {
             cache_max: 10_000,
             search_mode: SearchMode::default(),
             query_prefix: None,
+            debug_decisions: false,
         })
     }
 
@@ -96,6 +100,7 @@ impl SqliteMemory {
             cache_max,
             search_mode,
             query_prefix: None,
+            debug_decisions: false,
         })
     }
 
@@ -105,6 +110,14 @@ impl SqliteMemory {
     #[must_use]
     pub fn with_query_prefix(mut self, prefix: Option<String>) -> Self {
         self.query_prefix = prefix.filter(|prefix| !prefix.is_empty());
+        self
+    }
+
+    /// Наблюдаемость решений памяти (9-17): включить эмит
+    /// `memory.recall_selection` (layer=backend) из recall-веток.
+    #[must_use]
+    pub fn with_debug_decisions(mut self, debug_decisions: bool) -> Self {
+        self.debug_decisions = debug_decisions;
         self
     }
 
@@ -1093,16 +1106,31 @@ impl SqliteMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.recall_by_time_only_impl(limit, session_id, since, until, true)
+            .await
+    }
+
+    /// Тело `recall_by_time_only`. `emit_selection` — эмитить ли
+    /// `memory.recall_selection`: вызывающий `recall_scoped` просит не эмитить,
+    /// когда ниже него ещё agent-scope фильтр (событие уходит оттуда с
+    /// итоговыми счётчиками), чтобы не плодить дубли.
+    async fn recall_by_time_only_impl(
+        &self,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+        emit_selection: bool,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
         let conn = self.conn.clone();
         let sid = session_id.map(String::from);
         let since_owned = since.map(String::from);
         let until_owned = until.map(String::from);
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+        let results = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
             let since_ref = since_owned.as_deref();
             let until_ref = until_owned.as_deref();
-
             let mut sql =
                 "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
                  FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
@@ -1161,6 +1189,47 @@ impl SqliteMemory {
             Ok(results)
         })
         .await?
+        .inspect(|results| {
+            if emit_selection && self.debug_decisions {
+                Self::record_recall_selection("time_only", None, 0, results.len(), 0, 0, 0);
+            }
+        })?;
+        Ok(results)
+    }
+
+    /// Эмит `memory.recall_selection` (layer=backend). Атрибуты — строго
+    /// скаляры: path, число терминов запроса, счётчики. Контент записей и
+    /// текст запроса не эмитятся (приватность + объём, 9-17).
+    fn record_recall_selection(
+        path: &str,
+        query_terms: Option<usize>,
+        candidates: usize,
+        returned: usize,
+        rejected_window: u64,
+        rejected_agent_scope: u64,
+        rejected_superseded: u64,
+    ) {
+        let mut attrs = ::serde_json::json!({
+            "error_key": "memory.recall_selection",
+            "subsystem": "retrieval",
+            "layer": "backend",
+            "path": path,
+            "candidates": candidates,
+            "returned": returned,
+            "rejected_window": rejected_window,
+            "rejected_agent_scope": rejected_agent_scope,
+            "rejected_superseded": rejected_superseded,
+            "cache": "off",
+        });
+        if let Some(query_terms) = query_terms {
+            attrs["query_terms"] = ::serde_json::json!(query_terms);
+        }
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(attrs),
+            "memory recall selection (backend)"
+        );
     }
 
     async fn recall_scoped(
@@ -1182,22 +1251,48 @@ impl SqliteMemory {
             } else {
                 self.count().await?.max(limit)
             };
-            let raw = self
-                .recall_by_time_only(recall_limit, session_id, since, until)
-                .await?;
-            if allowed_agent_ids.is_empty() {
+            let agent_scope_active = !allowed_agent_ids.is_empty();
+            let raw = if agent_scope_active {
+                // Agent-scope фильтр ниже портил бы returned внутреннего
+                // события — эмит откладывается на пост-фильтр ниже.
+                self.recall_by_time_only_impl(recall_limit, session_id, since, until, false)
+                    .await?
+            } else {
+                // Тrait-метод эмитит своё событие сам (emit_selection=true).
+                self.recall_by_time_only(recall_limit, session_id, since, until)
+                    .await?
+            };
+            if !agent_scope_active {
                 return Ok(raw);
             }
-            return Ok(raw
-                .into_iter()
-                .filter(|entry| {
-                    entry
-                        .agent_id
-                        .as_deref()
-                        .is_some_and(|agent_id| allowed_agent_ids.iter().any(|id| id == agent_id))
-                })
-                .take(limit)
-                .collect());
+            let mut rejected_agent_scope = 0u64;
+            let filtered: Vec<_> =
+                raw.into_iter()
+                    .filter(|entry| {
+                        let keep = entry.agent_id.as_deref().is_some_and(|agent_id| {
+                            allowed_agent_ids.iter().any(|id| id == agent_id)
+                        });
+                        if !keep {
+                            rejected_agent_scope += 1;
+                        }
+                        keep
+                    })
+                    .take(limit)
+                    .collect();
+            if self.debug_decisions {
+                // recall_by_time_only_impl не эмитила (agent-фильтр ниже
+                // портил бы returned) — эмит здесь, с итоговыми счётчиками.
+                Self::record_recall_selection(
+                    "time_only",
+                    None,
+                    0,
+                    filtered.len(),
+                    0,
+                    rejected_agent_scope,
+                    0,
+                );
+            }
+            return Ok(filtered);
         }
 
         // Compute query embedding only when needed (skip for BM25-only mode).
@@ -1235,6 +1330,8 @@ impl SqliteMemory {
         let keyword_weight = self.keyword_weight;
         let search_mode = self.search_mode.clone();
         let allowed = allowed_agent_ids;
+        let debug_decisions = self.debug_decisions;
+        let query_terms = query.split_whitespace().count();
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
@@ -1290,6 +1387,20 @@ impl SqliteMemory {
                 Vec::new()
             };
 
+            // Путь выборки для наблюдаемости (9-17): по построению ветвления
+            // выше. LIKE-fallback ниже перезапишет на "like", если сработал.
+            let mut path = if !vector_results.is_empty() && !keyword_results.is_empty() {
+                "hybrid"
+            } else if !vector_results.is_empty() {
+                "vector"
+            } else {
+                "fts"
+            };
+            // Счётчики отсеянных в фильтр-циклах ниже (9-17).
+            let mut rejected_window = 0u64;
+            let mut rejected_agent_scope = 0u64;
+            let mut rejected_superseded = 0u64;
+
             // Merge results based on search mode
             let merged = if vector_results.is_empty() {
                 // FTS-only survivors: map raw BM25 onto the [0, 1] axis
@@ -1326,6 +1437,10 @@ impl SqliteMemory {
                     limit,
                 )
             };
+
+            // candidates — merged ДО truncate и фильтров; при path=like
+            // остаётся 0 по построению (fallback не пользуется merged).
+            let candidates = merged.len();
 
             // Fetch full entries for merged results in a single query
             // instead of N round-trips (N+1 pattern).
@@ -1412,10 +1527,12 @@ impl SqliteMemory {
                     {
                         if let Some(s) = since_ref
                             && ts.as_str() < s {
+                                rejected_window += 1;
                                 continue;
                             }
                         if let Some(u) = until_ref
                             && ts.as_str() > u {
+                                rejected_window += 1;
                                 continue;
                             }
                         let entry = MemoryEntry {
@@ -1449,14 +1566,27 @@ impl SqliteMemory {
                                     entry.session_id.as_deref(),
                                 ))
                         {
+                            rejected_agent_scope += 1;
                             continue;
                         }
                         results.push(entry);
+                    } else {
+                        // id из merged отсутствует в выборке — SQL-фильтр
+                        // superseded/principal строк отсёк кандидата.
+                        rejected_superseded += 1;
                     }
                 }
             }
 
-            // If hybrid returned nothing, fall back to LIKE search.
+            // If hybrid returned nothing, fall back to LIKE search. Гейт
+            // НЕ ограничен debug_decisions и не сужен до `candidates == 0`:
+            // семантика recall (включая LIKE-recovery для substring-совпадений,
+            // которые FTS-токенизация не видит) должна быть байт-в-байт
+            // прежней при выключенном флаге (acceptance 1 спеки 9-17).
+            // Побочка для наблюдаемости: при re-scan одна и та же строка,
+            // отсечённая session-фильтром, может попасть в rejected_* счётчики
+            // дважды (FTS-проход + LIKE-проход) — трактовать счётчики как
+            // «отсечений», не «уникальных строк».
             if results.is_empty() {
                 const MAX_LIKE_KEYWORDS: usize = 8;
                 let raw_keywords: Vec<String> = query
@@ -1560,6 +1690,7 @@ impl SqliteMemory {
                         let entry = row?;
                         if let Some(sid) = session_ref
                             && entry.session_id.as_deref() != Some(sid) {
+                                rejected_agent_scope += 1;
                                 continue;
                             }
                         if needs_prefix_filter
@@ -1575,7 +1706,26 @@ impl SqliteMemory {
                             break;
                         }
                     }
+                    if !results.is_empty() {
+                        // LIKE-fallback сработал: path=like, candidates=0 по
+                        // построению (merged не использовался).
+                        path = "like";
+                    }
                 }
+            }
+
+            if debug_decisions {
+                // Эмит ПЕРЕД truncate: returned — что вернётся вызывающему
+                // после фильтров и лимита.
+                Self::record_recall_selection(
+                    path,
+                    Some(query_terms),
+                    candidates,
+                    results.len().min(limit),
+                    rejected_window,
+                    rejected_agent_scope,
+                    rejected_superseded,
+                );
             }
 
             results.truncate(limit);
@@ -2957,6 +3107,207 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         (tmp, mem)
+    }
+
+    // ── epic 9-17: наблюдаемость решений (recall-selection, layer=backend) ──
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn recall_selection_backend_reveals_empty_recall_cause() {
+        let (_obs_guard, _writer_guard, _hook_guard, mut rx) = crate::log_capture::install();
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path())
+            .unwrap()
+            .with_debug_decisions(true);
+
+        // Запись есть, recall из ДРУГОЙ сессии её не поднимает: кандидат
+        // нашёлся (FTS), отсечён session-фильтром — виновник виден в счётчике.
+        mem.store(
+            "sess_a_fact",
+            "gizmo calibration notes",
+            MemoryCategory::Core,
+            Some("sess-a"),
+        )
+        .await
+        .unwrap();
+        let found = mem
+            .recall("gizmo", 10, Some("sess-b"), None, None)
+            .await
+            .unwrap();
+        assert!(
+            found.is_empty(),
+            "cross-session recall must not lift the row"
+        );
+
+        let events = crate::log_capture::collect(&mut rx, "memory.recall_selection");
+        let backend: Vec<_> = events
+            .iter()
+            .filter(|event| event["attributes"]["layer"] == "backend")
+            .collect();
+        assert_eq!(
+            backend.len(),
+            1,
+            "exactly one backend-layer recall_selection event, got {events:?}"
+        );
+        let attrs = &backend[0]["attributes"];
+        assert_eq!(attrs["path"], "fts");
+        assert_eq!(
+            attrs["candidates"], 1,
+            "FTS surfaced the row before filters"
+        );
+        assert_eq!(attrs["returned"], 0);
+        // Спека (acceptance 3): виновник пустой выдачи виден. Физическая
+        // строка отсекается session-фильтром в цикле FTS и (когда hybrid
+        // пуст) пересканируется LIKE-fallback'ом — счётчик может быть 1 или 2
+        // в зависимости от ветки; инвариант — ненулевой и нет returned.
+        assert!(
+            attrs["rejected_agent_scope"].as_u64().unwrap_or(0) >= 1,
+            "session-scope filter must be the visible culprit, got {events:?}"
+        );
+        assert_eq!(attrs["rejected_window"], 0);
+        assert_eq!(attrs["rejected_superseded"], 0);
+        crate::log_capture::assert_scalar_only(&events);
+
+        // Повторный recall с правильной сессией: returned=1, отсечек нет.
+        let found = mem
+            .recall("gizmo", 10, Some("sess-a"), None, None)
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        let events = crate::log_capture::collect(&mut rx, "memory.recall_selection");
+        let backend: Vec<_> = events
+            .iter()
+            .filter(|event| event["attributes"]["layer"] == "backend")
+            .collect();
+        assert_eq!(backend.len(), 1, "got {events:?}");
+        let attrs = &backend[0]["attributes"];
+        assert_eq!(attrs["returned"], 1);
+        assert_eq!(attrs["rejected_agent_scope"], 0);
+    }
+
+    #[tokio::test]
+    async fn recall_like_fallback_recovers_substring_match_after_filtered_candidates() {
+        // Pin семантики recall (acceptance 1): кандидаты FTS, отсечённые
+        // фильтрами, всё ещё запускают LIKE-fallback — substring-совпадение
+        // («gizmo» внутри «gizmocalibration»), невидимое FTS-токенизации,
+        // но не отфильтрованное, должно быть поднято. Регрессия здесь
+        // сломала бы восстановление и вернула пустую выдачу.
+        let (_obs_guard, _writer_guard, _hook_guard, mut rx) = crate::log_capture::install();
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path())
+            .unwrap()
+            .with_debug_decisions(true);
+        // Строка A: токен совпал, но отсечена session-фильтром.
+        mem.store(
+            "row_a",
+            "gizmo calibration",
+            MemoryCategory::Core,
+            Some("sess-a"),
+        )
+        .await
+        .unwrap();
+        // Строка B: «gizmo» только внутри большего токена (FTS не видит),
+        // сессия совпадает с запросом.
+        mem.store(
+            "row_b",
+            "gizmocalibration notes",
+            MemoryCategory::Core,
+            Some("sess-b"),
+        )
+        .await
+        .unwrap();
+
+        let found = mem
+            .recall("gizmo", 10, Some("sess-b"), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "LIKE recovery must lift the substring-only row B, got {found:?}"
+        );
+        assert_eq!(found[0].key, "row_b");
+
+        let events = crate::log_capture::collect(&mut rx, "memory.recall_selection");
+        let backend: Vec<_> = events
+            .iter()
+            .filter(|event| event["attributes"]["layer"] == "backend")
+            .collect();
+        assert_eq!(backend.len(), 1, "got {events:?}");
+        let attrs = &backend[0]["attributes"];
+        // Выдача восстановлена именно LIKE-fallback'ом.
+        assert_eq!(attrs["path"], "like");
+        assert_eq!(attrs["candidates"], 1, "FTS surfaced row A before filters");
+        assert_eq!(attrs["returned"], 1);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn recall_selection_backend_event_flag_off_is_silent() {
+        let (_obs_guard, _writer_guard, _hook_guard, mut rx) = crate::log_capture::install();
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("k1", "alpha keyword", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let _ = mem.recall("alpha", 5, None, None, None).await.unwrap();
+        // is_recent_recall_query("*") — проверка time_only-ветки тоже.
+        let _ = mem.recall("*", 5, None, None, None).await.unwrap();
+        let events = crate::log_capture::collect(&mut rx, "memory.recall_selection");
+        assert!(
+            events.is_empty(),
+            "debug_decisions off (default): zero recall_selection events, got {events:?}"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn recall_selection_backend_time_only_path_reported() {
+        let (_obs_guard, _writer_guard, _hook_guard, mut rx) = crate::log_capture::install();
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path())
+            .unwrap()
+            .with_debug_decisions(true);
+        mem.store("k1", "recent entry", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let found = mem.recall("*", 5, None, None, None).await.unwrap();
+        assert_eq!(found.len(), 1);
+        let events = crate::log_capture::collect(&mut rx, "memory.recall_selection");
+        let backend: Vec<_> = events
+            .iter()
+            .filter(|event| event["attributes"]["layer"] == "backend")
+            .collect();
+        assert_eq!(backend.len(), 1, "got {events:?}");
+        assert_eq!(backend[0]["attributes"]["path"], "time_only");
+        assert_eq!(backend[0]["attributes"]["returned"], 1);
+        crate::log_capture::assert_scalar_only(&events);
+    }
+
+    #[tokio::test]
+    async fn recall_selection_backend_like_fallback_path_reported() {
+        let (_obs_guard, _writer_guard, _hook_guard, mut rx) = crate::log_capture::install();
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path())
+            .unwrap()
+            .with_debug_decisions(true);
+        mem.store("cal", "calibration notes", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        // «alibra» — не целый токен FTS (часть слова), поэтому hybrid пуст
+        // (candidates=0), а LIKE-substring совпадает: path=like по построению.
+        let found = mem.recall("alibra", 10, None, None, None).await.unwrap();
+        assert_eq!(found.len(), 1, "LIKE substring recall must lift the row");
+        let events = crate::log_capture::collect(&mut rx, "memory.recall_selection");
+        let backend: Vec<_> = events
+            .iter()
+            .filter(|event| event["attributes"]["layer"] == "backend")
+            .collect();
+        assert_eq!(backend.len(), 1, "got {events:?}");
+        let attrs = &backend[0]["attributes"];
+        assert_eq!(attrs["path"], "like");
+        assert_eq!(attrs["candidates"], 0, "merged не использовался fallback");
+        assert_eq!(attrs["returned"], 1);
+        crate::log_capture::assert_scalar_only(&events);
     }
 
     #[tokio::test]

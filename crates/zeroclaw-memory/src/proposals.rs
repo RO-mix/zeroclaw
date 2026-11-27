@@ -797,6 +797,7 @@ pub fn apply_signed(
     signer: &str,
     decisions: &[(u32, ItemDecision)],
     reject_reason: Option<&str>,
+    debug_decisions: bool,
 ) -> Result<ApplyOutcome> {
     if signer != ratification.principal || ratification.principal.is_empty() {
         bail!("ratification refused: signer is not the configured principal");
@@ -850,7 +851,7 @@ pub fn apply_signed(
     let now = chrono::Local::now().to_rfc3339();
     let tx = conn.unchecked_transaction()?;
     let mut outcome = ApplyOutcome::default();
-    for item in selected {
+    for item in &selected {
         let status = match decision_of(item.position) {
             ItemDecision::Accept => STATUS_ACCEPTED,
             ItemDecision::Reject => STATUS_REJECTED,
@@ -932,6 +933,29 @@ pub fn apply_signed(
     )?;
     let receipt_id = tx.last_insert_rowid();
     tx.commit()?;
+    // Наблюдаемость решений (9-17): вердикты — строго ПОСЛЕ commit, событие
+    // не влияет на исход (best-effort по построению record!).
+    if debug_decisions {
+        for item in &selected {
+            let decision = match decision_of(item.position) {
+                ItemDecision::Accept => "accepted",
+                ItemDecision::Reject => "rejected",
+            };
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "error_key": "memory.proposal_verdict",
+                        "subsystem": "proposals",
+                        "decision": decision,
+                        "source": "ratification",
+                        "keys_count": 1,
+                        "has_reason": decision == "rejected" && reject_reason.is_some(),
+                    })),
+                "memory proposal verdict"
+            );
+        }
+    }
     outcome.receipt = Some(Receipt {
         id: receipt_id,
         packet_id: packet.packet_id.clone(),
@@ -987,7 +1011,7 @@ pub fn verify_chain(receipts: &[Receipt]) -> bool {
 /// Затухание-с-аудитом: pending-не-коррекции старше `days` → expired.
 /// Строки не удаляются — retention-очистка proposals не предусмотрена,
 /// исключение до resolved выполнено по построению. Коррекции бессрочны.
-pub fn expire_stale(conn: &Connection, days: u32) -> Result<u64> {
+pub fn expire_stale(conn: &Connection, days: u32, debug_decisions: bool) -> Result<u64> {
     let cutoff = chrono::Local::now() - chrono::Duration::days(i64::from(days));
     let changed = conn.execute(
         "UPDATE proposals SET status = ?1, resolved_at = ?2 \
@@ -1000,7 +1024,25 @@ pub fn expire_stale(conn: &Connection, days: u32) -> Result<u64> {
             cutoff.to_rfc3339(),
         ],
     )?;
-    Ok(u64::try_from(changed).unwrap_or(0))
+    let changed = u64::try_from(changed).unwrap_or(0);
+    // Наблюдаемость решений (9-17): строго после персистента вердикта.
+    if debug_decisions && changed > 0 {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "error_key": "memory.proposal_verdict",
+                    "subsystem": "proposals",
+                    "decision": "expired",
+                    "source": "expiry",
+                    "keys_count": changed,
+                    "has_reason": false,
+                })
+            ),
+            "memory proposal verdict"
+        );
+    }
+    Ok(changed)
 }
 
 /// Записать факт file_write в узкий журнал (путь, метка, turn-id — не diff).
@@ -1087,6 +1129,96 @@ mod tests {
 
     fn proposal(kind: &str, payload: &str, hash: &str) -> RatificationProposal {
         RatificationProposal::new(kind, payload, RatificationProposal::PRIORITY_NORMAL, hash)
+    }
+
+    // ── epic 9-17: наблюдаемость решений (proposal_verdict) ──
+
+    #[test]
+    fn apply_signed_emits_verdict_events_after_commit() {
+        let (_obs_guard, _writer_guard, _hook_guard, mut rx) = crate::log_capture::install();
+        let (_tmp, _db, conn) = mem_db();
+        let rat = test_ratification();
+        let ids: Vec<i64> = ["v1", "v2"]
+            .iter()
+            .map(|h| {
+                propose(&conn, &proposal("trend", "fact", h))
+                    .unwrap()
+                    .proposal_id
+            })
+            .collect();
+        let packet = assemble_packet(&conn, "pkt-v", &ids, 20).unwrap().unwrap();
+        mark_delivered(&conn, "pkt-v").unwrap();
+
+        // Отклонённый пакет целиком: явные reject-решения по обеим позициям
+        // (позиции без решения дефолтят в Accept). Решение уже персистентно
+        // (commit прошёл) — события после факта.
+        let outcome = apply_signed(
+            &conn,
+            &rat,
+            &packet,
+            "operator-1",
+            &[(1, ItemDecision::Reject), (2, ItemDecision::Reject)],
+            Some("не соответствует оси"),
+            true,
+        )
+        .unwrap();
+        assert!(outcome.receipt.is_some());
+
+        let events = crate::log_capture::collect(&mut rx, "memory.proposal_verdict");
+        assert_eq!(events.len(), 2, "one verdict per item, got {events:?}");
+        for event in &events {
+            assert_eq!(event["attributes"]["decision"], "rejected");
+            assert_eq!(event["attributes"]["source"], "ratification");
+            assert_eq!(event["attributes"]["keys_count"], 1);
+            assert_eq!(event["attributes"]["has_reason"], true);
+        }
+        crate::log_capture::assert_scalar_only(&events);
+
+        // Флаг выкл: повторная подпись другого пакета — молча.
+        let ids2: Vec<i64> = ["v3"]
+            .iter()
+            .map(|h| {
+                propose(&conn, &proposal("trend", "fact 2", h))
+                    .unwrap()
+                    .proposal_id
+            })
+            .collect();
+        let packet2 = assemble_packet(&conn, "pkt-v2", &ids2, 20)
+            .unwrap()
+            .unwrap();
+        mark_delivered(&conn, "pkt-v2").unwrap();
+        let _ = apply_signed(&conn, &rat, &packet2, "operator-1", &[], None, false).unwrap();
+        let events = crate::log_capture::collect(&mut rx, "memory.proposal_verdict");
+        assert!(
+            events.is_empty(),
+            "debug_decisions off: zero proposal_verdict events, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn expire_stale_emits_expired_verdict_event() {
+        let (_obs_guard, _writer_guard, _hook_guard, mut rx) = crate::log_capture::install();
+        let (_tmp, _db, conn) = mem_db();
+        // pending-строка «в прошлом» (created_at напрямую состариваем).
+        let id = propose(&conn, &proposal("trend", "old fact", "exp-1"))
+            .unwrap()
+            .proposal_id;
+        let stale = (chrono::Local::now() - chrono::Duration::days(30)).to_rfc3339();
+        conn.execute(
+            "UPDATE proposals SET created_at = ?1 WHERE id = ?2",
+            params![stale, id],
+        )
+        .unwrap();
+
+        let faded = expire_stale(&conn, 7, true).unwrap();
+        assert_eq!(faded, 1);
+
+        let events = crate::log_capture::collect(&mut rx, "memory.proposal_verdict");
+        assert_eq!(events.len(), 1, "got {events:?}");
+        assert_eq!(events[0]["attributes"]["decision"], "expired");
+        assert_eq!(events[0]["attributes"]["source"], "expiry");
+        assert_eq!(events[0]["attributes"]["keys_count"], 1);
+        crate::log_capture::assert_scalar_only(&events);
     }
 
     #[test]
@@ -1254,7 +1386,7 @@ mod tests {
             .unwrap();
         mark_delivered(&conn, "pkt-a").unwrap();
 
-        let outcome = apply_signed(&conn, &rat, &packet, "operator-1", &[], None).unwrap();
+        let outcome = apply_signed(&conn, &rat, &packet, "operator-1", &[], None, false).unwrap();
         assert_eq!(outcome.accepted.len(), 2);
         assert!(outcome.rejected.is_empty());
         let receipt = outcome.receipt.unwrap();
@@ -1282,7 +1414,7 @@ mod tests {
             .unwrap()
             .unwrap();
         mark_delivered(&conn, "pkt-b").unwrap();
-        let outcome2 = apply_signed(&conn, &rat, &packet2, "operator-1", &[], None).unwrap();
+        let outcome2 = apply_signed(&conn, &rat, &packet2, "operator-1", &[], None, false).unwrap();
         assert_eq!(outcome2.receipt.unwrap().prev_hash, receipt_hash(&receipt));
 
         let chain = receipts(&conn).unwrap();
@@ -1318,6 +1450,7 @@ mod tests {
             "operator-1",
             &[(2, ItemDecision::Reject)],
             Some("устарело"),
+            false,
         )
         .unwrap();
         assert_eq!(outcome.accepted.len(), 0);
@@ -1350,7 +1483,7 @@ mod tests {
             .unwrap();
         mark_delivered(&conn, "pkt-np").unwrap();
 
-        let err = apply_signed(&conn, &rat, &packet, "someone-else", &[], None)
+        let err = apply_signed(&conn, &rat, &packet, "someone-else", &[], None, false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("not the configured principal"));
@@ -1378,7 +1511,7 @@ mod tests {
             params![a.proposal_id],
         )
         .unwrap();
-        let err = apply_signed(&conn, &rat, &packet, "operator-1", &[], None)
+        let err = apply_signed(&conn, &rat, &packet, "operator-1", &[], None, false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("mirror changed"));
@@ -1421,7 +1554,7 @@ mod tests {
         )
         .unwrap();
 
-        let faded = expire_stale(&conn, 7).unwrap();
+        let faded = expire_stale(&conn, 7, false).unwrap();
         assert_eq!(faded, 1, "only the non-correction expires");
         let stats = counts(&conn).unwrap();
         assert_eq!(stats.expired, 1);
@@ -1697,7 +1830,7 @@ mod tests {
         .unwrap();
         mark_delivered(&conn, "pkt-rev").unwrap();
 
-        let outcome = apply_signed(&conn, &rat, &packet, "operator-1", &[], None).unwrap();
+        let outcome = apply_signed(&conn, &rat, &packet, "operator-1", &[], None, false).unwrap();
         assert_eq!(outcome.accepted.len(), 3);
 
         // Non-destructive: старая версия суперседита новой (не удалена).
@@ -1771,7 +1904,7 @@ mod tests {
             .unwrap();
         mark_delivered(&conn, "pkt-rev-bad").unwrap();
 
-        let err = apply_signed(&conn, &rat, &packet, "operator-1", &[], None)
+        let err = apply_signed(&conn, &rat, &packet, "operator-1", &[], None, false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("invalid payload"), "got: {err}");

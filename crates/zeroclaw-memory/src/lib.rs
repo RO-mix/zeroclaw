@@ -145,17 +145,18 @@ fn wrap_audit<M: Memory + 'static>(
 
 /// Compose the two install-wide decorators exactly once. Content scanning is
 /// closest to storage; the optional audit wrapper observes the resulting
-/// success or failure without bypassing the security boundary.
+/// success or failure without bypassing the security boundary. Принимает
+/// `&MemoryConfig` целиком: policy и audit flag — как раньше, плюс флаг
+/// `debug_decisions` (9-17) прокидывается в `ScannedMemory`.
 fn wrap_scanned_and_audit<M: Memory + 'static>(
     memory: M,
-    policy: &MemoryPolicyConfig,
+    config: &MemoryConfig,
     workspace_dir: &Path,
-    audit_enabled: bool,
 ) -> anyhow::Result<Box<dyn Memory>> {
     wrap_audit(
-        ScannedMemory::new(memory, policy),
+        ScannedMemory::new(memory, &config.policy, config.debug_decisions),
         workspace_dir,
-        audit_enabled,
+        config.audit_enabled,
     )
 }
 
@@ -164,23 +165,21 @@ fn create_memory_with_builders<F>(
     workspace_dir: &Path,
     mut sqlite_builder: F,
     unknown_context: &str,
-    policy: &MemoryPolicyConfig,
-    audit_enabled: bool,
+    config: &MemoryConfig,
 ) -> anyhow::Result<Box<dyn Memory>>
 where
     F: FnMut() -> anyhow::Result<SqliteMemory>,
 {
     match classify_memory_backend(backend_name) {
         MemoryBackendKind::Sqlite => {
-            wrap_scanned_and_audit(sqlite_builder()?, policy, workspace_dir, audit_enabled)
+            wrap_scanned_and_audit(sqlite_builder()?, config, workspace_dir)
         }
         MemoryBackendKind::Lucid => {
             let local = sqlite_builder()?;
             wrap_scanned_and_audit(
                 LucidMemory::new("lucid", workspace_dir, local),
-                policy,
+                config,
                 workspace_dir,
-                audit_enabled,
             )
         }
         MemoryBackendKind::Postgres => {
@@ -197,23 +196,18 @@ where
         }
         MemoryBackendKind::Markdown => wrap_scanned_and_audit(
             MarkdownMemory::new("markdown", workspace_dir),
-            policy,
+            config,
             workspace_dir,
-            audit_enabled,
         ),
-        MemoryBackendKind::None => wrap_scanned_and_audit(
-            NoneMemory::new("none"),
-            policy,
-            workspace_dir,
-            audit_enabled,
-        ),
+        MemoryBackendKind::None => {
+            wrap_scanned_and_audit(NoneMemory::new("none"), config, workspace_dir)
+        }
         MemoryBackendKind::Unknown => {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"backend_name": backend_name, "unknown_context": unknown_context})), "Unknown memory backend '', falling back to markdown");
             wrap_scanned_and_audit(
                 MarkdownMemory::new("markdown", workspace_dir),
-                policy,
+                config,
                 workspace_dir,
-                audit_enabled,
             )
         }
     }
@@ -702,7 +696,8 @@ fn build_memory_with_storage(
             sqlite_open_timeout_secs,
             config.search_mode.clone(),
         )?
-        .with_query_prefix(config.embedding_query_prefix.clone());
+        .with_query_prefix(config.embedding_query_prefix.clone())
+        .with_debug_decisions(config.debug_decisions);
 
         if let Some(resolved_embedding) = resolved_embedding
             && has_embedder
@@ -754,9 +749,8 @@ fn build_memory_with_storage(
         return wrap_scanned_and_audit(
             QdrantMemory::new_lazy("qdrant", &url, &collection, qdrant_api_key, embedder)
                 .with_query_prefix(config.embedding_query_prefix.clone()),
-            &config.policy,
+            config,
             workspace_dir,
-            config.audit_enabled,
         );
     }
 
@@ -770,12 +764,7 @@ fn build_memory_with_storage(
         };
         #[cfg(feature = "memory-postgres")]
         {
-            return wrap_scanned_and_audit(
-                build_postgres_memory(pg_cfg)?,
-                &config.policy,
-                workspace_dir,
-                config.audit_enabled,
-            );
+            return wrap_scanned_and_audit(build_postgres_memory(pg_cfg)?, config, workspace_dir);
         }
         #[cfg(not(feature = "memory-postgres"))]
         {
@@ -792,9 +781,8 @@ fn build_memory_with_storage(
         )?;
         return wrap_scanned_and_audit(
             build_lucid_memory(workspace_dir, local, active_storage),
-            &config.policy,
+            config,
             workspace_dir,
-            config.audit_enabled,
         );
     }
 
@@ -810,8 +798,7 @@ fn build_memory_with_storage(
             )
         },
         "",
-        &config.policy,
-        config.audit_enabled,
+        config,
     )
 }
 
@@ -1007,6 +994,7 @@ fn wrap_in_retrieval_pipeline(memory: Arc<dyn Memory>, config: &MemoryConfig) ->
         memory,
         RetrievalConfig {
             cache_enabled,
+            debug_decisions: config.debug_decisions,
             ..RetrievalConfig::default()
         },
     ))
@@ -1179,6 +1167,7 @@ async fn create_memory_for_agent_inner(
         let own: Arc<dyn Memory> = Arc::new(ScannedMemory::new(
             MarkdownMemory::new("markdown", &own_workspace),
             &config.memory.policy,
+            config.memory.debug_decisions,
         ));
         let mut peers: Vec<agent_scoped_markdown::MarkdownPeer> = Vec::new();
         for grant in &agent_cfg.workspace.read_memory_from {
@@ -1189,6 +1178,7 @@ async fn create_memory_for_agent_inner(
                 memory: Arc::new(ScannedMemory::new(
                     MarkdownMemory::new("markdown", &peer_workspace),
                     &config.memory.policy,
+                    config.memory.debug_decisions,
                 )),
                 allowed_categories: grant
                     .categories()
@@ -1274,6 +1264,81 @@ pub fn create_response_cache(config: &MemoryConfig, workspace_dir: &Path) -> Opt
                 "Response cache disabled due to error"
             );
             None
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod log_capture {
+    //! Общий harness для тестов слоя наблюдаемости решений памяти (9-17):
+    //! процесс-глобальный capture-subscriber + broadcast-receiver
+    //! (паттерн zeroclaw_log::try_install_capture_subscriber /
+    //! subscribe_or_install). Блокировки writer/hook держатся вызывающим
+    //! тестом, чтобы параллельные writer/broadcast-тесты не подбирали чужие
+    //! события.
+    use serde_json::Value;
+    use tokio::sync::broadcast::Receiver;
+
+    /// Сериализация observability-тестов: broadcast-хук процесс-глобален,
+    /// без лока «ноль событий»-ассерты тестов гоняются с соседними тестами
+    /// слоя memory.*.
+    static OBSERVABILITY_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// Установить subscriber, вернуть guard'ы блокировок и drained receiver.
+    pub(crate) fn install() -> (impl Drop, impl Drop, impl Drop, Receiver<Value>) {
+        let obs_guard = OBSERVABILITY_TEST_LOCK.lock();
+        let writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+        (obs_guard, writer_guard, hook_guard, rx)
+    }
+
+    /// Собрать из буфера события, чей `attributes.error_key` начинается с
+    /// `prefix` (`memory.` — все пять подсистем слоя 9-17). record! синхронен:
+    /// к моменту возврата действия все его события уже в broadcast-буфере.
+    pub(crate) fn collect(rx: &mut Receiver<Value>, prefix: &str) -> Vec<Value> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut out = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(value) => {
+                    if value["attributes"]["error_key"]
+                        .as_str()
+                        .is_some_and(|key| key.starts_with(prefix))
+                    {
+                        out.push(value);
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    // Grace-окно на вторичное событие той же операции.
+                    if std::time::Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                        continue;
+                    }
+                    break;
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+            }
+        }
+        out
+    }
+
+    /// Сканер формы событий (acceptance 5): все значения attributes —
+    /// скаляры (null/bool/number/string), никаких объектов/массивов — ни
+    /// контента записей, ни пользовательских текстов.
+    pub(crate) fn assert_scalar_only(events: &[Value]) {
+        for event in events {
+            let attrs = &event["attributes"];
+            assert!(attrs.is_object(), "attributes must be an object: {attrs}");
+            for (key, value) in attrs.as_object().expect("object checked") {
+                assert!(
+                    value.is_null() || value.is_boolean() || value.is_number() || value.is_string(),
+                    "attribute {key} must be scalar, got {value}"
+                );
+            }
         }
     }
 }
@@ -3220,7 +3285,7 @@ url = "http://localhost:6333"
 
         // Exact production stack for sqlite agents (create_memory_for_agent_inner):
         // RetrievalPipeline -> AgentScopedMemory -> ScannedMemory -> SqliteMemory.
-        let scanned = ScannedMemory::new(inner.clone(), &MemoryPolicyConfig::default());
+        let scanned = ScannedMemory::new(inner.clone(), &MemoryPolicyConfig::default(), false);
         let scoped = AgentScopedMemory::new(Arc::new(scanned), &alpha, Vec::<String>::new());
         let stack: Arc<dyn Memory> = Arc::new(RetrievalPipeline::new(
             Arc::new(scoped),
@@ -3275,6 +3340,7 @@ url = "http://localhost:6333"
         let own: Arc<dyn Memory> = Arc::new(ScannedMemory::new(
             crate::markdown::MarkdownMemory::new("markdown", &own_dir),
             &MemoryPolicyConfig::default(),
+            false,
         ));
         let scoped = AgentScopedMarkdownMemory::new("alpha", own, Vec::<MarkdownPeer>::new());
         let stack: Arc<dyn Memory> = Arc::new(RetrievalPipeline::new(

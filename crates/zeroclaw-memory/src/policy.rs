@@ -81,6 +81,19 @@ pub enum PolicyViolation {
     CategoryQuotaExceeded { max: usize, current: usize },
 }
 
+impl PolicyViolation {
+    /// Stable machine-readable discriminator for observability (9-17):
+    /// emitted as `violation_kind` in `memory.gate_disposition` deny events.
+    #[must_use]
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::ReadOnlyNamespace(_) => "read_only_namespace",
+            Self::NamespaceQuotaExceeded { .. } => "namespace_quota_exceeded",
+            Self::CategoryQuotaExceeded { .. } => "category_quota_exceeded",
+        }
+    }
+}
+
 impl std::fmt::Display for PolicyViolation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

@@ -85,6 +85,9 @@ pub struct RetrievalConfig {
     pub cache_max_entries: usize,
     /// TTL for cached results.
     pub cache_ttl: Duration,
+    /// Наблюдаемость решений памяти (9-17): эмит `memory.recall_selection`
+    /// (layer=pipeline) после каждого recall. Default off.
+    pub debug_decisions: bool,
 }
 
 impl Default for RetrievalConfig {
@@ -93,6 +96,7 @@ impl Default for RetrievalConfig {
             cache_enabled: false,
             cache_max_entries: 256,
             cache_ttl: Duration::from_secs(300),
+            debug_decisions: false,
         }
     }
 }
@@ -218,19 +222,25 @@ impl RetrievalPipeline {
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         if !self.config.cache_enabled {
-            return self
+            let results = self
                 .backend_recall(query, limit, session_id, namespace, since, until)
-                .await;
+                .await?;
+            self.record_selection_event(query, results.len(), "off");
+            return Ok(results);
         }
 
         let ck = Self::cache_key(query, limit, session_id, namespace, since, until);
         if let Some(cached) = self.check_cache(&ck) {
+            // Privacy (9-17): логируем число терминов, не текст запроса —
+            // при --ephemeral (floor=debug) DEBUG доезжает до трейса.
+            let query_terms = query.split_whitespace().count();
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"query": query})),
+                    .with_attrs(::serde_json::json!({"query_terms": query_terms})),
                 "retrieval pipeline: cache hit for ''"
             );
+            self.record_selection_event(query, cached.len(), "hit");
             return Ok(cached);
         }
 
@@ -243,7 +253,33 @@ impl RetrievalPipeline {
         if !results.is_empty() {
             self.store_in_cache_if_current(ck, results.clone(), generation);
         }
+        self.record_selection_event(query, results.len(), "miss");
         Ok(results)
+    }
+
+    /// Наблюдаемость решений памяти (9-17): событие выборки recall на уровне
+    /// пайплайна. Backend-слой (path/candidates/rejected-счётчики) эмитит
+    /// своё событие в `sqlite.rs`; здесь — размерность кэша. Эмит строго
+    /// после получения результата, best-effort по построению record!.
+    fn record_selection_event(&self, query: &str, returned: usize, cache: &str) {
+        if !self.config.debug_decisions {
+            return;
+        }
+        let query_terms = query.split_whitespace().count();
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "error_key": "memory.recall_selection",
+                    "subsystem": "retrieval",
+                    "layer": "pipeline",
+                    "query_terms": query_terms,
+                    "returned": returned,
+                    "cache": cache,
+                })
+            ),
+            "memory recall selection (pipeline)"
+        );
     }
 
     /// One hybrid backend recall; `namespace` picks the scoped variant.
@@ -1691,5 +1727,107 @@ mod tests {
             0,
             "a failed mutation must still invalidate the cache"
         );
+    }
+
+    // ── epic 9-17: наблюдаемость решений (recall-selection, layer=pipeline) ──
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn recall_selection_pipeline_event_flag_gated() {
+        let (_obs_guard, _writer_guard, _hook_guard, mut rx) = crate::log_capture::install();
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Флаг выкл (дефолт): ровно ноль событий слоя memory.*.
+        let off = RetrievalPipeline::new(
+            Arc::new(SqliteMemory::new("sqlite", tmp.path()).unwrap()),
+            RetrievalConfig::default(),
+        );
+        off.store("k_off", "alpha beta", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let _ = off
+            .recall("alpha", 5, None, None, None, None)
+            .await
+            .unwrap();
+        // Узкий префикс: параллельные тесты крейта могут эмитить свои WARN
+        // (например memory.embedding_route_*) в общий broadcast — они не
+        // касаются гейта 9-17. Одноимённые тесты сериализованы hook-локом.
+        let events = crate::log_capture::collect(&mut rx, "memory.recall_selection");
+        assert!(
+            events.is_empty(),
+            "debug_decisions off: zero recall_selection events, got {events:?}"
+        );
+
+        // Флаг вкл: pipeline-событие с cache=off (кэш не настроен). Отдельный
+        // tempdir: иначе recall поднимет и запись off-фазы из общей brain.db.
+        let tmp_on = tempfile::TempDir::new().unwrap();
+        let on = RetrievalPipeline::new(
+            Arc::new(SqliteMemory::new("sqlite", tmp_on.path()).unwrap()),
+            RetrievalConfig {
+                debug_decisions: true,
+                ..RetrievalConfig::default()
+            },
+        );
+        on.store("k_on", "alpha beta", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let found = on.recall("alpha", 5, None, None, None, None).await.unwrap();
+        assert_eq!(found.len(), 1);
+        let events = crate::log_capture::collect(&mut rx, "memory.recall_selection");
+        let pipeline_events: Vec<_> = events
+            .iter()
+            .filter(|event| event["attributes"]["layer"] == "pipeline")
+            .collect();
+        assert_eq!(
+            pipeline_events.len(),
+            1,
+            "exactly one pipeline-layer recall_selection event, got {events:?}"
+        );
+        let attrs = &pipeline_events[0]["attributes"];
+        assert_eq!(attrs["cache"], "off");
+        assert_eq!(attrs["returned"], 1);
+        assert_eq!(attrs["query_terms"], 1);
+        crate::log_capture::assert_scalar_only(&events);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn recall_selection_pipeline_cache_hit_and_miss_reported() {
+        let (_obs_guard, _writer_guard, _hook_guard, mut rx) = crate::log_capture::install();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pipeline = RetrievalPipeline::new(
+            Arc::new(SqliteMemory::new("sqlite", tmp.path()).unwrap()),
+            RetrievalConfig {
+                cache_enabled: true,
+                debug_decisions: true,
+                ..RetrievalConfig::default()
+            },
+        );
+        pipeline
+            .store("k1", "gamma delta", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        // miss → backend → cache store
+        let _ = pipeline
+            .recall("gamma", 5, None, None, None, None)
+            .await
+            .unwrap();
+        // hit
+        let _ = pipeline
+            .recall("gamma", 5, None, None, None, None)
+            .await
+            .unwrap();
+
+        let events = crate::log_capture::collect(&mut rx, "memory.recall_selection");
+        let caches: Vec<&str> = events
+            .iter()
+            .filter(|e| e["attributes"]["layer"] == "pipeline")
+            .filter_map(|e| e["attributes"]["cache"].as_str())
+            .collect();
+        assert!(
+            caches.contains(&"miss") && caches.contains(&"hit"),
+            "expected miss+hit pipeline events, got {caches:?}"
+        );
+        crate::log_capture::assert_scalar_only(&events);
     }
 }

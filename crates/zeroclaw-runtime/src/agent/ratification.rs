@@ -144,6 +144,7 @@ pub fn intercept_operator_signature(
         sender,
         &decisions,
         signature.reason.as_deref(),
+        config.memory.debug_decisions,
     ) {
         Ok(outcome) => {
             let accepted = outcome.accepted.len().to_string();
@@ -657,7 +658,11 @@ pub(crate) fn worker_tick_sync(
     // Календарная фаза (state-file, паттерн hygiene).
     if calendar_due(config) {
         // Затухание-с-аудитом: старые без подписи (не коррекции) → expired.
-        proposals::expire_stale(conn, ratification.packet_trigger_days)?;
+        proposals::expire_stale(
+            conn,
+            ratification.packet_trigger_days,
+            config.memory.debug_decisions,
+        )?;
         // Генераторы.
         let _episodes = generate_expensive_episodes(conn)?;
         let _silent = generate_silent_corrections(conn)?;
@@ -1114,6 +1119,7 @@ mod tests {
             "operator-1",
             &[],
             None,
+            false,
         )
         .unwrap();
 
@@ -1159,6 +1165,7 @@ mod tests {
             "operator-1",
             &[],
             None,
+            false,
         )
         .unwrap();
 

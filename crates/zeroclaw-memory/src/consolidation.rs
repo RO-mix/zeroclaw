@@ -57,6 +57,25 @@ Do not include any text outside the JSON object."#;
 
 const MAX_TYPED_FACTS_PER_TURN: usize = 5;
 
+/// Наблюдаемость решений памяти (9-17): событие решения консолидации.
+/// Атрибуты — скаляры (kind/key — идентификаторы, не контент).
+fn record_consolidation_decision(action: &str, kind: &str, key: &str, outcome: &str) {
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "error_key": "memory.consolidation_decision",
+                "subsystem": "consolidation",
+                "action": action,
+                "kind": kind,
+                "key": key,
+                "outcome": outcome,
+            })
+        ),
+        "memory consolidation decision"
+    );
+}
+
 pub async fn consolidate_turn(
     model_provider: &dyn ModelProvider,
     model: &str,
@@ -135,7 +154,14 @@ pub async fn consolidate_turn(
     // при выключенном флаге блок не выполняется и trend теряется, как раньше).
     // Это сигнальная проводка: записи идут в очередь proposals, а не в память.
     if memory_config.ratification.enabled {
-        record_ratification_signals(memory, &result, user_message, &history_key).await;
+        record_ratification_signals(
+            memory,
+            &result,
+            user_message,
+            &history_key,
+            memory_config.debug_decisions,
+        )
+        .await;
     }
 
     // Phase 2: extract atomic typed facts (gated; default off). Runs before
@@ -273,9 +299,26 @@ pub async fn consolidate_turn(
             }
             superseded_ok = supersede_result.is_ok();
         }
+        // Наблюдаемость решений (9-17): ветка conflict-supersede.
+        if memory_config.debug_decisions && !superseded_ids.is_empty() {
+            record_consolidation_decision(
+                "conflict_supersede",
+                "core",
+                &mem_key,
+                if superseded_ok { "ok" } else { "skipped" },
+            );
+        }
         if superseded_ok && memory_config.ratification.enabled && !superseded_ids.is_empty() {
             let proposal = conflict::contradiction_proposal(update, &superseded_ids);
-            propose_best_effort(memory, &proposal, "contradiction").await;
+            let queued = propose_best_effort(memory, &proposal, "contradiction").await;
+            if memory_config.debug_decisions {
+                record_consolidation_decision(
+                    "proposal_queued",
+                    &proposal.kind,
+                    &mem_key,
+                    if queued { "ok" } else { "skipped" },
+                );
+            }
         }
     }
 
@@ -290,6 +333,7 @@ async fn record_ratification_signals(
     result: &ConsolidationResult,
     user_message: &str,
     history_key: &str,
+    debug_decisions: bool,
 ) {
     // trend: доводим сигнал consolidation до записи (до 9-4 trend молча
     // терялся). Идемпотентно по source_hash — повторный прогон не дублирует.
@@ -306,24 +350,41 @@ async fn record_ratification_signals(
             crate::proposals::source_hash(&["trend", trend]),
         )
         .with_refs([history_key]);
-        propose_best_effort(memory, &proposal, "trend").await;
+        let queued = propose_best_effort(memory, &proposal, "trend").await;
+        if debug_decisions {
+            record_consolidation_decision(
+                "signals_recorded",
+                &proposal.kind,
+                history_key,
+                if queued { "ok" } else { "skipped" },
+            );
+        }
     }
 
     // correction: явные фразы оператора — самый сильный сигнал, priority=highest.
     if conflict::detect_operator_correction(user_message) {
         let excerpt: String = user_message.trim().chars().take(200).collect();
         let proposal = conflict::operator_correction_proposal(&excerpt);
-        propose_best_effort(memory, &proposal, "operator correction").await;
+        let queued = propose_best_effort(memory, &proposal, "operator correction").await;
+        if debug_decisions {
+            record_consolidation_decision(
+                "signals_recorded",
+                &proposal.kind,
+                history_key,
+                if queued { "ok" } else { "skipped" },
+            );
+        }
     }
 }
 
 /// Лучшая попытка записи предложения: ошибка очереди не должна ронять
-/// консолидацию.
+/// консолидацию. Возвращает `true`, если предложение реально встало в
+/// очередь (нужно слою наблюдаемости 9-17).
 async fn propose_best_effort(
     memory: &dyn Memory,
     proposal: &zeroclaw_api::memory_traits::RatificationProposal,
     what: &str,
-) {
+) -> bool {
     match memory.propose_ratification(proposal).await {
         Ok(created) => {
             if created {
@@ -337,6 +398,7 @@ async fn propose_best_effort(
                     "ratification proposal queued"
                 );
             }
+            created
         }
         Err(e) => {
             ::zeroclaw_log::record!(
@@ -350,6 +412,7 @@ async fn propose_best_effort(
                     })),
                 "ratification proposal skipped"
             );
+            false
         }
     }
 }
@@ -411,6 +474,14 @@ async fn store_typed_facts(
                         .with_attrs(::serde_json::json!({"duplicate_of": dup_of})),
                     "memory fact skipped as duplicate"
                 );
+                if memory_config.debug_decisions {
+                    record_consolidation_decision(
+                        "typed_facts_stored",
+                        "fact",
+                        &mem_key,
+                        "skipped",
+                    );
+                }
                 continue;
             }
             DedupAction::Merge { into } => {
@@ -470,6 +541,9 @@ async fn store_typed_facts(
                 },
             )
             .await?;
+        if memory_config.debug_decisions {
+            record_consolidation_decision("typed_facts_stored", "fact", &mem_key, "ok");
+        }
 
         // A: reversible soft-hide of superseded rows (gated, default-on);
         // журналирование противоречия — как в основном core-обновлении.
@@ -489,7 +563,15 @@ async fn store_typed_facts(
         }
         if superseded_ok && memory_config.ratification.enabled && !superseded_ids.is_empty() {
             let proposal = conflict::contradiction_proposal(fact, &superseded_ids);
-            propose_best_effort(memory, &proposal, "contradiction").await;
+            let queued = propose_best_effort(memory, &proposal, "contradiction").await;
+            if memory_config.debug_decisions {
+                record_consolidation_decision(
+                    "proposal_queued",
+                    &proposal.kind,
+                    &mem_key,
+                    if queued { "ok" } else { "skipped" },
+                );
+            }
         }
     }
 
@@ -1886,5 +1968,71 @@ mod consolidate_turn_tests {
             .query_row("SELECT COUNT(*) FROM proposal_refs", [], |row| row.get(0))
             .unwrap();
         assert!(refs >= 1, "superseded row reference recorded");
+    }
+
+    // ── epic 9-17: наблюдаемость решений (consolidation_decision) ──
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn consolidation_decision_events_flag_gated() {
+        let (_obs_guard, _writer_guard, _hook_guard, mut rx) = crate::log_capture::install();
+        let tmp = TempDir::new().unwrap();
+        let memory = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        // Ответ с trend + atomic facts: цепляет обе наблюдаемые ветки
+        // (signals_recorded и typed_facts_stored).
+        let reply = r#"{"history_entry":"h","memory_update":null,
+            "trend":"deploys drift to Mondays",
+            "facts":["User prefers weekly deploys"]}"#;
+
+        // Флаг выкл (ратификация включена, facts-извлечение включено):
+        // решения принимаются, но слой memory.* молчит.
+        let cfg = MemoryConfig {
+            ratification: zeroclaw_config::schema::MemoryRatificationConfig {
+                enabled: true,
+                ..zeroclaw_config::schema::MemoryRatificationConfig::default()
+            },
+            consolidation_extract_facts: true,
+            ..MemoryConfig::default()
+        };
+        let provider = ScriptedProvider::replying(reply);
+        run(&provider, &memory, &cfg).await.unwrap();
+        let events = crate::log_capture::collect(&mut rx, "memory.consolidation_decision");
+        assert!(
+            events.is_empty(),
+            "debug_decisions off: zero consolidation_decision events, got {events:?}"
+        );
+
+        // Флаг вкл: тот же прогон эмитит свои решения.
+        let tmp2 = TempDir::new().unwrap();
+        let memory2 = SqliteMemory::new("sqlite", tmp2.path()).unwrap();
+        let cfg = MemoryConfig {
+            debug_decisions: true,
+            ..cfg
+        };
+        let provider = ScriptedProvider::replying(reply);
+        run(&provider, &memory2, &cfg).await.unwrap();
+
+        let events = crate::log_capture::collect(&mut rx, "memory.consolidation_decision");
+        let has = |action: &str, kind: &str| {
+            events
+                .iter()
+                .any(|e| e["attributes"]["action"] == action && e["attributes"]["kind"] == kind)
+        };
+        assert!(
+            has("signals_recorded", "trend"),
+            "trend signal event expected, got {events:?}"
+        );
+        assert!(
+            has("typed_facts_stored", "fact"),
+            "typed fact store event expected, got {events:?}"
+        );
+        for event in &events {
+            let outcome = event["attributes"]["outcome"].as_str().unwrap_or("");
+            assert!(
+                matches!(outcome, "ok" | "skipped" | "disabled"),
+                "unexpected outcome: {event}"
+            );
+        }
+        crate::log_capture::assert_scalar_only(&events);
     }
 }

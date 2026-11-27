@@ -277,6 +277,7 @@ mod tests {
         let mem = Arc::new(ScannedMemory::new(
             SqliteMemory::new("test", tmp.path()).unwrap(),
             &policy,
+            false,
         ));
 
         mem.store(
