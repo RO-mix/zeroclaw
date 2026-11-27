@@ -125,3 +125,37 @@ m.room_key_request для новых устройств бота (opt-in + white
 подачи в апстрим (наши issues/PR или NB заявляется сам) — за Ram.
 Также NB напоминает про thinking-temperature (ждут апстрим-фикс) — при
 нашем won't-fix контура это отдельный вопрос на визу.
+
+## Fix: memory stack store_with_options_and_agent (28.11, виза Ram «Да, правим»)
+
+Alarm R1 legalplat 27.11 (narrative distillate падает на стеке sqlite) — FIX:
+override store_with_options_and_agent добавлен в ScannedMemory и RetrievalPipeline
+(зеркало их store_with_options). Приёмочный тест через точный прод-стек
+RetrievalPipeline→AgentScopedMemory→ScannedMemory→SqliteMemory. Сьют
+zeroclaw-memory 630/630, fmt чист, новых clippy-варнингов нет. Коммит
+380c150da1, fork-main запушен в форк (2757e7626c..380c150da1). Деплой в прод
+(release-сборка + рестарт сервиса) — отдельной визой. Markdown-ветка
+(AgentScopedMarkdownMemory без store_with_options override) — отдельная
+дизайн-история, записана в deferred-work.md.
+
+## Fix: markdown-ветка narrative distillate (28.11, виза Ram «починим всё — и
+## маркдаун ветку, а потом перепесоберем и в прод»)
+
+AgentScopedMarkdownMemory без store_with_options (дефолтный bail на kind/pinned)
++ MarkdownMemory без typed-поверхности. FIX: markdown.rs — narrative хранится
+как выделенный NARRATIVE.md с семантикой перезаписи, читается под NARRATIVE_KEY
+с kind/pinned (get/recall/deploy работают как на sqlite); прочие full-options —
+явный bail; partial — append-only fallback. agent_scoped_markdown.rs — оба
+override делегируют в own-backend. Тесты: 3 unit + полнoстековый
+(RetrievalPipeline→AgentScopedMarkdownMemory→ScannedMemory→MarkdownMemory) с
+deploy в SOUL.md. Сьют 634/634, fmt чист, clippy без новых. Коммит 6151a0db8b,
+запушен. Release-сборка и деплой — в этом же витке.
+
+## Деплой: memory-stack fixes в прод (28.11 ~15:06 МСК)
+
+Прод переведён на fork-main head `6151a0db8b` (fix sqlite-стека 380c150da1 +
+markdown narrative 6151a0db8b). Release-сборка 23м15с. Бэкап
+`zeroclaw.exe.bak-20261127-150539`. Проверки после старта: gateway 42621 → 200;
+cron list = 19; memory stats healthy (Total 2880, Proposals 94: pending 41,
+expired 53 — TTL-истечения штатны). Alarm-сценарий legalplat (memory_store
+kind=narrative) закрыт обоими фиксами; rollback — bak-20261127-150539.
