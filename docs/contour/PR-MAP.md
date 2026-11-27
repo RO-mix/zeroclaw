@@ -159,3 +159,18 @@ markdown narrative 6151a0db8b). Release-сборка 23м15с. Бэкап
 cron list = 19; memory stats healthy (Total 2880, Proposals 94: pending 41,
 expired 53 — TTL-истечения штатны). Alarm-сценарий legalplat (memory_store
 kind=narrative) закрыт обоими фиксами; rollback — bak-20261127-150539.
+
+## Story 9-17: Debug memory — наблюдаемость решений памяти (28.11, виза Ram)
+
+Спека: spec-9-17-debug-memory.md (status: done, review-виток 1). Реализация:
+пять error_key (memory.proposal_verdict / gate_disposition / recall_selection
+/ hygiene_decision / consolidation_decision) за флагом [memory]
+debug_decisions (default off — байт-в-байт поведение). Коммит 52f5f87a4f.
+Верификация: zeroclaw-memory 646/646, fmt чист, clippy без новых; ревью
+тремя слоями, триаж в спеке, hardening deferred. Операторская заметка:
+docs/contour/MEMORY-DEBUG-DECISIONS.md.
+
+ОЖИДАЮТ ВИЗЫ Ram: (1) прод-конфиг debug_decisions=true (zc-config-surgery);
+(2) кроны Демиурга — п.2в ночного обхода (ежедневный лёгкий чек) + новый
+еженедельный memory review (zc-cron-ops). Без них acceptance 6-7 живьём не
+подтвердить. Push в форк — с визы.
